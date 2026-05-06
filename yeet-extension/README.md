@@ -68,9 +68,9 @@ release source. Code signing is on the v1.1 roadmap.
 | `Yeet: Start` | Spawns the bundled daemon for the current workspace. |
 | `Yeet: Stop` | Gracefully terminates the daemon. |
 | `Yeet: Create` | Scaffolds a new Rojo-compatible project at the workspace root. |
-| `Yeet: Sync From Studio` | One-shot push: Studio's DataModel becomes the source of truth; disk files are recreated to match. |
-| `Yeet: Sync From IDE` | Inverse: disk files overwrite Studio's DataModel. |
-| `Yeet: Pair Studio` | Manual fallback to refresh the auto-pair breadcrumb if Studio missed it. |
+
+Bulk sync (Studio ↔ disk) and manual pairing are driven from the
+Studio plugin's own UI, not from the IDE command palette.
 
 ---
 

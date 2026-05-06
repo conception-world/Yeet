@@ -49,9 +49,10 @@ If you need to abort and pick one side wholesale, the dock has
 
 ## Bulk sync
 
-Two one-shot commands, both reachable from the command palette:
+Two one-shot operations, both driven from the **Studio plugin's
+BulkSync dock** (button in the plugin toolbar).
 
-### `Yeet: Sync From Studio`
+### Sync From Studio
 
 Studio's DataModel becomes the source of truth. Disk files are
 recreated to match the Studio tree exactly. Use this when:
@@ -65,7 +66,7 @@ A **preview dock** appears first, showing every file that would be
 created / overwritten / deleted. You confirm before anything is
 written.
 
-### `Yeet: Sync From IDE`
+### Sync From IDE
 
 The inverse: disk files overwrite Studio's DataModel. Use this when:
 
@@ -93,7 +94,8 @@ plugin's "Open in IDE" button bootstraps everything in one shot:
 5. You click **Open Folder** — VS Code opens the new project
 
 After bootstrap you're in the same state as if you'd run
-`Yeet: Create` and `Yeet: Sync From Studio` manually.
+`Yeet: Create` followed by a Sync From Studio in the plugin
+manually.
 
 The confirmation modal is mandatory — opening an arbitrary folder
 in VS Code can run code (`.vscode/tasks.json` with `"runOn":
