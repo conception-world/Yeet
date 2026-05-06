@@ -1,0 +1,108 @@
+{
+  "name": "yeet",
+  "displayName": "Yeet",
+  "description": "Bidirectional sync between Roblox Studio and VS Code / Antigravity.",
+  "version": "0.3.0",
+  "publisher": "yeet-dev-TODO-replace-before-publish",
+  "license": "MIT",
+  "engines": {
+    "vscode": "^1.90.0"
+  },
+  "categories": [
+    "Other"
+  ],
+  "keywords": [
+    "roblox",
+    "roblox studio",
+    "rojo",
+    "sync",
+    "luau"
+  ],
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/conception-world/Yeet.git"
+  },
+  "bugs": {
+    "url": "https://github.com/conception-world/Yeet/issues"
+  },
+  "homepage": "https://github.com/conception-world/Yeet#readme",
+  "main": "./out/extension.js",
+  "icon": "icon.png",
+  "activationEvents": [
+    "workspaceContains:default.project.json"
+  ],
+  "contributes": {
+    "commands": [
+      {
+        "command": "yeet.start",
+        "title": "Yeet: Start"
+      },
+      {
+        "command": "yeet.stop",
+        "title": "Yeet: Stop"
+      },
+      {
+        "command": "yeet.create",
+        "title": "Yeet: Create"
+      },
+      {
+        "command": "yeet.syncFromStudio",
+        "title": "Yeet: Sync From Studio"
+      },
+      {
+        "command": "yeet.syncFromIde",
+        "title": "Yeet: Sync From Ide"
+      },
+      {
+        "command": "yeet.pairStudio",
+        "title": "Yeet: Pair Studio"
+      }
+    ],
+    "configuration": {
+      "title": "Yeet",
+      "properties": {
+        "yeet.daemonPath": {
+          "type": "string",
+          "default": "",
+          "scope": "machine",
+          "description": "Optional override for the yeet-daemon binary path. Leave empty to use the bundled binary that ships inside this extension (recommended for most users). Set to an absolute path when running a custom-built daemon — e.g. `<repo>/yeet-daemon/target/release/yeet-daemon(.exe)` during development. Scoped to user/machine: workspace .vscode/settings.json CANNOT override this, so opening an untrusted repo can never trick Yeet into spawning an attacker-controlled binary."
+        },
+        "yeet.debugEcho": {
+          "type": "boolean",
+          "default": false,
+          "description": "Pass --debug-echo to the daemon so every hash and echo-detection decision is logged at info level. Useful when diagnosing ping-pong between Studio and disk."
+        },
+        "yeet.createTemplate": {
+          "type": "array",
+          "items": { "type": "string" },
+          "default": [
+            "ServerScriptService",
+            "ReplicatedStorage",
+            "ReplicatedFirst",
+            "ServerStorage",
+            "StarterPlayer/StarterPlayerScripts",
+            "StarterPlayer/StarterCharacterScripts"
+          ],
+          "description": "Default set of service scopes Yeet: Create scaffolds into src/. Use slashes to nest under a service (e.g. StarterPlayer/StarterPlayerScripts). Empty array -> no src/ folders generated."
+        }
+      }
+    }
+  },
+  "scripts": {
+    "typecheck": "tsc --noEmit -p .",
+    "build": "node esbuild.js",
+    "watch": "node esbuild.js --watch",
+    "package": "npm run typecheck && npm run build && vsce package --no-dependencies"
+  },
+  "dependencies": {
+    "ws": "^8.18.0"
+  },
+  "devDependencies": {
+    "@types/node": "^20.11.0",
+    "@types/vscode": "^1.90.0",
+    "@types/ws": "^8.5.13",
+    "@vscode/vsce": "^3.2.0",
+    "esbuild": "^0.24.2",
+    "typescript": "^5.6.0"
+  }
+}

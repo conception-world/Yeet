@@ -1,0 +1,7 @@
+# Aftman manages the Roblox toolchain for this plugin. Pinning exact versions
+# here means a fresh clone can run `aftman install` and get the same stack
+# used when the plugin was built, regardless of what the user has globally.
+
+[tools]
+rojo = "rojo-rbx/rojo@7.6.1"
+wally = "UpliftGames/wally@0.3.2"

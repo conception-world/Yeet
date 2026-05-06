@@ -1,0 +1,9 @@
+{
+  "className": "Script",
+  "properties": {
+    "RunContext": {
+      "type": "enum",
+      "value": "RunContext.Client"
+    }
+  }
+}

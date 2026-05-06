@@ -1,0 +1,246 @@
+import * as fs from "node:fs";
+import * as path from "node:path";
+import * as vscode from "vscode";
+
+// Path segments inside a `default.project.json` tree. Empty leaves (used for
+// `$path` entries) use an empty object so rojo honors the mapping with no
+// children; adding `$className` would force a new instance, which is wrong
+// for services.
+type TreeNode = {
+	$className?: string;
+	$path?: string;
+	[child: string]: TreeNode | string | undefined;
+};
+
+interface ProjectJson {
+	name: string;
+	tree: TreeNode;
+}
+
+/// Canonical set of Roblox services Yeet: Create knows how to scaffold under.
+/// Everything the user configures in `yeet.createTemplate` is validated
+/// against this list — anything else is surfaced as a warning and skipped so
+/// a typo doesn't silently produce an orphaned folder.
+const KNOWN_SERVICES = new Set<string>([
+	"ServerScriptService",
+	"ReplicatedStorage",
+	"ReplicatedFirst",
+	"ServerStorage",
+	"Workspace",
+	"Lighting",
+	"StarterGui",
+	"StarterPack",
+	"StarterPlayer",
+	"Teams",
+	"TestService",
+	"SoundService",
+	"Chat",
+	"LocalizationService",
+]);
+
+/// Children of StarterPlayer that are themselves "containers" rojo mounts
+/// scripts under. They get a `$className` so rojo creates the right child
+/// instance even if the place doesn't have it yet.
+const STARTER_PLAYER_CHILDREN: Record<string, string> = {
+	StarterPlayerScripts: "StarterPlayerScripts",
+	StarterCharacterScripts: "StarterCharacterScripts",
+};
+
+export async function createProject(output: vscode.OutputChannel): Promise<void> {
+	const folder = await pickWorkspaceFolder(output);
+	if (folder === undefined) {
+		return;
+	}
+
+	const projectFile = path.join(folder, "default.project.json");
+	if (fs.existsSync(projectFile)) {
+		const choice = await vscode.window.showWarningMessage(
+			"default.project.json already exists in this folder. Overwrite?",
+			{ modal: true },
+			"Overwrite",
+			"Cancel",
+		);
+		if (choice !== "Overwrite") {
+			output.appendLine("[yeet:create] cancelled (project already exists)");
+			return;
+		}
+	}
+
+	const cfg = vscode.workspace.getConfiguration("yeet");
+	const templateRaw = cfg.get<string[]>("createTemplate") ?? [];
+	const { tree, createdDirs, skipped } = buildTree(templateRaw, folder);
+
+	const projectName = await vscode.window.showInputBox({
+		prompt: "Project name (used in default.project.json)",
+		value: path.basename(folder),
+		validateInput: (v) => (v.trim().length === 0 ? "Required" : null),
+	});
+	if (projectName === undefined) {
+		output.appendLine("[yeet:create] cancelled at project-name prompt");
+		return;
+	}
+
+	const project: ProjectJson = {
+		name: projectName.trim(),
+		tree,
+	};
+
+	fs.writeFileSync(projectFile, `${JSON.stringify(project, null, 2)}\n`, "utf8");
+	output.appendLine(`[yeet:create] wrote ${projectFile}`);
+
+	for (const rel of createdDirs) {
+		const abs = path.join(folder, rel);
+		fs.mkdirSync(abs, { recursive: true });
+		output.appendLine(`[yeet:create] scaffolded ${rel}`);
+	}
+
+	writeGitignore(folder, output);
+
+	if (skipped.length > 0) {
+		output.appendLine(
+			`[yeet:create] skipped unknown scopes: ${skipped.join(", ")}`,
+		);
+		void vscode.window.showWarningMessage(
+			`Yeet: Create skipped unrecognized scopes: ${skipped.join(", ")}. ` +
+				"Edit yeet.createTemplate in settings to fix.",
+		);
+	}
+
+	void vscode.window.showInformationMessage(
+		`Yeet project scaffolded in ${path.basename(folder)}. Run Yeet: Start to begin sync.`,
+	);
+}
+
+async function pickWorkspaceFolder(
+	output: vscode.OutputChannel,
+): Promise<string | undefined> {
+	const folders = vscode.workspace.workspaceFolders;
+	if (folders === undefined || folders.length === 0) {
+		const picked = await vscode.window.showOpenDialog({
+			canSelectFolders: true,
+			canSelectFiles: false,
+			canSelectMany: false,
+			openLabel: "Select folder for new Yeet project",
+		});
+		const fsPath = picked?.[0]?.fsPath;
+		if (fsPath === undefined) {
+			output.appendLine("[yeet:create] cancelled at folder prompt");
+			return undefined;
+		}
+		return fsPath;
+	}
+	if (folders.length === 1) {
+		const only = folders[0];
+		return only === undefined ? undefined : only.uri.fsPath;
+	}
+	const picked = await vscode.window.showWorkspaceFolderPick({
+		placeHolder: "Pick the folder to scaffold Yeet into",
+	});
+	return picked?.uri.fsPath;
+}
+
+/// Turns the flat list of scope strings into a rojo-compatible tree + the set
+/// of `src/...` directories we need to create on disk. Validation is permissive:
+/// unknown services are dropped (with a warning bubbled back to the caller)
+/// rather than failing the whole command, so a partial template still works.
+function buildTree(
+	scopes: string[],
+	_folder: string,
+): { tree: TreeNode; createdDirs: string[]; skipped: string[] } {
+	const tree: TreeNode = { $className: "DataModel" };
+	const createdDirs: string[] = [];
+	const skipped: string[] = [];
+
+	for (const scopeRaw of scopes) {
+		const scope = scopeRaw.trim().replace(/\\/g, "/");
+		if (scope.length === 0) {
+			continue;
+		}
+		const segments = scope.split("/").filter((s) => s.length > 0);
+		const service = segments[0];
+		if (service === undefined || !KNOWN_SERVICES.has(service)) {
+			skipped.push(scope);
+			continue;
+		}
+
+		if (segments.length === 1) {
+			ensureServiceNode(tree, service);
+			const relDir = `src/${service}`;
+			applyPath(tree, [service], relDir);
+			createdDirs.push(relDir);
+			continue;
+		}
+
+		// Nested under a service (e.g. StarterPlayer/StarterPlayerScripts).
+		// Today only StarterPlayer has honest sub-containers; guard other
+		// services so we don't invent tree shapes rojo can't honor.
+		if (service !== "StarterPlayer") {
+			skipped.push(scope);
+			continue;
+		}
+		const child = segments[1];
+		if (child === undefined || STARTER_PLAYER_CHILDREN[child] === undefined) {
+			skipped.push(scope);
+			continue;
+		}
+		ensureServiceNode(tree, service);
+		ensureStarterPlayerChild(tree, child);
+		const relDir = `src/${service}/${child}`;
+		applyPath(tree, [service, child], relDir);
+		createdDirs.push(relDir);
+	}
+
+	return { tree, createdDirs, skipped };
+}
+
+function ensureServiceNode(tree: TreeNode, service: string): void {
+	if (tree[service] === undefined) {
+		tree[service] = { $className: service };
+	}
+}
+
+function ensureStarterPlayerChild(tree: TreeNode, child: string): void {
+	const starter = tree["StarterPlayer"];
+	if (typeof starter !== "object" || starter === null) {
+		return;
+	}
+	const className = STARTER_PLAYER_CHILDREN[child];
+	if (className === undefined) {
+		return;
+	}
+	if (starter[child] === undefined) {
+		starter[child] = { $className: className };
+	}
+}
+
+function applyPath(tree: TreeNode, segments: string[], relDir: string): void {
+	let node: TreeNode = tree;
+	for (const seg of segments) {
+		const next = node[seg];
+		if (typeof next !== "object" || next === null) {
+			return;
+		}
+		node = next;
+	}
+	node["$path"] = relDir;
+}
+
+function writeGitignore(folder: string, output: vscode.OutputChannel): void {
+	const file = path.join(folder, ".gitignore");
+	const lines = [".yeet/", "build/", "*.rbxm", "*.rbxl", "*.rbxlx"];
+	if (fs.existsSync(file)) {
+		const existing = fs.readFileSync(file, "utf8");
+		const missing = lines.filter((l) => !existing.includes(l));
+		if (missing.length === 0) {
+			return;
+		}
+		const append = `${existing.endsWith("\n") ? "" : "\n"}${missing.join("\n")}\n`;
+		fs.appendFileSync(file, append);
+		output.appendLine(
+			`[yeet:create] appended ${missing.length} entries to existing .gitignore`,
+		);
+		return;
+	}
+	fs.writeFileSync(file, `${lines.join("\n")}\n`, "utf8");
+	output.appendLine("[yeet:create] wrote .gitignore");
+}

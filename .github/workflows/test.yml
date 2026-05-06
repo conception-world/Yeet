@@ -1,0 +1,41 @@
+name: tests
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+# Cancel any in-flight run for the same ref the moment a new push lands;
+# we only care about the latest commit.
+concurrency:
+  group: tests-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  cargo-test:
+    name: cargo test (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      # Run both OSes even if one fails — the Windows-gated path tests
+      # only execute on windows-latest, and a Linux-only regression
+      # shouldn't hide a Windows one.
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+    defaults:
+      run:
+        working-directory: yeet-daemon
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: yeet-daemon
+      - name: cargo build --tests
+        run: cargo build --tests --locked
+      - name: cargo test
+        # The integration suites (`tests/concurrency.rs`) spawn the
+        # daemon binary, so the previous `cargo build --tests` step
+        # must have produced it. We don't gate on coverage tooling
+        # here — see docs/test-strategy.md for cargo-tarpaulin runs.
+        run: cargo test --workspace --locked

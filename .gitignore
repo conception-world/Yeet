@@ -1,0 +1,44 @@
+# Rust
+target/
+**/*.rs.bk
+Cargo.lock.bak
+
+# Node / TypeScript
+node_modules/
+out/
+*.tsbuildinfo
+
+# Rojo / plugin builds
+build/
+*.rbxm
+*.rbxmx
+*.rbxl
+*.rbxlx
+
+# VS Code extension packaging
+*.vsix
+.vscode-test/
+
+# OS
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# Editor
+.idea/
+.vs/
+*.swp
+*.swo
+
+# Yeet runtime state — auth tokens, pairing breadcrumbs.
+# Created per-project when the daemon runs; never commit secrets.
+.yeet/
+
+# Logs
+*.log
+
+# VitePress build output (docs-site/.gitignore also covers this,
+# duplicated here so a fresh clone with no docs-site/.gitignore yet
+# still ignores the build dir if `npm run docs:build` runs first)
+docs-site/.vitepress/cache/
+docs-site/.vitepress/dist/

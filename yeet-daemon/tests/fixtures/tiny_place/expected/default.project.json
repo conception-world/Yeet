@@ -1,0 +1,12 @@
+{
+  "name": "tiny_place",
+  "tree": {
+    "$className": "DataModel",
+    "ServerScriptService": {
+      "$path": "src/ServerScriptService"
+    },
+    "Workspace": {
+      "$path": "src/Workspace"
+    }
+  }
+}
