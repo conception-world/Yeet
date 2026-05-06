@@ -3,7 +3,7 @@
   "displayName": "Yeet",
   "description": "Bidirectional sync between Roblox Studio and VS Code / Antigravity.",
   "version": "0.3.0",
-  "publisher": "yeet-dev-TODO-replace-before-publish",
+  "publisher": "conceptionworld",
   "license": "MIT",
   "engines": {
     "vscode": "^1.90.0"
@@ -58,6 +58,13 @@
         "title": "Yeet: Pair Studio"
       }
     ],
+    "menus": {
+      "commandPalette": [
+        { "command": "yeet.syncFromStudio", "when": "false" },
+        { "command": "yeet.syncFromIde", "when": "false" },
+        { "command": "yeet.pairStudio", "when": "false" }
+      ]
+    },
     "configuration": {
       "title": "Yeet",
       "properties": {
