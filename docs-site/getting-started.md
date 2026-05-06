@@ -31,12 +31,14 @@ connect with a clear error in the dock log.
 
 ## 1. Install the VS Code extension
 
-Open the Extensions panel (`Ctrl+Shift+X`) and search for **Yeet**.
-Install the one published by `conception-world`. Or install via
-command line:
+Open the
+[Yeet on the VS Code Marketplace](https://marketplace.visualstudio.com/items?itemName=ConceptionWorld.yeet)
+and click **Install**. Or, from inside VS Code: open the Extensions
+panel (`Ctrl+Shift+X`), search for **Yeet**, and install the one
+published by `Conception World`. Or via command line:
 
 ```bash
-code --install-extension conception-world.yeet
+code --install-extension ConceptionWorld.yeet
 ```
 
 The extension activates on workspaces that contain a
@@ -49,8 +51,8 @@ directories for the common service mounts.
 
 ### Option A — Roblox Creator Store (recommended)
 
-1. Open [the Yeet plugin page on Roblox](https://create.roblox.com/store)
-   (search for "Yeet" by `conception-world`)
+1. Open the
+   [Yeet plugin page on the Roblox Creator Store](https://create.roblox.com/store/asset/126422641897714/Yeet)
 2. Click **Install**
 3. Reopen Studio (or click the plugin button in the Plugins toolbar)
 

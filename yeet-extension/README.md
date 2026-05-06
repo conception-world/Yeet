@@ -14,8 +14,10 @@ so existing projects pick up sync without restructuring.
 ## Requirements
 
 - **VS Code** 1.90+ (also works in Cursor and Antigravity).
-- **Roblox Studio** with the Yeet plugin installed (download from
-  the project's GitHub Releases page).
+- **Roblox Studio** with the Yeet plugin installed
+  ([install from the Roblox Creator Store](https://create.roblox.com/store/asset/126422641897714/Yeet)
+  or download `Yeet.rbxm` from the
+  [GitHub Releases page](https://github.com/conception-world/Yeet/releases)).
 - **Allow HTTP Requests** enabled in Studio: File → Game Settings →
   Security → Allow HTTP Requests. The plugin's first connect
   attempt will surface this if it's off.
@@ -47,9 +49,13 @@ release source. Code signing is on the v1.1 roadmap.
 
 ## Quick start
 
-1. Install the extension from the VS Code Marketplace.
-2. Install the Yeet plugin in Studio (drop `Yeet.rbxm` into your
-   `Plugins/` folder).
+1. Install the extension from the
+   [VS Code Marketplace](https://marketplace.visualstudio.com/items?itemName=ConceptionWorld.yeet).
+2. Install the Yeet plugin in Studio from the
+   [Roblox Creator Store](https://create.roblox.com/store/asset/126422641897714/Yeet)
+   (or download `Yeet.rbxm` from
+   [GitHub Releases](https://github.com/conception-world/Yeet/releases)
+   and drop it into your `Plugins/` folder).
 3. Open your Roblox project folder in VS Code.
 4. Run **Yeet: Create** if you don't already have a
    `default.project.json` — it scaffolds the standard Rojo layout

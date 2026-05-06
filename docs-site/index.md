@@ -13,7 +13,13 @@ hero:
       text: Get started
       link: /getting-started
     - theme: alt
-      text: View on GitHub
+      text: VS Code Marketplace
+      link: https://marketplace.visualstudio.com/items?itemName=ConceptionWorld.yeet
+    - theme: alt
+      text: Roblox Creator Store
+      link: https://create.roblox.com/store/asset/126422641897714/Yeet
+    - theme: alt
+      text: GitHub
       link: https://github.com/conception-world/Yeet
 
 features:
@@ -60,11 +66,11 @@ machine.
 
 ## 30-second quickstart
 
-```bash
-# 1. Install the extension from the VS Code Marketplace
-# 2. Install the Yeet plugin in Studio (drop Yeet.rbxm into your Plugins folder)
-# 3. In your Roblox project folder:
-```
+1. Install the extension from the
+   [VS Code Marketplace](https://marketplace.visualstudio.com/items?itemName=ConceptionWorld.yeet)
+2. Install the plugin from the
+   [Roblox Creator Store](https://create.roblox.com/store/asset/126422641897714/Yeet)
+3. In your Roblox project folder:
 
 In VS Code:
 
