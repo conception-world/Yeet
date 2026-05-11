@@ -8,7 +8,7 @@ end
 
 -- Stamp the Studio Output so a reload can be verified without opening any
 -- widget. Match the version tag on `Widget` / `ConflictResolver` titles.
-print("[Yeet] plugin loaded v0.0.0")
+print("[Yeet] plugin loaded v0.4.0")
 
 -- Sweep orphan scratch instances from previous Yeet sessions out of
 -- ServerStorage. ConflictResolver and BulkSyncPreview both stash a
@@ -74,21 +74,6 @@ openButton.ClickableWhenViewportHidden = true
 openButton.Click:Connect(function()
   widget:toggle()
   openButton:SetActive(widget:isOpen())
-end)
-
--- Manual escape hatch: if the BulkSync dock fails to appear visibly
--- (Studio occasionally caches an off-screen position), this button
--- force-toggles it. Cheap to expose; only the user who hits the bug
--- needs it.
-local syncDockButton = toolbar:CreateButton(
-  "YeetForceSyncDock",
-  "Force the Yeet BulkSync dock to appear (use if it didn't open after bootstrap)",
-  "rbxassetid://133454131974501",
-  "Show Sync"
-)
-syncDockButton.ClickableWhenViewportHidden = true
-syncDockButton.Click:Connect(function()
-  widget:forceShowSyncPreview()
 end)
 
 -- The persisted settings are applied INSIDE `Widget.new` (via the

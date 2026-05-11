@@ -614,10 +614,30 @@ function TreeBuilder.discover(project: Project): { mappings: Mappings, scripts: 
     return { mappings = mappings, scripts = scripts }
 end
 
+-- Returns the `Instance.Name` a script should have after being renamed to
+-- `path`. For `src/Foo/init.luau`, that's `Foo` (the parent dir); for
+-- `src/Foo.luau` or `src/Foo.server.luau`, that's `Foo`. Used by
+-- `Applier.applyFileRenamed` to update `instance.Name` after a path change.
+local function basenameFor(path: string): string
+    local parts = splitPath(path)
+    if #parts == 0 then
+        return ""
+    end
+    local last = parts[#parts]
+    if initKind(last:lower()) ~= nil then
+        if #parts >= 2 then
+            return parts[#parts - 1]
+        end
+        return ""
+    end
+    return scriptNameFromFile(last)
+end
+
 TreeBuilder.classFor = classFor
 TreeBuilder.scriptNameFromFile = scriptNameFromFile
 TreeBuilder.materializeFile = materializeFile
 TreeBuilder.computePath = computePath
 TreeBuilder.isInitFilename = isInitFilename
+TreeBuilder.basenameFor = basenameFor
 
 return TreeBuilder

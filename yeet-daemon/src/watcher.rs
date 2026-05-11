@@ -4,6 +4,7 @@ use std::sync::mpsc as std_mpsc;
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
+use notify::event::{ModifyKind, RenameMode};
 use notify::{EventKind, RecommendedWatcher, RecursiveMode, Watcher};
 use tokio::sync::mpsc;
 
@@ -112,7 +113,18 @@ enum PendingKind {
 impl From<&EventKind> for PendingKind {
     fn from(kind: &EventKind) -> Self {
         match kind {
-            EventKind::Create(_) | EventKind::Modify(_) => Self::Touched,
+            EventKind::Create(_) => Self::Touched,
+            // A rename surfaces as a paired `From`+`To` on platforms that
+            // distinguish them (Windows ReadDirectoryChangesW, Linux
+            // inotify). `From` is semantically a remove of the old path —
+            // without this branch the previous categorization mapped it
+            // to `Touched(old)`, the daemon called `abs.is_file()` and
+            // dropped the event, and the rename looked like a pure
+            // create at the new path (Studio gets a duplicate instance
+            // instead of a rename).
+            EventKind::Modify(ModifyKind::Name(RenameMode::From)) => Self::Removed,
+            EventKind::Modify(ModifyKind::Name(RenameMode::To)) => Self::Touched,
+            EventKind::Modify(_) => Self::Touched,
             EventKind::Remove(_) => Self::Removed,
             // Access events and raw "Any" on some platforms are uninteresting;
             // we re-poll disk when something actionable happens.

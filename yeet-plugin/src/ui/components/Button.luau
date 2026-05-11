@@ -11,7 +11,7 @@
 local Roact = require(script.Parent.Parent.Parent.Packages.Roact)
 local theme = require(script.Parent.Parent.theme)
 
-export type Variant = "primary" | "danger" | "ghost" | "accept"
+export type Variant = "primary" | "danger" | "ghost" | "accept" | "studio" | "ide"
 
 type Props = {
   text: string,
@@ -33,6 +33,15 @@ local function colorsFor(variant: Variant, disabled: boolean): (Color3, Color3)
     return theme.colors.surface, theme.colors.text
   elseif variant == "accept" then
     return theme.colors.accentAccept, theme.colors.textInverse
+  elseif variant == "studio" then
+    -- Filled blue pill matching the STUDIO column stripe — used by
+    -- actions whose meaning is "this is Studio's side" (e.g. take all
+    -- of Studio's content).
+    return theme.colors.accentStudio, theme.colors.text
+  elseif variant == "ide" then
+    -- Filled orange pill matching the IDE column stripe — used by
+    -- actions whose meaning is "this is the IDE's side".
+    return theme.colors.accentIde, theme.colors.text
   end
   return theme.colors.accentPrimary, theme.colors.text
 end

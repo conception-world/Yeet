@@ -523,11 +523,19 @@ local function PreviewView(props: ViewProps)
           TextXAlignment = Enum.TextXAlignment.Left,
           LayoutOrder = 1,
         }),
+        -- Colour by source-side instead of by destructiveness: Studio
+        -- → IDE paints in `accentStudio` (blue) because semantically
+        -- "everything comes from Studio"; IDE → Studio paints in
+        -- `accentIde` (orange). The earlier red-for-both variant made
+        -- the two buttons look interchangeable and forced users to
+        -- read the label carefully every time. The confirm step still
+        -- flips to `accept` (green) so the second-click commit reads
+        -- as a deliberate go-ahead distinct from the armed state.
         studioToIde = Roact.createElement(Button, {
           text = if props.pendingMigrate == "studio_to_ide"
             then `⚠ Confirm: {#props.entries} file(s) Studio → IDE`
             else "Studio → IDE",
-          variant = if props.pendingMigrate == "studio_to_ide" then "accept" else "danger",
+          variant = if props.pendingMigrate == "studio_to_ide" then "accept" else "studio",
           layoutOrder = 2,
           onClick = function()
             props.onMigrateAll("studio_to_ide")
@@ -537,7 +545,7 @@ local function PreviewView(props: ViewProps)
           text = if props.pendingMigrate == "ide_to_studio"
             then `⚠ Confirm: {#props.entries} file(s) IDE → Studio`
             else "IDE → Studio",
-          variant = if props.pendingMigrate == "ide_to_studio" then "accept" else "danger",
+          variant = if props.pendingMigrate == "ide_to_studio" then "accept" else "ide",
           layoutOrder = 3,
           onClick = function()
             props.onMigrateAll("ide_to_studio")

@@ -6,7 +6,7 @@ use crate::merge::{ConflictHunk, ConflictKind, HunkResolution};
 use crate::project::Project;
 
 /// Script instance classes we know how to materialize in Phase 1.
-#[derive(Debug, Clone, Copy, Eq, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, Eq, PartialEq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ScriptKind {
     ModuleScript,
@@ -119,6 +119,31 @@ pub enum ClientMsg {
     /// User deleted a tracked script in Studio.
     FileDeleted {
         path: String,
+    },
+    /// User renamed, moved, or promoted/demoted a tracked script in Studio,
+    /// changing its path while the same `LuaSourceContainer` instance lives
+    /// on. The plugin emits this when its `SourceWatcher` detects a
+    /// `Name`/`AncestryChanged` event, or when a child added/removed flips
+    /// a leaf script into a `Foo/init.luau` (or back). `content` carries
+    /// the current `Source` so the daemon doesn't need a follow-up
+    /// `FileChanged` for renames that coincide with edits — the rename
+    /// frame is authoritative for both fields.
+    FileRenamed {
+        old_path: String,
+        new_path: String,
+        kind: ScriptKind,
+        content: String,
+        sha256: String,
+    },
+    /// Plugin detected two `LuaSourceContainer` instances that resolve to
+    /// the same project-relative path (two scripts with the same name under
+    /// the same parent in Studio). Sync for that path is paused until one
+    /// is renamed in Studio; this frame just informs the daemon so it can
+    /// reject incoming edits for `path` with `SyncErrorKind::NameCollisionPending`
+    /// and broadcast a `NameCollision` warning to the extension.
+    NameCollision {
+        path: String,
+        sha256: String,
     },
     /// User picked resolutions in the conflict UI for one or more files.
     ConflictResolved {
@@ -523,6 +548,28 @@ pub enum ServerMsg {
     FileDeleted {
         path: String,
     },
+    /// Daemon completed a `fs::rename` (real, history-preserving) on behalf
+    /// of a `ClientMsg::FileRenamed` from the plugin, or detected an offline
+    /// rename via the handshake content-matching heuristic. Plugin applies
+    /// this in a single `withRecording("YeetFileRenamed", ...)` so the user
+    /// can undo the rename in one step.
+    FileRenamed {
+        old_path: String,
+        new_path: String,
+        content: String,
+        sha256: String,
+        kind: ScriptKind,
+    },
+    /// Two scripts collide at `path`. `message` is the human-readable hint
+    /// the plugin surfaces in its dock log; the extension may treat it as
+    /// a generic warning. Sent on every collision detection and again when
+    /// the collision is resolved (the daemon sends `path` empty in that
+    /// case — plugin clears any active warning UI). Routed via broadcast
+    /// so both plugin and extension surfaces stay in sync.
+    NameCollision {
+        path: String,
+        message: String,
+    },
     /// Emitted when a `.meta.json` on disk changes the `attributes` block of
     /// an instance. `path` points at the *associated* tracked entry (the
     /// script path for a `Foo.meta.json` sidecar), not at the `.meta.json`
@@ -631,6 +678,19 @@ pub enum SyncErrorKind {
     HashMismatch,
     /// One or more entries in a `StudioSnapshotReport` were dropped.
     SnapshotEntryDropped,
+    /// `path` is currently in `pending_collisions` — two `LuaSourceContainer`s
+    /// in Studio resolve to the same path and sync is paused until one is
+    /// renamed. Frames touching the colliding path are rejected with this
+    /// kind so the plugin can show "this script's sync is on hold".
+    NameCollisionPending,
+    /// A handler (rename, write, delete, etc.) returned an `Err` that the
+    /// daemon couldn't recover from. The `reason` field carries the
+    /// `format!("{e:#}")` of the original error so the user has a real
+    /// failure mode to chase instead of "the rename silently didn't
+    /// happen". Used whenever an I/O operation (fs::rename,
+    /// create_dir_all, atomic_write, etc.) fails inside a Studio→IDE
+    /// sync path.
+    HandlerFailed,
 }
 
 /// Summary of one completed syncback. Returned inside `SyncbackComplete` so

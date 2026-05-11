@@ -54,6 +54,22 @@ pub enum Kind {
     /// `sha_before`/`sha_after` fields carry the old and new IDs so the
     /// post-mortem can correlate a "lost session" symptom to the cause.
     SessionRotated,
+    /// Daemon performed a real `fs::rename` (history-preserving) on behalf
+    /// of a `FileRenamed` from the plugin or an offline-rename pairing in
+    /// the handshake. `path` holds the new path; `sha_before` holds the
+    /// old path (overloading `sha_before` so the audit log keeps a single
+    /// uniform schema). `sha_after` carries the new content hash.
+    FsRename,
+    /// Handshake's content-hash heuristic matched one or more disappeared
+    /// paths to newly-appeared paths and emitted them as renames. `path`
+    /// is left empty; `note` carries the count.
+    OfflineRenamesDetected,
+    /// Plugin reported two `LuaSourceContainer`s collide at `path`; sync
+    /// for that path is paused until a rename clears it.
+    NameCollisionDetected,
+    /// `NameCollisionDetected` cleared (one of the colliding instances
+    /// was renamed in Studio).
+    NameCollisionResolved,
 }
 
 #[derive(Debug, Clone, Serialize)]

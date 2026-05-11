@@ -1,0 +1,28 @@
+# Default: let git auto-detect text vs binary and normalize EOLs in the
+# repo to LF, while letting Windows checkouts use CRLF if the user has
+# core.autocrlf=true. The exceptions below pin specific paths to LF on
+# disk regardless of autocrlf, because their consumers byte-compare
+# against on-disk content.
+
+* text=auto
+
+# Daemon test fixtures: the syncback materializer writes plain LF and
+# the fixture comparison is byte-exact. CRLF checkouts on Windows would
+# spuriously fail `syncback_fixture::tiny_place_matches_fixture`.
+yeet-daemon/tests/fixtures/**/*.luau text eol=lf
+yeet-daemon/tests/fixtures/**/*.json text eol=lf
+
+# Lua/Luau project sources sync bidirectionally with Roblox Studio,
+# which always writes LF. Pinning here avoids the daemon seeing every
+# Windows checkout as a one-line edit on every script.
+*.lua text eol=lf
+*.luau text eol=lf
+
+# Pre-built binaries that ship in the extension should be byte-identical
+# across platforms. Mark explicitly so no future text auto-detection
+# touches them.
+yeet-extension/bin/**/* binary
+*.exe binary
+*.rbxm binary
+*.rbxmx binary
+*.msgpack binary

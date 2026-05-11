@@ -106,6 +106,13 @@ type ApplierHandle = {
   isEcho: (self: ApplierHandle, path: string, hash: string) -> boolean,
   recordSelfEdit: (self: ApplierHandle, path: string, hash: string) -> (),
   forgetLocalDelete: (self: ApplierHandle, path: string) -> (),
+  forgetLocalRename: (
+    self: ApplierHandle,
+    oldPath: string,
+    newPath: string,
+    hash: string
+  ) -> (),
+  resolvePath: (self: ApplierHandle, instance: Instance) -> (string?, string?),
   setTrackHooks: (
     self: ApplierHandle,
     onTracked: (path: string, instance: Instance) -> (),
@@ -120,6 +127,20 @@ type ApplierHandle = {
   setStudioCreatedHook: (
     self: ApplierHandle,
     hook: ((path: string, kind: string, studioContent: string, studioSha256: string) -> ())?
+  ) -> (),
+  setStudioRenamedHook: (
+    self: ApplierHandle,
+    hook: ((
+      oldPath: string,
+      newPath: string,
+      kind: string,
+      studioContent: string,
+      studioSha256: string
+    ) -> ())?
+  ) -> (),
+  setStudioCollisionHook: (
+    self: ApplierHandle,
+    hook: ((path: string, source: string, sha256: string, colliders: { Instance }) -> ())?
   ) -> (),
   setBootstrapPreviewMode: (self: ApplierHandle, enabled: boolean) -> (),
   setBootstrapSnapshotHook: (
@@ -137,6 +158,12 @@ type SourceWatcherHandle = {
 type LogEntry = { time: string, text: string }
 type ViewProps = {
   connected: boolean,
+  -- True between the moment the user clicks Connect (or a server-side
+  -- close triggers a reconnect attempt) and the next successful socket
+  -- open. Surfaced in the view as a yellow "Connecting…" pill with a
+  -- "Click to stop" hint so the user can bail out of a stalled
+  -- handshake instead of staring at a frozen button.
+  connecting: boolean,
   paused: boolean,
   log: { LogEntry },
   onToggle: () -> (),
@@ -213,15 +240,31 @@ local function buildLogChildren(log: { LogEntry }): { [string]: any }
 end
 
 local function WidgetView(props: ViewProps)
+  local dotColor: Color3
+  if props.connected then
+    dotColor = theme.colors.accentAccept
+  elseif props.connecting then
+    dotColor = theme.colors.accentWarning
+  else
+    dotColor = theme.colors.textMuted
+  end
   local statusDot = Roact.createElement("Frame", {
     Size = UDim2.fromOffset(10, 10),
-    BackgroundColor3 = if props.connected then theme.colors.accentAccept else theme.colors.textMuted,
+    BackgroundColor3 = dotColor,
     BorderSizePixel = 0,
     LayoutOrder = 1,
   }, {
     corner = Roact.createElement("UICorner", { CornerRadius = UDim.new(1, 0) }),
   })
 
+  local statusText: string
+  if props.connected then
+    statusText = "Connected"
+  elseif props.connecting then
+    statusText = "Connecting…"
+  else
+    statusText = "Disconnected"
+  end
   local statusRow = Roact.createElement("Frame", {
     Size = UDim2.new(1, 0, 0.2, 0),
     BackgroundTransparency = 1,
@@ -237,7 +280,7 @@ local function WidgetView(props: ViewProps)
     label = Roact.createElement("TextLabel", {
       Size = UDim2.new(1, -20, 1, 0),
       BackgroundTransparency = 1,
-      Text = if props.connected then "Connected" else "Disconnected",
+      Text = statusText,
       TextColor3 = theme.colors.textMuted,
       Font = theme.typography.caption.font,
       TextSize = theme.typography.caption.size,
@@ -261,14 +304,82 @@ local function WidgetView(props: ViewProps)
   -- height eliminates the ambiguity: all three are exactly the same
   -- size regardless of how many are present.
   local BUTTON_HEIGHT = UDim2.new(1, 0, 0, 40)
+  -- "Connecting…" gets a taller pill so the secondary "Click to stop"
+  -- hint fits below the main label without crowding the glyphs.
+  local CONNECTING_BUTTON_HEIGHT = UDim2.new(1, 0, 0, 56)
 
-  local connectButton = Roact.createElement(Button, {
-    text = if props.connected then "Disconnect" else "Connect",
-    variant = if props.connected then "danger" else "primary",
-    size = BUTTON_HEIGHT,
-    onClick = props.onToggle,
-    layoutOrder = 3,
-  })
+  local connectButton
+  if props.connecting and not props.connected then
+    -- Custom yellow pill with two stacked labels. The Button component
+    -- is single-line by design, so this branch hand-rolls a TextButton
+    -- that mirrors its pill shape (UICorner + label typography) while
+    -- adding a muted "Click to stop" subtitle. Same `onToggle` handler
+    -- as the regular Connect / Disconnect button: a click while
+    -- "Connecting…" tears the in-flight reconnect down.
+    connectButton = Roact.createElement("TextButton", {
+      Size = CONNECTING_BUTTON_HEIGHT,
+      AutomaticSize = Enum.AutomaticSize.None,
+      LayoutOrder = 3,
+      BackgroundColor3 = theme.colors.accentWarning,
+      BorderSizePixel = 0,
+      AutoButtonColor = true,
+      Text = "",
+      [Roact.Event.Activated] = function()
+        local ok, err = pcall(props.onToggle)
+        if not ok then
+          warn(string.format("[Yeet] Connect (connecting) onClick threw: %s", tostring(err)))
+        end
+      end,
+    }, {
+      corner = Roact.createElement("UICorner", {
+        CornerRadius = UDim.new(0, theme.radius.pill),
+      }),
+      layout = Roact.createElement("UIListLayout", {
+        FillDirection = Enum.FillDirection.Vertical,
+        VerticalAlignment = Enum.VerticalAlignment.Center,
+        HorizontalAlignment = Enum.HorizontalAlignment.Center,
+        SortOrder = Enum.SortOrder.LayoutOrder,
+        Padding = UDim.new(0, 2),
+      }),
+      padding = Roact.createElement("UIPadding", {
+        PaddingTop = UDim.new(0, theme.spacing.sm),
+        PaddingBottom = UDim.new(0, theme.spacing.sm),
+        PaddingLeft = UDim.new(0, theme.spacing.lg),
+        PaddingRight = UDim.new(0, theme.spacing.lg),
+      }),
+      title = Roact.createElement("TextLabel", {
+        Size = UDim2.new(1, 0, 0, theme.typography.label.size + 2),
+        BackgroundTransparency = 1,
+        Text = "Connecting…",
+        TextColor3 = theme.colors.textInverse,
+        Font = theme.typography.label.font,
+        TextSize = theme.typography.label.size,
+        TextXAlignment = Enum.TextXAlignment.Center,
+        LayoutOrder = 1,
+      }),
+      hint = Roact.createElement("TextLabel", {
+        Size = UDim2.new(1, 0, 0, theme.typography.caption.size + 2),
+        BackgroundTransparency = 1,
+        Text = "Click to stop",
+        -- Slightly translucent dark on top of the warning yellow so
+        -- the hint reads as secondary without losing contrast.
+        TextColor3 = theme.colors.textInverse,
+        TextTransparency = 0.35,
+        Font = theme.typography.caption.font,
+        TextSize = theme.typography.caption.size,
+        TextXAlignment = Enum.TextXAlignment.Center,
+        LayoutOrder = 2,
+      }),
+    })
+  else
+    connectButton = Roact.createElement(Button, {
+      text = if props.connected then "Disconnect" else "Connect",
+      variant = if props.connected then "danger" else "primary",
+      size = BUTTON_HEIGHT,
+      onClick = props.onToggle,
+      layoutOrder = 3,
+    })
+  end
 
   -- Pause/Resume only makes sense when connected. Suppresses outgoing edits
   -- and incoming applies without tearing down the WebSocket — handy when
@@ -400,6 +511,12 @@ type self = {
   tree: any,
   log: { LogEntry },
   connected: boolean,
+  -- True from the moment `_onConnectPressed` runs until the next
+  -- successful `onOpen` (or until `_teardownConnection` cancels the
+  -- attempt). `onReconnecting` flips it back to true between automated
+  -- retries so the dock shows the same "Connecting…" pill during
+  -- handshake stalls as during the initial connect.
+  connecting: boolean,
   -- True when a deferred log-batch flush is already scheduled. Set by
   -- `_appendLog`, cleared by `_rerender`. Lets us coalesce a burst of
   -- log lines into a single Roact diff instead of one per entry.
@@ -456,7 +573,7 @@ type WidgetSettings = {
 function Widget.new(plugin: Plugin, initialSettings: WidgetSettings?): Widget
   local info = DockWidgetPluginGuiInfo.new(Enum.InitialDockState.Right, false, false, 320, 480, 280, 360)
   local gui = plugin:CreateDockWidgetPluginGui(WIDGET_ID, info)
-  gui.Title = "Yeet v0.3.0"
+  gui.Title = "Yeet v0.4.0"
   gui.Name = WIDGET_ID
 
   local resolver = ConflictResolver.new(plugin) :: any
@@ -474,6 +591,7 @@ function Widget.new(plugin: Plugin, initialSettings: WidgetSettings?): Widget
     tree = nil,
     log = {},
     connected = false,
+    connecting = false,
     logRerenderPending = false,
     paused = false,
     -- Defaults match Settings.defaults() in ui/Settings.luau. If
@@ -605,6 +723,7 @@ end
 function Widget._renderTree(self: Widget)
   return Roact.createElement(WidgetView, {
     connected = self.connected,
+    connecting = self.connecting,
     paused = self.paused,
     log = self.log,
     onToggle = function()
@@ -701,7 +820,17 @@ function Widget._teardownConnection(self: Widget)
   end
   self.sourceWatcher = nil
   self.syncPreview:close()
+  -- `_setConnected` short-circuits when the bool doesn't change; if
+  -- we tore down a connection that never reached `onOpen` (still in
+  -- the connecting state, connected already false), we still need a
+  -- render to drop the yellow pill. Force one when only the
+  -- connecting flag flipped.
+  local wasConnecting = self.connecting
+  self.connecting = false
   self:_setConnected(false)
+  if wasConnecting and not self.connected then
+    self:_rerender()
+  end
 end
 
 function Widget._onToggleConnection(self: Widget)
@@ -746,6 +875,16 @@ function Widget.isPaused(self: Widget): boolean
 end
 
 function Widget._onConnectPressed(self: Widget)
+  -- Flip into the "Connecting…" visual state up front, before any of
+  -- the async machinery (Reconnect.run, Applier setup) runs. This way
+  -- the button paints the yellow pill on the same frame as the click;
+  -- the matching `connecting = false` lives in the `onOpen` callback
+  -- below (success path) and in `_teardownConnection` (user bails out
+  -- or socket dies before handshake).
+  if not self.connecting then
+    self.connecting = true
+    self:_rerender()
+  end
   local logger = function(line: string)
     self:_appendLog(line)
   end
@@ -758,6 +897,9 @@ function Widget._onConnectPressed(self: Widget)
     end,
     isEcho = function(path, hash)
       return applier:isEcho(path, hash)
+    end,
+    resolvePath = function(instance)
+      return applier:resolvePath(instance)
     end,
     onEdit = function(path, content, hash)
       applier:recordSelfEdit(path, hash)
@@ -788,6 +930,41 @@ function Widget._onConnectPressed(self: Widget)
           type = "file_deleted",
           path = path,
         })
+      end
+    end,
+    onRename = function(oldPath, newPath, kind, content, hash)
+      -- The Applier's local mirror is the source of truth for echo
+      -- detection — flip it BEFORE the wire frame goes out so a
+      -- mid-flight daemon broadcast for the old path doesn't trip up
+      -- subsequent reconciliations.
+      local okForget, forgetErr = pcall(function()
+        applier:forgetLocalRename(oldPath, newPath, hash)
+      end)
+      if not okForget then
+        self:_appendLog(`rename: forgetLocalRename failed for {oldPath} -> {newPath}: {tostring(forgetErr)}`)
+        return
+      end
+      if self.paused then
+        return
+      end
+      local current = self.connection
+      if current == nil then
+        self:_appendLog(`rename dropped (disconnected): {oldPath} -> {newPath}`)
+        return
+      end
+      local okSend, sendErr = pcall(function()
+        current:send({
+          type = "file_renamed",
+          old_path = oldPath,
+          new_path = newPath,
+          kind = kind,
+          content = content,
+          sha256 = hash,
+        })
+      end)
+      if not okSend then
+        self:_appendLog(`rename send failed for {oldPath} -> {newPath}: {tostring(sendErr)}`)
+        return
       end
     end,
   })
@@ -833,6 +1010,50 @@ function Widget._onConnectPressed(self: Widget)
       sha256 = studioSha256,
     })
     self:_appendLog(`-> file_created {path}`)
+  end)
+  applier:setStudioRenamedHook(function(
+    oldPath: string,
+    newPath: string,
+    kind: string,
+    studioContent: string,
+    studioSha256: string
+  )
+    if self.paused then
+      return
+    end
+    local current = self.connection
+    if current == nil then
+      self:_appendLog(`studio rename ignored (disconnected): {oldPath} -> {newPath}`)
+      return
+    end
+    current:send({
+      type = "file_renamed",
+      old_path = oldPath,
+      new_path = newPath,
+      kind = kind,
+      content = studioContent,
+      sha256 = studioSha256,
+    })
+    self:_appendLog(`-> file_renamed {oldPath} -> {newPath}`)
+  end)
+  applier:setStudioCollisionHook(function(
+    path: string,
+    source: string,
+    sha256: string,
+    _colliders: { Instance }
+  )
+    local current = self.connection
+    if current == nil then
+      self:_appendLog(`name_collision ignored (disconnected): {path}`)
+      return
+    end
+    current:send({
+      type = "name_collision",
+      path = path,
+      sha256 = sha256,
+    })
+    local _ = source -- reserved for future "preview the conflicting source" UI
+    self:_appendLog(`!! name_collision reported to daemon: {path}`)
   end)
   -- Mirror the `request_bootstrap_preview` flag we set in the Hello: the
   -- Applier needs to know whether to run its preview-mode handler for
@@ -981,11 +1202,11 @@ function Widget._onConnectPressed(self: Widget)
         type = "hello",
         -- Plugin reports its own wire-protocol version. The daemon
         -- parses with semver and enforces
-        -- `>= MIN_COMPATIBLE_PLUGIN_VERSION` (currently "0.3.0"); bump
+        -- `>= MIN_COMPATIBLE_PLUGIN_VERSION` (currently "0.2.0"); bump
         -- in lockstep with breaking protocol changes so the daemon can
         -- refuse old plugins instead of silently misinterpreting their
         -- frames.
-        version = "0.3.0",
+        version = "0.4.0",
         studio_snapshot = {},
         request_bootstrap_preview = true,
       }
@@ -1024,6 +1245,10 @@ function Widget._onConnectPressed(self: Widget)
       else
         self:_appendLog(`reconnected (attempt {attempt})`)
       end
+      -- Handshake completed — leave the "Connecting…" visual state.
+      -- `_setConnected(true)` already rerenders, so we just clear the
+      -- flag inline; the next render reads `connecting = false`.
+      self.connecting = false
       self:_setConnected(true)
     end,
     onMessage = function(payload)
@@ -1046,7 +1271,20 @@ function Widget._onConnectPressed(self: Widget)
     end,
     onReconnecting = function(attempt: number, delaySec: number)
       self:_appendLog(`reconnecting (attempt {attempt} in {delaySec}s)`)
+      -- A reconnect cycle counts as "connecting" from the user's
+      -- perspective: the dock should show the yellow pill with
+      -- "Click to stop" so the user can break out instead of waiting
+      -- through an open-ended retry loop.
+      local wasConnecting = self.connecting
+      self.connecting = true
       self:_setConnected(false)
+      -- `_setConnected` already rerendered if `connected` flipped to
+      -- false; if `onClose` ran first (most common path), connected
+      -- was already false and `_setConnected` short-circuits — so we
+      -- force one render here to make the yellow pill appear.
+      if not wasConnecting then
+        self:_rerender()
+      end
     end,
     onResumed = function(_sessionId: string, replayed: number)
       self:_appendLog(`resumed: {replayed} buffered frame(s)`)

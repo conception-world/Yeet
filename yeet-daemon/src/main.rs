@@ -3,6 +3,7 @@ use std::io::Write as _;
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, bail};
 use futures_util::{SinkExt, StreamExt};
@@ -32,8 +33,8 @@ use yeet_daemon::protocol::{
     SyncbackTemplate, classify, is_init_filename,
 };
 use yeet_daemon::state::{
-    ProjectState, SharedState, encode_for_disk, is_meta_file, normalize_from_disk, resolve_inside,
-    sha256_hex,
+    FileMeta, FsRemovedPending, ProjectState, SharedState, encode_for_disk, is_meta_file,
+    normalize_from_disk, resolve_inside, sha256_hex,
 };
 use yeet_daemon::syncback::{self, SyncbackOptions, SyncbackSession, SyncbackSessions};
 use yeet_daemon::tree::{self, TreeEntry};
@@ -125,6 +126,20 @@ const MIN_COMPATIBLE_PLUGIN_VERSION: &str = "0.2.0";
 /// a misbehaving or compromised client shipping a gigabyte blob.
 const MAX_CONTENT_BYTES: usize = 10 * 1024 * 1024;
 
+/// Human-readable build identifier appended to `daemon_version` in
+/// `ProjectOpened`. Bump whenever a behaviour-visible daemon change ships
+/// so the plugin dock log proves which binary is talking to it (the user
+/// can grep the dock for this string to verify a respawn happened).
+const BUILD_STAMP: &str = "rename-surface-errors-1";
+
+/// How long the daemon waits after a watcher `Removed` event before
+/// committing it as a real delete, looking for a matching `Touched`
+/// with the same `sha256` in the meantime. Pairing them yields a
+/// `FileRenamed` instead of Delete+Create — Studio-side state survives.
+/// Sized above the watcher's 100 ms debounce so the From/To pair always
+/// lands inside the window even on slower platforms.
+const FS_RENAME_PAIR_TTL: Duration = Duration::from_millis(250);
+
 struct CliArgs {
     project_root: PathBuf,
     debug_echo: bool,
@@ -162,7 +177,7 @@ async fn main() -> Result<()> {
     // confirm whether the daemon actually picked up the new code.
     info!(
         version = env!("CARGO_PKG_VERSION"),
-        build = "aggressive-sweep+iterative+codeless-prune",
+        build = BUILD_STAMP,
         "yeet-daemon starting"
     );
     let args = parse_args()?;
@@ -438,6 +453,16 @@ async fn handle_fs_event(
                 debug!(path = %rel, "fs drop: path is not under any $path mapping in default.project.json");
                 return Ok(());
             }
+            // Drop watcher echoes from a daemon-initiated `fs::rename`. The
+            // matching Remove(old) + Touched(new) pair is one-shot so the
+            // second `consume_rename_echo` call returns false naturally.
+            {
+                let mut guard = state.write().await;
+                if guard.consume_rename_echo(&rel) {
+                    debug!(path = %rel, "fs drop: suppressed echo of daemon rename");
+                    return Ok(());
+                }
+            }
             let file_name = abs
                 .file_name()
                 .and_then(|s| s.to_str())
@@ -463,6 +488,83 @@ async fn handle_fs_event(
                 );
                 return Ok(());
             }
+            // Look for a recently-removed entry with the same content
+            // hash — that's the source half of an IDE-side rename. The
+            // pairing window is small enough that natural Delete+Create
+            // sequences from a user (delete X.luau, then start fresh
+            // typing into a new file with same content seconds later)
+            // never trip it, but tight enough that the Modify(From) +
+            // Modify(To) pair the OS emits for a rename always lands
+            // inside it.
+            if let Some(pending) = guard.fs_removed_pending.remove(&sha) {
+                let old_path = pending.path.clone();
+                let new_path = rel.clone();
+                let kind_resolved = pending.entry.kind; // preserve the original kind, matches `kind` here too
+                let _ = kind_resolved;
+                let new_entry = TreeEntry {
+                    kind,
+                    content: content.clone(),
+                    sha256: sha.clone(),
+                };
+                guard.tree_fs.insert(new_path.clone(), new_entry.clone());
+                guard.meta.insert(new_path.clone(), meta);
+                if let Some(base) = guard.tree_base.remove(&old_path) {
+                    guard.tree_base.insert(new_path.clone(), base);
+                }
+                if let Some(studio) = guard.tree_studio.remove(&old_path) {
+                    guard.tree_studio.insert(new_path.clone(), studio);
+                }
+                // Also rename any DirToDir-style descendants if old_path
+                // was a folder-with-init script. The fs watcher emits one
+                // event per child, so each child rename is handled on its
+                // own; the top-level rename only needs to move the script
+                // entry itself.
+                guard.note_rename_echo(old_path.clone(), new_path.clone());
+                persist_base(&guard)?;
+                let root = guard.root.clone();
+                let session_id = guard.session_id.clone();
+                let collision_cleared = guard.pending_collisions.remove(&old_path)
+                    | guard.pending_collisions.remove(&new_path);
+                drop(guard);
+                audit::record(
+                    &root,
+                    &audit::Entry {
+                        ts: audit::now_rfc3339(),
+                        kind: audit::Kind::FsRename,
+                        path: &new_path,
+                        sha_before: Some(&old_path),
+                        sha_after: Some(&sha),
+                        session_id: &session_id,
+                        note: Some("ide-side rename paired via fs watcher"),
+                    },
+                );
+                broadcast_server_msg(
+                    state,
+                    bcast_tx,
+                    ServerMsg::FileRenamed {
+                        old_path: old_path.clone(),
+                        new_path: new_path.clone(),
+                        content,
+                        sha256: sha,
+                        kind,
+                    },
+                )
+                .await;
+                if collision_cleared {
+                    broadcast_server_msg(
+                        state,
+                        bcast_tx,
+                        ServerMsg::NameCollision {
+                            path: String::new(),
+                            message: format!(
+                                "name collision at {old_path} resolved by rename to {new_path}"
+                            ),
+                        },
+                    )
+                    .await;
+                }
+                return Ok(());
+            }
             log_echo(
                 debug_echo,
                 format_args!(
@@ -483,11 +585,62 @@ async fn handle_fs_event(
         }
         FileEvent::Removed(abs) => {
             let mut guard = state.write().await;
-            let Some(rel) = guard.forget_fs_file(&abs) else {
+            let rel_for_echo = guard.relative(&abs);
+            if let Some(rel) = rel_for_echo.as_deref() {
+                if guard.consume_rename_echo(rel) {
+                    debug!(path = %rel, "fs drop: suppressed echo of daemon rename (removal side)");
+                    return Ok(());
+                }
+            }
+            // Capture the entry BEFORE forgetting it so a later Touched
+            // with the same sha can promote the pair to a FileRenamed.
+            let rel = match guard.relative(&abs) {
+                Some(r) => r,
+                None => {
+                    debug!(path = %abs.display(), "fs drop: removal of untracked path (outside project)");
+                    return Ok(());
+                }
+            };
+            let Some(entry) = guard.tree_fs.get(&rel).cloned() else {
                 debug!(path = %abs.display(), "fs drop: removal of untracked path (already gone or never tracked)");
                 return Ok(());
             };
-            rel
+            let entry_meta = guard.meta_for(&rel);
+            let sha = entry.sha256.clone();
+            guard.tree_fs.remove(&rel);
+            guard.meta.remove(&rel);
+            guard.fs_removed_pending.insert(
+                sha.clone(),
+                FsRemovedPending {
+                    path: rel.clone(),
+                    entry,
+                    meta: entry_meta,
+                    since: Instant::now(),
+                },
+            );
+            drop(guard);
+            // Defer the actual reconcile (which would emit FileDeleted to
+            // Studio + drop the tree_base entry) until the pairing window
+            // expires. If a matching Touched lands inside the window, it
+            // consumes `fs_removed_pending[sha]` and the rename is emitted
+            // as a single `FileRenamed` instead.
+            let state2 = state.clone();
+            let bcast_tx2 = bcast_tx.clone();
+            let sha2 = sha.clone();
+            let rel2 = rel.clone();
+            tokio::spawn(async move {
+                tokio::time::sleep(FS_RENAME_PAIR_TTL).await;
+                let still_pending = {
+                    let mut guard = state2.write().await;
+                    guard.fs_removed_pending.remove(&sha2).is_some()
+                };
+                if still_pending {
+                    if let Err(e) = reconcile_path(&state2, &rel2, &bcast_tx2).await {
+                        warn!(path = %rel2, error = ?e, "deferred fs delete reconcile failed");
+                    }
+                }
+            });
+            return Ok(());
         }
     };
 
@@ -1522,6 +1675,25 @@ async fn handle_studio_changed(
             return Ok(());
         }
     }
+    {
+        let guard = state.read().await;
+        if guard.pending_collisions.contains(&path) {
+            drop(guard);
+            broadcast_server_msg(
+                state,
+                bcast_tx,
+                ServerMsg::SyncError {
+                    kind: SyncErrorKind::NameCollisionPending,
+                    path: path.clone(),
+                    reason: format!(
+                        "sync paused for {path}: two Studio scripts collide at this path"
+                    ),
+                },
+            )
+            .await;
+            return Ok(());
+        }
+    }
     let actual_sha = sha256_hex(content.as_bytes());
     if claimed_sha256 != actual_sha {
         // Hash disagreement is a protocol violation: either the plugin
@@ -1653,6 +1825,813 @@ async fn handle_studio_deleted(
     }
     drop(guard);
     reconcile_path(state, &path, bcast_tx).await
+}
+
+/// Classifies a `(old_path, new_path)` pair the plugin sent in a
+/// `FileRenamed` frame into one of four filesystem operations.
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+enum RenameCase {
+    /// Both ends are leaf script files (e.g. `Foo.luau` → `Bar.luau`).
+    /// Straight `fs::rename` after `mkdir -p` on the new parent.
+    LeafToLeaf,
+    /// Both ends are `init.luau` (etc.) inside a script-container folder.
+    /// Rename the *directory* — moves every child in one shot.
+    DirToDir,
+    /// Leaf → container: `Foo.luau` becomes `Foo/init.luau` because a
+    /// child was added to it in Studio. The path collision (`Foo.luau`
+    /// occupies the slot where the new directory `Foo/` needs to land)
+    /// is sidestepped via a tmp file.
+    Promote,
+    /// Container → leaf: the last child was removed; `Foo/init.luau`
+    /// folds back into a flat `Foo.luau`. Refuses to demote if the
+    /// directory still has other children — guards against the plugin
+    /// emitting the rename before the watcher saw the child deletion.
+    Demote,
+}
+
+impl RenameCase {
+    fn classify(old_path: &str, new_path: &str) -> Self {
+        let old_is_init = is_init_filename(old_path);
+        let new_is_init = is_init_filename(new_path);
+        match (old_is_init, new_is_init) {
+            (false, false) => Self::LeafToLeaf,
+            (true, true) => Self::DirToDir,
+            (false, true) => Self::Promote,
+            (true, false) => Self::Demote,
+        }
+    }
+}
+
+/// Wraps `std::fs::rename` with a small retry loop. The project commonly
+/// lives inside `OneDrive\Documentos\...`; the OneDrive client momentarily
+/// holds the rename target during cloud sync and the first attempt then
+/// fails with `Access is denied`. Three tries with 100/200/300 ms backoff
+/// covers every observed OneDrive hold without making real failures slow.
+fn fs_rename_with_retry(from: &Path, to: &Path) -> std::io::Result<()> {
+    let mut last_err: Option<std::io::Error> = None;
+    for attempt in 0..3u64 {
+        match std::fs::rename(from, to) {
+            Ok(()) => return Ok(()),
+            Err(e) => {
+                // PermissionDenied is the OneDrive/antivirus signal on
+                // Windows; ErrorKind::Other covers Windows's
+                // STATUS_SHARING_VIOLATION when the file is open elsewhere.
+                let recoverable = matches!(
+                    e.kind(),
+                    std::io::ErrorKind::PermissionDenied | std::io::ErrorKind::Other
+                );
+                if !recoverable {
+                    return Err(e);
+                }
+                last_err = Some(e);
+                std::thread::sleep(std::time::Duration::from_millis(100 * (attempt + 1)));
+            }
+        }
+    }
+    Err(last_err.unwrap())
+}
+
+/// Performs every disk mutation for `handle_studio_renamed` and returns
+/// a `String` error on the first failure. The async caller catches the
+/// `Err` and emits a `SyncError` over the WebSocket so the plugin dock
+/// shows what actually went wrong (instead of swallowing the failure in
+/// the daemon's stderr log, which is invisible to the user).
+fn perform_rename_io(
+    case: RenameCase,
+    old_abs: &Path,
+    new_abs: &Path,
+    new_meta: FileMeta,
+    content: &str,
+    old_path_disp: &str,
+    new_path_disp: &str,
+) -> Result<(), String> {
+    fn io_step<E: std::fmt::Display>(op: &str, e: E) -> String {
+        format!("{op}: {e}")
+    }
+
+    match case {
+        RenameCase::LeafToLeaf => {
+            if let Some(parent) = new_abs.parent() {
+                std::fs::create_dir_all(parent)
+                    .map_err(|e| io_step(&format!("mkdir -p {}", parent.display()), e))?;
+            }
+            if old_abs.is_file() {
+                fs_rename_with_retry(old_abs, new_abs).map_err(|e| {
+                    io_step(
+                        &format!("rename {} -> {}", old_abs.display(), new_abs.display()),
+                        e,
+                    )
+                })?;
+            } else {
+                let encoded = encode_for_disk(content, new_meta);
+                atomic_write(new_abs, encoded.as_bytes())
+                    .map_err(|e| io_step(&format!("write {}", new_abs.display()), e))?;
+            }
+        }
+        RenameCase::DirToDir => {
+            let old_dir = old_abs
+                .parent()
+                .ok_or_else(|| format!("init path {old_path_disp} has no parent dir"))?
+                .to_path_buf();
+            let new_dir = new_abs
+                .parent()
+                .ok_or_else(|| format!("init path {new_path_disp} has no parent dir"))?
+                .to_path_buf();
+            if let Some(parent) = new_dir.parent() {
+                std::fs::create_dir_all(parent)
+                    .map_err(|e| io_step(&format!("mkdir -p {}", parent.display()), e))?;
+            }
+            if old_dir.is_dir() {
+                fs_rename_with_retry(&old_dir, &new_dir).map_err(|e| {
+                    io_step(
+                        &format!("rename dir {} -> {}", old_dir.display(), new_dir.display()),
+                        e,
+                    )
+                })?;
+            } else {
+                std::fs::create_dir_all(&new_dir)
+                    .map_err(|e| io_step(&format!("mkdir {}", new_dir.display()), e))?;
+                let encoded = encode_for_disk(content, new_meta);
+                atomic_write(new_abs, encoded.as_bytes())
+                    .map_err(|e| io_step(&format!("write {}", new_abs.display()), e))?;
+            }
+        }
+        RenameCase::Promote => {
+            let tmp = {
+                let mut os = old_abs.as_os_str().to_owned();
+                os.push(".yeet-tmp");
+                PathBuf::from(os)
+            };
+            if old_abs.is_file() {
+                fs_rename_with_retry(old_abs, &tmp).map_err(|e| {
+                    io_step(
+                        &format!("stage {} -> {}", old_abs.display(), tmp.display()),
+                        e,
+                    )
+                })?;
+            }
+            if let Some(parent) = new_abs.parent() {
+                std::fs::create_dir_all(parent)
+                    .map_err(|e| io_step(&format!("mkdir -p {}", parent.display()), e))?;
+            }
+            if tmp.is_file() {
+                fs_rename_with_retry(&tmp, new_abs).map_err(|e| {
+                    io_step(
+                        &format!("finalize {} -> {}", tmp.display(), new_abs.display()),
+                        e,
+                    )
+                })?;
+            } else {
+                let encoded = encode_for_disk(content, new_meta);
+                atomic_write(new_abs, encoded.as_bytes())
+                    .map_err(|e| io_step(&format!("write {}", new_abs.display()), e))?;
+            }
+        }
+        RenameCase::Demote => {
+            let old_dir = old_abs
+                .parent()
+                .ok_or_else(|| format!("init path {old_path_disp} has no parent dir"))?
+                .to_path_buf();
+            let extra_children = match std::fs::read_dir(&old_dir) {
+                Ok(it) => it
+                    .filter_map(|e| e.ok())
+                    .filter(|e| e.path() != *old_abs)
+                    .count(),
+                Err(_) => 0,
+            };
+            if extra_children > 0 {
+                return Err(format!(
+                    "demote rename refused: directory {} still has {extra_children} child(ren)",
+                    old_dir.display()
+                ));
+            }
+            if let Some(parent) = new_abs.parent() {
+                std::fs::create_dir_all(parent)
+                    .map_err(|e| io_step(&format!("mkdir -p {}", parent.display()), e))?;
+            }
+            if old_abs.is_file() {
+                fs_rename_with_retry(old_abs, new_abs).map_err(|e| {
+                    io_step(
+                        &format!("rename {} -> {}", old_abs.display(), new_abs.display()),
+                        e,
+                    )
+                })?;
+            } else {
+                let encoded = encode_for_disk(content, new_meta);
+                atomic_write(new_abs, encoded.as_bytes())
+                    .map_err(|e| io_step(&format!("write {}", new_abs.display()), e))?;
+            }
+            if old_dir.is_dir() {
+                let _ = std::fs::remove_dir(&old_dir);
+            }
+        }
+    }
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn handle_studio_renamed(
+    state: &SharedState,
+    old_path: String,
+    new_path: String,
+    kind: ScriptKind,
+    content: String,
+    claimed_sha256: String,
+    bcast_tx: &broadcast::Sender<Arc<ServerMsg>>,
+) -> Result<()> {
+    info!(
+        old = %old_path,
+        new = %new_path,
+        kind = ?kind,
+        bytes = content.len(),
+        "handle_studio_renamed: entered"
+    );
+    if content.len() > MAX_CONTENT_BYTES {
+        warn!(
+            old = %old_path,
+            new = %new_path,
+            bytes = content.len(),
+            cap = MAX_CONTENT_BYTES,
+            "rejecting client file_renamed: exceeds MAX_CONTENT_BYTES"
+        );
+        broadcast_server_msg(
+            state,
+            bcast_tx,
+            ServerMsg::SyncError {
+                kind: SyncErrorKind::OversizedContent,
+                path: new_path.clone(),
+                reason: format!(
+                    "content length {} exceeds cap of {} bytes",
+                    content.len(),
+                    MAX_CONTENT_BYTES
+                ),
+            },
+        )
+        .await;
+        return Ok(());
+    }
+    let actual_sha = sha256_hex(content.as_bytes());
+    if claimed_sha256 != actual_sha {
+        warn!(
+            old = %old_path,
+            new = %new_path,
+            claimed = %claimed_sha256,
+            actual = %actual_sha,
+            "rejecting file_renamed: hash mismatch"
+        );
+        broadcast_server_msg(
+            state,
+            bcast_tx,
+            ServerMsg::SyncError {
+                kind: SyncErrorKind::HashMismatch,
+                path: new_path.clone(),
+                reason: format!(
+                    "claimed sha256 {claimed_sha256} does not match content (recomputed {actual_sha})"
+                ),
+            },
+        )
+        .await;
+        return Ok(());
+    }
+    {
+        let guard = state.read().await;
+        for p in [&old_path, &new_path] {
+            if let Err(e) = resolve_inside(&guard.root, p) {
+                let reason = format!("{e:#}");
+                warn!(path = %p, error = %reason, "rejecting file_renamed: unsafe path");
+                drop(guard);
+                broadcast_server_msg(
+                    state,
+                    bcast_tx,
+                    ServerMsg::SyncError {
+                        kind: SyncErrorKind::UnsafePath,
+                        path: p.clone(),
+                        reason,
+                    },
+                )
+                .await;
+                return Ok(());
+            }
+            if !guard.is_under_mapping(p) {
+                let reason = "path is inside project root but outside every declared $path mapping"
+                    .to_string();
+                warn!(path = %p, "rejecting file_renamed: path not under any mapping");
+                drop(guard);
+                broadcast_server_msg(
+                    state,
+                    bcast_tx,
+                    ServerMsg::SyncError {
+                        kind: SyncErrorKind::UnsafePath,
+                        path: p.clone(),
+                        reason,
+                    },
+                )
+                .await;
+                return Ok(());
+            }
+        }
+        if guard.pending_collisions.contains(&old_path)
+            || guard.pending_collisions.contains(&new_path)
+        {
+            let stuck = if guard.pending_collisions.contains(&old_path) {
+                old_path.clone()
+            } else {
+                new_path.clone()
+            };
+            drop(guard);
+            broadcast_server_msg(
+                state,
+                bcast_tx,
+                ServerMsg::SyncError {
+                    kind: SyncErrorKind::NameCollisionPending,
+                    path: stuck.clone(),
+                    reason: format!(
+                        "sync paused for {stuck}: two Studio scripts collide at this path"
+                    ),
+                },
+            )
+            .await;
+            // Don't return early — the rename itself is the resolution
+            // signal the user needs to clear the collision, so we still
+            // perform it below. Re-take the lock and proceed.
+        }
+    }
+    {
+        let guard = state.read().await;
+        if guard.dry_run {
+            audit::record(
+                &guard.root,
+                &audit::Entry {
+                    ts: audit::now_rfc3339(),
+                    kind: audit::Kind::FsRename,
+                    path: &new_path,
+                    sha_before: Some(&old_path),
+                    sha_after: Some(&actual_sha),
+                    session_id: &guard.session_id,
+                    note: Some("dry-run: suppressed"),
+                },
+            );
+            info!(old = %old_path, new = %new_path, "DRY-RUN file_renamed suppressed");
+            return Ok(());
+        }
+    }
+
+    let mut guard = state.write().await;
+    let old_abs = match resolve_inside(&guard.root, &old_path) {
+        Ok(p) => p,
+        Err(e) => {
+            let reason = format!("resolve old_path {old_path}: {e:#}");
+            drop(guard);
+            broadcast_server_msg(
+                state,
+                bcast_tx,
+                ServerMsg::SyncError {
+                    kind: SyncErrorKind::HandlerFailed,
+                    path: old_path.clone(),
+                    reason,
+                },
+            )
+            .await;
+            return Ok(());
+        }
+    };
+    let new_abs = match resolve_inside(&guard.root, &new_path) {
+        Ok(p) => p,
+        Err(e) => {
+            let reason = format!("resolve new_path {new_path}: {e:#}");
+            drop(guard);
+            broadcast_server_msg(
+                state,
+                bcast_tx,
+                ServerMsg::SyncError {
+                    kind: SyncErrorKind::HandlerFailed,
+                    path: new_path.clone(),
+                    reason,
+                },
+            )
+            .await;
+            return Ok(());
+        }
+    };
+    let case = RenameCase::classify(&old_path, &new_path);
+    let new_meta = guard.meta_for(&new_path);
+
+    // Run all I/O outside the lock-holding path. Errors come back as
+    // human-readable strings; we surface them to the plugin so the user
+    // sees the real failure (OneDrive lock, antivirus, missing source,
+    // demote refused — whatever it is) instead of a silent no-op.
+    if let Err(reason) =
+        perform_rename_io(case, &old_abs, &new_abs, new_meta, &content, &old_path, &new_path)
+    {
+        warn!(
+            old = %old_path,
+            new = %new_path,
+            error = %reason,
+            "handle_studio_renamed: I/O failed"
+        );
+        drop(guard);
+        broadcast_server_msg(
+            state,
+            bcast_tx,
+            ServerMsg::SyncError {
+                kind: SyncErrorKind::HandlerFailed,
+                path: new_path.clone(),
+                reason,
+            },
+        )
+        .await;
+        return Ok(());
+    }
+
+    // Update trees. For DirToDir we also have to re-key every descendant
+    // path that lived under the old directory.
+    let old_meta = guard.meta.get(&old_path).copied();
+    let new_entry = TreeEntry {
+        kind,
+        content: content.clone(),
+        sha256: actual_sha.clone(),
+    };
+
+    if matches!(case, RenameCase::DirToDir) {
+        let old_dir_prefix = format!(
+            "{}/",
+            old_path
+                .rsplit_once('/')
+                .map(|(d, _)| d)
+                .unwrap_or_default()
+        );
+        let new_dir_prefix = format!(
+            "{}/",
+            new_path
+                .rsplit_once('/')
+                .map(|(d, _)| d)
+                .unwrap_or_default()
+        );
+        rekey_tree(&mut guard.tree_fs, &old_dir_prefix, &new_dir_prefix);
+        rekey_tree(&mut guard.tree_base, &old_dir_prefix, &new_dir_prefix);
+        rekey_tree(&mut guard.tree_studio, &old_dir_prefix, &new_dir_prefix);
+        rekey_meta(&mut guard.meta, &old_dir_prefix, &new_dir_prefix);
+    } else {
+        guard.tree_fs.remove(&old_path);
+        guard.tree_base.remove(&old_path);
+        guard.tree_studio.remove(&old_path);
+        guard.meta.remove(&old_path);
+    }
+    guard.tree_fs.insert(new_path.clone(), new_entry.clone());
+    guard.tree_base.insert(new_path.clone(), new_entry.clone());
+    guard.tree_studio.insert(new_path.clone(), new_entry);
+    if let Some(meta) = old_meta {
+        guard.meta.insert(new_path.clone(), meta);
+    }
+
+    guard.note_rename_echo(old_path.clone(), new_path.clone());
+    let collision_cleared =
+        guard.pending_collisions.remove(&old_path) | guard.pending_collisions.remove(&new_path);
+    if let Err(e) = persist_base(&guard) {
+        let reason = format!("persist_base after rename {old_path} -> {new_path}: {e:#}");
+        warn!(error = %reason, "handle_studio_renamed: persist_base failed");
+        drop(guard);
+        broadcast_server_msg(
+            state,
+            bcast_tx,
+            ServerMsg::SyncError {
+                kind: SyncErrorKind::HandlerFailed,
+                path: new_path.clone(),
+                reason,
+            },
+        )
+        .await;
+        return Ok(());
+    }
+    let root = guard.root.clone();
+    let session_id = guard.session_id.clone();
+    drop(guard);
+
+    audit::record(
+        &root,
+        &audit::Entry {
+            ts: audit::now_rfc3339(),
+            kind: audit::Kind::FsRename,
+            path: &new_path,
+            sha_before: Some(&old_path),
+            sha_after: Some(&actual_sha),
+            session_id: &session_id,
+            note: None,
+        },
+    );
+
+    broadcast_server_msg(
+        state,
+        bcast_tx,
+        ServerMsg::FileRenamed {
+            old_path: old_path.clone(),
+            new_path: new_path.clone(),
+            content,
+            sha256: actual_sha,
+            kind,
+        },
+    )
+    .await;
+
+    if collision_cleared {
+        audit::record(
+            &root,
+            &audit::Entry {
+                ts: audit::now_rfc3339(),
+                kind: audit::Kind::NameCollisionResolved,
+                path: &new_path,
+                sha_before: None,
+                sha_after: None,
+                session_id: &session_id,
+                note: Some("rename cleared collision"),
+            },
+        );
+        broadcast_server_msg(
+            state,
+            bcast_tx,
+            ServerMsg::NameCollision {
+                path: String::new(),
+                message: format!(
+                    "name collision at {} resolved by rename to {}",
+                    old_path, new_path
+                ),
+            },
+        )
+        .await;
+    }
+    Ok(())
+}
+
+/// Re-keys every entry in `tree` whose key starts with `old_prefix` to use
+/// `new_prefix` instead. Used by DirToDir renames to move every descendant
+/// of a renamed `Foo/` to `Bar/` in lockstep with the on-disk
+/// `fs::rename(Foo, Bar)`.
+fn rekey_tree(tree: &mut crate::tree::Tree, old_prefix: &str, new_prefix: &str) {
+    let to_move: Vec<String> = tree
+        .keys()
+        .filter(|k| k.starts_with(old_prefix))
+        .cloned()
+        .collect();
+    for old_key in to_move {
+        let suffix = &old_key[old_prefix.len()..];
+        let new_key = format!("{new_prefix}{suffix}");
+        if let Some(entry) = tree.remove(&old_key) {
+            tree.insert(new_key, entry);
+        }
+    }
+}
+
+fn rekey_meta(meta: &mut HashMap<String, FileMeta>, old_prefix: &str, new_prefix: &str) {
+    let to_move: Vec<String> = meta
+        .keys()
+        .filter(|k: &&String| k.starts_with(old_prefix))
+        .cloned()
+        .collect();
+    for old_key in to_move {
+        let suffix = &old_key[old_prefix.len()..];
+        let new_key = format!("{new_prefix}{suffix}");
+        if let Some(entry) = meta.remove(&old_key) {
+            meta.insert(new_key, entry);
+        }
+    }
+}
+
+/// One match made by the handshake's offline-rename heuristic: a path
+/// disappeared from `tree_base` and a new path showed up in the plugin's
+/// `studio_snapshot` carrying the same `(kind, sha256)`. Promoted to a
+/// real `fs::rename` so the git log keeps history instead of recording
+/// delete + create.
+#[derive(Debug, Clone)]
+struct OfflineRenamePair {
+    old_path: String,
+    new_path: String,
+    kind: ScriptKind,
+    content: String,
+    sha256: String,
+}
+
+/// Strips `path` down to the basename without script extension or Rojo
+/// kind suffix. `src/Foo.server.luau` → `Foo`. Used for the offline-rename
+/// tiebreaker — two candidates with the same content hash but different
+/// basenames score lower than ones that kept the human-readable name.
+fn rojo_basename_stem(path: &str) -> String {
+    let basename = path.rsplit('/').next().unwrap_or(path);
+    let lower = basename.to_ascii_lowercase();
+    let after_ext = lower
+        .strip_suffix(".luau")
+        .or_else(|| lower.strip_suffix(".lua"))
+        .unwrap_or(&lower);
+    let after_kind = after_ext
+        .strip_suffix(".server")
+        .or_else(|| after_ext.strip_suffix(".client"))
+        .unwrap_or(after_ext);
+    after_kind.to_owned()
+}
+
+/// Score one candidate `(old, new)` pairing for the offline-rename
+/// heuristic. Higher is better. Same basename dominates; longest common
+/// path prefix breaks ties; lexicographic order is the deterministic
+/// fallback so the same pair always wins for the same inputs.
+fn score_offline_pair(old_path: &str, new_path: &str) -> i64 {
+    let basename_match: i64 = if rojo_basename_stem(old_path) == rojo_basename_stem(new_path) {
+        100_000
+    } else {
+        0
+    };
+    let prefix_len: i64 = old_path
+        .as_bytes()
+        .iter()
+        .zip(new_path.as_bytes().iter())
+        .take_while(|(a, b)| a == b)
+        .count() as i64;
+    basename_match + prefix_len
+}
+
+/// Compares `tree_base` (what the daemon last saw at the end of the
+/// previous session) against the plugin's just-arrived `studio_snapshot`
+/// to spot renames that happened while the plugin was offline. A "rename"
+/// here means the same `(kind, sha256)` shows up under a different path.
+/// Empty content is excluded — boilerplate `return nil`-style scripts
+/// would collide constantly and the false-positive cost outweighs the
+/// occasional missed history-preserving rename.
+fn detect_offline_renames(
+    tree_base: &crate::tree::Tree,
+    snapshot: &[StudioFileSnapshot],
+) -> Vec<OfflineRenamePair> {
+    let empty_sha = sha256_hex(b"");
+    let snapshot_paths: HashSet<&str> = snapshot.iter().map(|s| s.path.as_str()).collect();
+
+    let removed: Vec<(&String, &TreeEntry)> = tree_base
+        .iter()
+        .filter(|(p, _)| !snapshot_paths.contains(p.as_str()))
+        .collect();
+
+    let mut buckets: HashMap<(ScriptKind, String), Vec<&StudioFileSnapshot>> = HashMap::new();
+    for s in snapshot {
+        if tree_base.contains_key(&s.path) {
+            continue;
+        }
+        if s.sha256 == empty_sha {
+            continue;
+        }
+        buckets
+            .entry((s.kind, s.sha256.clone()))
+            .or_default()
+            .push(s);
+    }
+
+    // Sort removed paths so iteration order is stable across runs.
+    let mut removed_sorted = removed;
+    removed_sorted.sort_by(|a, b| a.0.cmp(b.0));
+
+    let mut pairs: Vec<OfflineRenamePair> = Vec::new();
+    let mut consumed: HashSet<String> = HashSet::new();
+
+    for (old_path, entry) in removed_sorted {
+        if entry.sha256 == empty_sha {
+            continue;
+        }
+        let key = (entry.kind, entry.sha256.clone());
+        let Some(cands) = buckets.get(&key) else {
+            continue;
+        };
+        let mut best: Option<(i64, &StudioFileSnapshot)> = None;
+        for cand in cands {
+            if consumed.contains(&cand.path) {
+                continue;
+            }
+            let score = score_offline_pair(old_path, &cand.path);
+            match best {
+                None => best = Some((score, cand)),
+                Some((s, _)) if score > s => best = Some((score, cand)),
+                Some((s, prev)) if score == s && cand.path < prev.path => {
+                    best = Some((score, cand));
+                }
+                _ => {}
+            }
+        }
+        if let Some((_, picked)) = best {
+            consumed.insert(picked.path.clone());
+            pairs.push(OfflineRenamePair {
+                old_path: old_path.clone(),
+                new_path: picked.path.clone(),
+                kind: entry.kind,
+                content: entry.content.clone(),
+                sha256: entry.sha256.clone(),
+            });
+        }
+    }
+    pairs
+}
+
+/// Drops `Foo.luau` from `tree_fs` (and the disk file alongside it) when
+/// a `Foo/init.luau` (or its `.server`/`.client` flavors) lives in the
+/// same directory. Without this sweep, a project that survived a buggy
+/// promotion in a previous session would re-materialize both copies in
+/// Studio every reconnect — see Bug #2 in the plan.
+async fn sweep_leaf_folder_duplicates(
+    state: &SharedState,
+    bcast_tx: &broadcast::Sender<Arc<ServerMsg>>,
+) {
+    let duplicates: Vec<String> = {
+        let guard = state.read().await;
+        let fs = &guard.tree_fs;
+        fs.keys()
+            .filter(|p| !is_init_filename(p))
+            .filter(|p| {
+                let basename = match p.rsplit('/').next() {
+                    Some(b) => b,
+                    None => return false,
+                };
+                let lower = basename.to_ascii_lowercase();
+                let stem = match lower
+                    .strip_suffix(".luau")
+                    .or_else(|| lower.strip_suffix(".lua"))
+                {
+                    Some(s) => s,
+                    None => return false,
+                };
+                let bare = stem
+                    .strip_suffix(".server")
+                    .or_else(|| stem.strip_suffix(".client"))
+                    .unwrap_or(stem);
+                let dir_prefix = p
+                    .rsplit_once('/')
+                    .map(|(d, _)| format!("{d}/"))
+                    .unwrap_or_default();
+                let init_candidates = [
+                    format!("{dir_prefix}{bare}/init.luau"),
+                    format!("{dir_prefix}{bare}/init.lua"),
+                    format!("{dir_prefix}{bare}/init.server.luau"),
+                    format!("{dir_prefix}{bare}/init.server.lua"),
+                    format!("{dir_prefix}{bare}/init.client.luau"),
+                    format!("{dir_prefix}{bare}/init.client.lua"),
+                ];
+                init_candidates.iter().any(|c| fs.contains_key(c.as_str()))
+            })
+            .cloned()
+            .collect()
+    };
+    for path in duplicates {
+        warn!(path = %path, "handshake sweep: dropping leaf script that duplicates X/init.luau");
+        broadcast_server_msg(
+            state,
+            bcast_tx,
+            ServerMsg::SyncError {
+                kind: SyncErrorKind::SnapshotEntryDropped,
+                path: path.clone(),
+                reason: format!(
+                    "{path} duplicates an existing init.luau in the same folder; dropping the leaf"
+                ),
+            },
+        )
+        .await;
+        if let Err(e) = delete_from_fs(state, &path, bcast_tx, true).await {
+            warn!(path = %path, error = ?e, "sweep delete failed");
+        }
+    }
+}
+
+async fn handle_name_collision(
+    state: &SharedState,
+    path: String,
+    _sha256: String,
+    bcast_tx: &broadcast::Sender<Arc<ServerMsg>>,
+) -> Result<()> {
+    let (root, session_id, message) = {
+        let mut guard = state.write().await;
+        // Validate but don't reject — the path is informational; even an
+        // unsafe one is worth logging so the user sees the warning.
+        let inserted = guard.pending_collisions.insert(path.clone());
+        let root = guard.root.clone();
+        let session_id = guard.session_id.clone();
+        if !inserted {
+            return Ok(());
+        }
+        let message = format!(
+            "Two scripts collide at {path}. Rename one in Studio to resolve."
+        );
+        (root, session_id, message)
+    };
+    audit::record(
+        &root,
+        &audit::Entry {
+            ts: audit::now_rfc3339(),
+            kind: audit::Kind::NameCollisionDetected,
+            path: &path,
+            sha_before: None,
+            sha_after: None,
+            session_id: &session_id,
+            note: None,
+        },
+    );
+    broadcast_server_msg(
+        state,
+        bcast_tx,
+        ServerMsg::NameCollision { path, message },
+    )
+    .await;
+    Ok(())
 }
 
 async fn handle_conflict_resolved(
@@ -1884,6 +2863,71 @@ async fn handshake(
     bcast_tx: &broadcast::Sender<Arc<ServerMsg>>,
 ) -> Result<(Vec<FileConflictView>, Vec<FileSnapshot>, Project)> {
     let cold_boot = snapshot.is_empty();
+
+    // 0a. Drop leaf scripts that duplicate a sibling `init.luau` on disk.
+    //     Otherwise we'd materialize both in Studio on reconnect — see Bug #2.
+    sweep_leaf_folder_duplicates(state, bcast_tx).await;
+
+    // 0b. Detect renames that happened while the plugin was offline by
+    //     matching disappeared `tree_base` paths against new `snapshot`
+    //     paths with identical `(kind, sha256)`. Promote each pair to a
+    //     real `fs::rename` so git keeps history.
+    if !cold_boot {
+        let pairs = {
+            let guard = state.read().await;
+            detect_offline_renames(&guard.tree_base, &snapshot)
+        };
+        if !pairs.is_empty() {
+            let (root, session_id) = {
+                let guard = state.read().await;
+                (guard.root.clone(), guard.session_id.clone())
+            };
+            let count_note = format!("{} pair(s)", pairs.len());
+            audit::record(
+                &root,
+                &audit::Entry {
+                    ts: audit::now_rfc3339(),
+                    kind: audit::Kind::OfflineRenamesDetected,
+                    path: "",
+                    sha_before: None,
+                    sha_after: None,
+                    session_id: &session_id,
+                    note: Some(&count_note),
+                },
+            );
+            for pair in &pairs {
+                if let Err(e) = handle_studio_renamed(
+                    state,
+                    pair.old_path.clone(),
+                    pair.new_path.clone(),
+                    pair.kind,
+                    pair.content.clone(),
+                    pair.sha256.clone(),
+                    bcast_tx,
+                )
+                .await
+                {
+                    warn!(
+                        old = %pair.old_path,
+                        new = %pair.new_path,
+                        error = ?e,
+                        "offline rename promotion failed; falling back to delete+create"
+                    );
+                }
+            }
+            // IMPORTANT: do NOT retain the snapshot. The previous version
+            // dropped `new_path` entries from the snapshot here, reasoning
+            // that the merge below would otherwise see them as "create".
+            // But the next step (`tree_studio.clear()` + ingest) then
+            // leaves `tree_studio[new_path] = MISSING`, while
+            // `tree_base[new_path]` and `tree_fs[new_path]` are present
+            // (from handle_studio_renamed). The 3-way merge reads that
+            // as "Studio deleted it" and emits `Apply { side: Fs,
+            // content: None }` — i.e. *deletes the file we just
+            // created via rename*. Keep the snapshot intact so the
+            // tree_studio ingest re-adds the new_path entries.
+        }
+    }
 
     // 1. Ingest the snapshot into tree_studio.
     {
@@ -2513,7 +3557,7 @@ async fn run_plugin_session(
                 session_id: new_session_id,
                 // CARGO_PKG_VERSION is the daemon's own version baked
                 // in at compile time — no runtime config needed.
-                daemon_version: env!("CARGO_PKG_VERSION").to_string(),
+                daemon_version: format!("{}+{}", env!("CARGO_PKG_VERSION"), BUILD_STAMP),
                 project_root,
             },
         )
@@ -2596,6 +3640,20 @@ async fn run_plugin_session(
                         dispatch_client_frame(&state, &sessions, &frame, &bcast_tx).await
                     {
                         warn!(%peer, error = ?e, "client frame handling failed");
+                        // Surface the failure to the plugin dock instead of
+                        // letting it die in stderr. Without this, any `?`
+                        // that propagates out of a handler (fs::rename
+                        // refusing, deadlock recovery, etc.) is invisible.
+                        broadcast_server_msg(
+                            &state,
+                            &bcast_tx,
+                            ServerMsg::SyncError {
+                                kind: SyncErrorKind::HandlerFailed,
+                                path: String::new(),
+                                reason: format!("client frame handler failed: {e:#}"),
+                            },
+                        )
+                        .await;
                     }
                 }
             },
@@ -3152,7 +4210,41 @@ async fn dispatch_client_frame(
             return Ok(());
         }
     }
-    let msg = parse_client_msg(frame)?;
+    let msg = match parse_client_msg(frame) {
+        Ok(m) => m,
+        Err(e) => {
+            // Surface parse failures back to the plugin so the dock log
+            // shows them — otherwise an outdated daemon silently drops
+            // every frame it doesn't recognize and the user sees no
+            // feedback (exactly the rename bug we're chasing).
+            let preview = match frame {
+                Message::Text(t) => t.chars().take(160).collect::<String>(),
+                _ => String::new(),
+            };
+            warn!(error = ?e, preview = %preview, "parse_client_msg failed");
+            broadcast_server_msg(
+                state,
+                bcast_tx,
+                ServerMsg::SyncError {
+                    kind: SyncErrorKind::UnsafePath,
+                    path: String::new(),
+                    reason: format!("daemon rejected client frame: {e:#}"),
+                },
+            )
+            .await;
+            return Ok(());
+        }
+    };
+    let msg_kind_label = match &msg {
+        ClientMsg::FileRenamed { .. } => "file_renamed",
+        ClientMsg::FileChanged { .. } => "file_changed",
+        ClientMsg::FileCreated { .. } => "file_created",
+        ClientMsg::FileDeleted { .. } => "file_deleted",
+        ClientMsg::NameCollision { .. } => "name_collision",
+        ClientMsg::Hello { .. } => "hello",
+        _ => "other",
+    };
+    info!(kind = msg_kind_label, "dispatch_client_frame");
     match msg {
         ClientMsg::Hello { .. } => {
             warn!("received unexpected Hello mid-session; ignoring");
@@ -3183,6 +4275,18 @@ async fn dispatch_client_frame(
             handle_studio_changed(state, path, content, sha256, Some(kind), false, bcast_tx).await
         }
         ClientMsg::FileDeleted { path } => handle_studio_deleted(state, path, bcast_tx).await,
+        ClientMsg::FileRenamed {
+            old_path,
+            new_path,
+            kind,
+            content,
+            sha256,
+        } => {
+            handle_studio_renamed(state, old_path, new_path, kind, content, sha256, bcast_tx).await
+        }
+        ClientMsg::NameCollision { path, sha256 } => {
+            handle_name_collision(state, path, sha256, bcast_tx).await
+        }
         ClientMsg::ConflictResolved { resolutions } => {
             handle_conflict_resolved(state, resolutions, bcast_tx).await
         }
@@ -3758,6 +4862,8 @@ fn server_msg_kind(msg: &ServerMsg) -> &'static str {
         ServerMsg::FileCreated { .. } => "file_created",
         ServerMsg::FileChanged { .. } => "file_changed",
         ServerMsg::FileDeleted { .. } => "file_deleted",
+        ServerMsg::FileRenamed { .. } => "file_renamed",
+        ServerMsg::NameCollision { .. } => "name_collision",
         ServerMsg::AttributesChanged { .. } => "attributes_changed",
         ServerMsg::ConflictDetected { .. } => "conflict_detected",
         ServerMsg::SyncbackAck { .. } => "syncback_ack",

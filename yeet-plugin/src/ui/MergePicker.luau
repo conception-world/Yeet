@@ -641,11 +641,17 @@ local function mergedRow(
 	onRemove: () -> ()
 ): any
 	-- Layout: [provenance badge] [body text] [↑/↓/✕ controls]
-	-- Body shifts right by 22 to leave room for the badge; controls
-	-- now occupy the rightmost 120px (was 90 px) so the three
-	-- buttons fit at 32 px each with 6 px gaps. Earlier 26×LINE_HEIGHT
-	-- with 2 px gaps was a cramped tap target — uncomfortable for
-	-- precision merging.
+	-- Compact icon-button cluster. Earlier full-bleed red on the
+	-- remove button screamed at every row; pure transparent on all
+	-- three lost the "this is clickable" affordance. The middle
+	-- ground: subtle `surfaceActive` fills with corner rounding so
+	-- each control reads as a discrete button without dominating
+	-- the row. Disabled arrows fall back to `diffGutter` (the same
+	-- shade as inactive line-number gutters elsewhere in the
+	-- picker) so the affordance stays present but visibly inert.
+	local CTRL_SIZE = 24
+	local CTRL_GAP = 4
+	local CTRL_AREA = CTRL_SIZE * 3 + CTRL_GAP * 2 + 8  -- 84 px incl. right padding
 	return Roact.createElement("Frame", {
 		Size = UDim2.new(1, 0, 0, LINE_HEIGHT + 4),
 		BackgroundColor3 = theme.colors.surface,
@@ -655,7 +661,7 @@ local function mergedRow(
 		badge = provenanceBadge(entry.source),
 		body = Roact.createElement("TextLabel", {
 			Position = UDim2.new(0, 22, 0, 0),
-			Size = UDim2.new(1, -142, 1, 0),
+			Size = UDim2.new(1, -(22 + CTRL_AREA), 1, 0),
 			BackgroundTransparency = 1,
 			Text = entry.text,
 			TextColor3 = theme.colors.text,
@@ -671,25 +677,28 @@ local function mergedRow(
 			}),
 		}),
 		controls = Roact.createElement("Frame", {
-			Position = UDim2.new(1, -120, 0, 0),
-			Size = UDim2.new(0, 120, 1, 0),
+			Position = UDim2.new(1, -CTRL_AREA, 0, 0),
+			Size = UDim2.new(0, CTRL_AREA, 1, 0),
 			BackgroundTransparency = 1,
 		}, {
+			pad = Roact.createElement("UIPadding", {
+				PaddingRight = UDim.new(0, 8),
+			}),
 			layout = Roact.createElement("UIListLayout", {
 				FillDirection = Enum.FillDirection.Horizontal,
 				SortOrder = Enum.SortOrder.LayoutOrder,
 				HorizontalAlignment = Enum.HorizontalAlignment.Right,
 				VerticalAlignment = Enum.VerticalAlignment.Center,
-				Padding = UDim.new(0, 6),
+				Padding = UDim.new(0, CTRL_GAP),
 			}),
 			up = Roact.createElement("TextButton", {
-				Size = UDim2.new(0, 32, 0, LINE_HEIGHT + 2),
+				Size = UDim2.fromOffset(CTRL_SIZE, CTRL_SIZE),
 				BackgroundColor3 = if idx > 1 then theme.colors.surfaceActive else theme.colors.diffGutter,
 				BorderSizePixel = 0,
 				Text = "↑",
-				TextColor3 = theme.colors.text,
+				TextColor3 = if idx > 1 then theme.colors.text else theme.colors.textMuted,
 				Font = theme.typography.label.font,
-				TextSize = theme.typography.label.size,
+				TextSize = theme.typography.label.size + 1,
 				LayoutOrder = 1,
 				Active = idx > 1,
 				AutoButtonColor = idx > 1,
@@ -702,13 +711,13 @@ local function mergedRow(
 				}),
 			}),
 			down = Roact.createElement("TextButton", {
-				Size = UDim2.new(0, 32, 0, LINE_HEIGHT + 2),
+				Size = UDim2.fromOffset(CTRL_SIZE, CTRL_SIZE),
 				BackgroundColor3 = if idx < total then theme.colors.surfaceActive else theme.colors.diffGutter,
 				BorderSizePixel = 0,
 				Text = "↓",
-				TextColor3 = theme.colors.text,
+				TextColor3 = if idx < total then theme.colors.text else theme.colors.textMuted,
 				Font = theme.typography.label.font,
-				TextSize = theme.typography.label.size,
+				TextSize = theme.typography.label.size + 1,
 				LayoutOrder = 2,
 				Active = idx < total,
 				AutoButtonColor = idx < total,
@@ -720,15 +729,23 @@ local function mergedRow(
 					CornerRadius = UDim.new(0, theme.radius.sm),
 				}),
 			}),
+			-- Remove pill: subtle decline-tinted background instead of
+			-- the previous full-saturation red. The glyph is plain
+			-- ASCII "X" — the unicode ✕ (U+2715) doesn't ship in
+			-- Roblox's default Gotham fallback chain on every
+			-- Studio install, so it sometimes rendered as a
+			-- missing-glyph box. "X" is universally available.
 			remove = Roact.createElement("TextButton", {
-				Size = UDim2.new(0, 32, 0, LINE_HEIGHT + 2),
+				Size = UDim2.fromOffset(CTRL_SIZE, CTRL_SIZE),
 				BackgroundColor3 = theme.colors.accentDecline,
+				BackgroundTransparency = 0.5,
 				BorderSizePixel = 0,
-				Text = "✕",
+				Text = "X",
 				TextColor3 = theme.colors.text,
 				Font = theme.typography.label.font,
-				TextSize = theme.typography.label.size,
+				TextSize = theme.typography.label.size + 1,
 				LayoutOrder = 3,
+				AutoButtonColor = true,
 				[Roact.Event.Activated] = safeActivated(onRemove),
 			}, {
 				corner = Roact.createElement("UICorner", {
@@ -782,7 +799,11 @@ local function MergePickerView(props: ViewProps)
 	)
 	local panelGap = theme.spacing.sm
 	local halfWidth = UDim2.new(0.5, -math.floor(panelGap / 2), 1, 0)
-	local pickHint = "click a line to add to merged · ✓ = already in"
+	-- Short, low-noise hint. The earlier "click a line to add to merged ·
+	-- ✓ = already in" packed two ideas into one wrap-prone line; users
+	-- end up reading neither. The ✓ glyph already sits on every
+	-- included row, so the second clause was redundant.
+	local pickHint = "click to add"
 	local studioPanel = sourcePanel(
 		"STUDIO",
 		theme.colors.accentStudio,
@@ -897,8 +918,13 @@ local function MergePickerView(props: ViewProps)
 		ScrollBarThickness = 6,
 		ScrollBarImageColor3 = theme.colors.surface,
 	}, mergedChildren)
+	-- The S / I / = legend lived here because the old design had no
+	-- visual grouping for the bulk actions; the user had nowhere else
+	-- to learn what the badges meant. Now that the header carries a
+	-- dedicated legend chip, the merged hint can shrink to just the
+	-- per-row controls and the line count.
 	local mergedHint = string.format(
-		"%d line(s) · S=Studio · I=IDE · ==unchanged · ↑↓ reorder · ✕ drop",
+		"%d line(s) · ↑↓ reorder · ✕ remove",
 		#props.merged
 	)
 	local mergedPanelEl = sourcePanel(
@@ -957,23 +983,101 @@ local function MergePickerView(props: ViewProps)
 					VerticalAlignment = Enum.VerticalAlignment.Center,
 					Padding = UDim.new(0, theme.spacing.sm),
 				}),
+				-- Header for the three bulk-fill buttons. A small muted
+				-- label makes the trio read as a related group instead
+				-- of four flat ghost buttons fighting for attention.
+				quickFillHint = Roact.createElement("TextLabel", {
+					Size = UDim2.new(0, 0, 1, 0),
+					AutomaticSize = Enum.AutomaticSize.X,
+					BackgroundTransparency = 1,
+					Text = "Quick fill:",
+					TextColor3 = theme.colors.textMuted,
+					Font = theme.typography.label.font,
+					TextSize = theme.typography.label.size,
+					TextXAlignment = Enum.TextXAlignment.Left,
+					LayoutOrder = 1,
+				}),
 				reset = Roact.createElement(Button, {
-					text = "Reset to default",
+					text = "Reset",
 					variant = "ghost",
-					layoutOrder = 1,
+					layoutOrder = 2,
 					onClick = props.onResetDefault,
 				}),
 				takeStudio = Roact.createElement(Button, {
-					text = "Take all Studio",
+					text = "All Studio",
 					variant = "ghost",
-					layoutOrder = 2,
+					layoutOrder = 3,
 					onClick = props.onTakeAllStudio,
 				}),
 				takeIde = Roact.createElement(Button, {
-					text = "Take all IDE",
+					text = "All IDE",
 					variant = "ghost",
-					layoutOrder = 3,
+					layoutOrder = 4,
 					onClick = props.onTakeAllIde,
+				}),
+				-- Flex spacer + thin divider separating the bulk-fill
+				-- trio from the view toggle. They serve different
+				-- intents (mutate merged buffer vs. change what's
+				-- visible) — pushing the toggle to the right and
+				-- dropping a 1px stroke between groups makes that
+				-- distinction visible at a glance.
+				spacer = Roact.createElement("Frame", {
+					Size = UDim2.fromScale(0, 1),
+					BackgroundTransparency = 1,
+					LayoutOrder = 5,
+				}, {
+					flex = Roact.createElement("UIFlexItem", {
+						FlexMode = Enum.UIFlexMode.Fill,
+					}),
+				}),
+				-- Legend chip: visually parallel to the merged-row
+				-- badges so the user can match the colour swatches to
+				-- "S = Studio · I = IDE · = unchanged" without
+				-- crowding the merged-area hint with the same text.
+				legendStudio = Roact.createElement("TextLabel", {
+					Size = UDim2.fromOffset(20, 18),
+					BackgroundColor3 = theme.colors.accentStudio,
+					BorderSizePixel = 0,
+					Text = "S",
+					TextColor3 = theme.colors.text,
+					Font = theme.typography.label.font,
+					TextSize = theme.typography.label.size,
+					TextXAlignment = Enum.TextXAlignment.Center,
+					LayoutOrder = 6,
+				}, {
+					corner = Roact.createElement("UICorner", {
+						CornerRadius = UDim.new(0, theme.radius.sm),
+					}),
+				}),
+				legendIde = Roact.createElement("TextLabel", {
+					Size = UDim2.fromOffset(20, 18),
+					BackgroundColor3 = theme.colors.accentIde,
+					BorderSizePixel = 0,
+					Text = "I",
+					TextColor3 = theme.colors.text,
+					Font = theme.typography.label.font,
+					TextSize = theme.typography.label.size,
+					TextXAlignment = Enum.TextXAlignment.Center,
+					LayoutOrder = 7,
+				}, {
+					corner = Roact.createElement("UICorner", {
+						CornerRadius = UDim.new(0, theme.radius.sm),
+					}),
+				}),
+				legendBoth = Roact.createElement("TextLabel", {
+					Size = UDim2.fromOffset(20, 18),
+					BackgroundColor3 = theme.colors.surfaceActive,
+					BorderSizePixel = 0,
+					Text = "=",
+					TextColor3 = theme.colors.textMuted,
+					Font = theme.typography.label.font,
+					TextSize = theme.typography.label.size,
+					TextXAlignment = Enum.TextXAlignment.Center,
+					LayoutOrder = 8,
+				}, {
+					corner = Roact.createElement("UICorner", {
+						CornerRadius = UDim.new(0, theme.radius.sm),
+					}),
 				}),
 				-- Toggle between hunk-only view (default) and full-file
 				-- view. Hunk-only is the right default for production
@@ -985,7 +1089,7 @@ local function MergePickerView(props: ViewProps)
 				toggleShowFull = Roact.createElement(Button, {
 					text = if props.showFullFile then "Hide unchanged" else "Show all lines",
 					variant = if props.showFullFile then "accept" else "ghost",
-					layoutOrder = 4,
+					layoutOrder = 9,
 					onClick = props.onToggleShowFull,
 				}),
 			}),

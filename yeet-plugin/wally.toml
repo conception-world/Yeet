@@ -6,7 +6,7 @@
 
 [package]
 name = "conception-world/yeet-plugin"
-version = "0.1.2"
+version = "0.2.0"
 registry = "https://github.com/UpliftGames/wally-index"
 realm = "shared"
 

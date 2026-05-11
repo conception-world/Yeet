@@ -4,6 +4,72 @@ All notable changes to the Yeet VS Code extension are documented here.
 The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/);
 versions follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.4.0] — Rename support + real error surfacing
+
+### Added
+- **Bidirectional rename detection** — moving, renaming, or
+  reparenting a script in Studio now syncs to disk via
+  `fs::rename` (history-preserving) instead of delete+create. The
+  same pairing works in the other direction: an IDE-side rename is
+  detected by matching watcher Remove/Touched events with the same
+  sha256 inside a 250 ms window and surfaced as a single
+  `FileRenamed` to the plugin.
+- All four rename shapes are handled: leaf↔leaf (`Foo.luau` →
+  `Bar.luau`), folder↔folder (`Foo/init.luau` → `Bar/init.luau`),
+  promote (`Foo.luau` → `Foo/init.luau` when a child is added), and
+  demote (folder collapses back to leaf when its last child is
+  removed). Promote stages through a `.yeet-tmp` to dodge the
+  path-occupied collision; demote refuses if the directory still
+  holds children.
+- **Name-collision detection** — when two `LuaSourceContainer`
+  instances in Studio resolve to the same project path, sync for
+  that path pauses until a rename clears it. The plugin dock log
+  surfaces "sync paused for X" and the daemon rejects further edits
+  to that path with `NameCollisionPending` so neither side overwrites
+  the other.
+- **Plugin Connecting… state** — the Connect button now shows a
+  yellow `Connecting…` pill with a `Click to stop` hint while the
+  WebSocket handshake or a reconnect attempt is in flight. Same
+  visual during automatic backoff cycles so the user can bail out
+  of a stalled retry loop without waiting for the timeout.
+
+### Changed
+- **Line-by-Line Merge dock**: header reorganised into a `Quick
+  fill:` group (Reset / All Studio / All IDE), a colour legend
+  chip (S / I / =), and a separated `Show all lines` toggle. Per-row
+  controls collapsed from a 120 px filled-button cluster to a 84 px
+  icon cluster with subtle backgrounds — much less visual noise in
+  long merges. Remove button now uses ASCII `X` (the previous `✕`
+  rendered as a missing-glyph square on some Studio installs).
+- **Sync Preview migrate buttons** recoloured by source side instead
+  of destructiveness: `Studio → IDE` paints blue (`accentStudio`),
+  `IDE → Studio` paints orange (`accentIde`). The two-click confirm
+  state still flips to green to mark the deliberate commit.
+
+### Fixes
+- **Daemon I/O errors now reach the user.** OneDrive holds,
+  antivirus locks, missing source files, and refused demote-renames
+  used to fail silently in the daemon's stderr while the plugin saw
+  nothing. They now surface in the plugin dock via the new
+  `SyncErrorKind::HandlerFailed` with the underlying error string
+  intact — the user gets a real failure mode to chase instead of a
+  no-op.
+- **OneDrive rename retry** — `fs::rename` is wrapped in a
+  100/200/300 ms backoff that recovers from the transient
+  `PermissionDenied` / `STATUS_SHARING_VIOLATION` the OneDrive
+  client emits while it momentarily holds the rename target. Real
+  failures still surface immediately on the first non-recoverable
+  errno.
+- Rename echo suppression on the watcher side: a daemon-initiated
+  `fs::rename` no longer triggers a phantom `FileChanged` round-trip
+  via the watcher's own observation of the new path.
+
+### Removed
+- The toolbar `Show Sync` escape-hatch button. It was a workaround
+  for an early Studio-dock-position bug that the per-VM widget-ID
+  fix in v0.3.0 closed; the button hung around unused and confused
+  the toolbar.
+
 ## [0.3.0] — Initial public release
 
 ### Added
