@@ -1556,11 +1556,21 @@ async fn record_conflict(
     conflict: FileConflict,
     bcast_tx: &broadcast::Sender<Arc<ServerMsg>>,
 ) -> Result<()> {
-    let view = conflict_to_view(&conflict);
     let mut guard = state.write().await;
-    guard
-        .pending_conflicts
-        .insert(conflict.path.clone(), conflict);
+    if guard.pending_conflicts.contains_key(&conflict.path) {
+        // A conflict for this path is already waiting for the user to resolve
+        // it in the UI. Overwriting it would corrupt the resolution: the user
+        // would finish resolving the old conflict, submit their hunks, and the
+        // daemon would apply them to a different snapshot. Drop the new event
+        // and let the existing conflict stand.
+        debug!(
+            path = %conflict.path,
+            "dropping new conflict: resolution already pending for this path"
+        );
+        return Ok(());
+    }
+    let view = conflict_to_view(&conflict);
+    guard.pending_conflicts.insert(conflict.path.clone(), conflict);
     drop(guard);
     broadcast_server_msg(
         state,
