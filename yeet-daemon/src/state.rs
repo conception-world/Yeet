@@ -389,6 +389,7 @@ impl ProjectState {
     pub fn forget_fs_file(&mut self, abs: &Path) -> Option<String> {
         let rel = self.relative(abs)?;
         self.meta.remove(&rel);
+        self.meta_attributes.remove(&rel);
         self.tree_fs.remove(&rel).map(|_| rel)
     }
 
