@@ -573,7 +573,7 @@ type WidgetSettings = {
 function Widget.new(plugin: Plugin, initialSettings: WidgetSettings?): Widget
   local info = DockWidgetPluginGuiInfo.new(Enum.InitialDockState.Right, false, false, 320, 480, 280, 360)
   local gui = plugin:CreateDockWidgetPluginGui(WIDGET_ID, info)
-  gui.Title = "Yeet v0.4.0"
+  gui.Title = "Yeet v0.4.1"
   gui.Name = WIDGET_ID
 
   local resolver = ConflictResolver.new(plugin) :: any
@@ -1206,7 +1206,7 @@ function Widget._onConnectPressed(self: Widget)
         -- in lockstep with breaking protocol changes so the daemon can
         -- refuse old plugins instead of silently misinterpreting their
         -- frames.
-        version = "0.4.0",
+        version = "0.4.1",
         studio_snapshot = {},
         request_bootstrap_preview = true,
       }

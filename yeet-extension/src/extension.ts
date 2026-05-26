@@ -19,7 +19,7 @@ const KILL_GRACE_MS = 2000;
 // warning naming both versions; sync continues to operate (semver
 // minor compat usually holds), but the user knows what to fix when
 // behavior gets weird.
-const EXPECTED_DAEMON_VERSION = "0.4.0";
+const EXPECTED_DAEMON_VERSION = "0.4.1";
 // How long the pre-spawn TCP probe waits for `connect` to settle
 // before declaring the port unbound. Short enough that startDaemon
 // stays responsive; long enough to catch a daemon whose accept

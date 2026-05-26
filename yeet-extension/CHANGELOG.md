@@ -4,6 +4,24 @@ All notable changes to the Yeet VS Code extension are documented here.
 The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/);
 versions follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.4.1] — Conflict-overwrite guard + meta_attributes cleanup
+
+### Fixed
+- **Pending conflict no longer overwritten before resolution** — when
+  a second conflict event arrived for a path that already had a
+  conflict waiting in the resolver UI, the daemon used to replace the
+  pending snapshot. Resolving the original conflict then applied the
+  user's hunks over the wrong base. The daemon now drops the second
+  event and keeps the original conflict intact until the user finishes
+  resolving it. Originally contributed by @IBorgesDev.
+- **`meta_attributes` no longer leaks across delete/rename** — the
+  per-script attribute map kept stale entries after a tracked file
+  was deleted, and lost attributes when a file or its containing
+  folder was renamed. Delete now drops the attributes; rename
+  transfers them old→new; directory rename walks the prefix via a
+  dedicated rekey helper, matching how the rest of the in-memory
+  trees already worked.
+
 ## [0.4.0] — Rename support + real error surfacing
 
 ### Added

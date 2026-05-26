@@ -8,7 +8,7 @@ end
 
 -- Stamp the Studio Output so a reload can be verified without opening any
 -- widget. Match the version tag on `Widget` / `ConflictResolver` titles.
-print("[Yeet] plugin loaded v0.4.0")
+print("[Yeet] plugin loaded v0.4.1")
 
 -- Sweep orphan scratch instances from previous Yeet sessions out of
 -- ServerStorage. ConflictResolver and BulkSyncPreview both stash a
