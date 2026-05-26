@@ -85,40 +85,23 @@ local KEY_DAEMON_URL = "yeet_setting_daemonUrl"
 --      wrote directly. Returns as-is.
 --   3. Anything else (nil, table, etc.) — returns nil so the
 --      caller falls back to the default.
--- Logs every read for debugging "settings don't persist" reports.
 local function decodeStored(p: Plugin, key: string): any
 	local ok, raw = pcall(function() return p:GetSetting(key) end)
 	if not ok then
-		print(string.format(
+		warn(string.format(
 			"[Yeet:settings] read %s: GetSetting threw (%s)", key, tostring(raw)
 		))
 		return nil
 	end
-	-- Common case: stored as JSON-wrapped string by `Settings.save`.
 	if typeof(raw) == "string" then
 		local decodeOk, decoded = pcall(function()
 			return HttpService:JSONDecode(raw)
 		end)
 		if decodeOk and typeof(decoded) == "table" and decoded.v ~= nil then
-			print(string.format(
-				"[Yeet:settings] read %s: type=%s, value=%s (decoded from JSON wrapper)",
-				key, typeof(decoded.v), tostring(decoded.v)
-			))
 			return decoded.v
 		end
-		-- Plain string from a legacy plugin version.
-		print(string.format(
-			"[Yeet:settings] read %s: type=string, value=%s (legacy plain)",
-			key, tostring(raw)
-		))
 		return raw
 	end
-	-- Legacy boolean / number from a plugin version before
-	-- the JSON-wrapping rewrite.
-	print(string.format(
-		"[Yeet:settings] read %s: type=%s, value=%s (legacy raw)",
-		key, typeof(raw), tostring(raw)
-	))
 	return raw
 end
 
@@ -214,11 +197,6 @@ function Settings.save(p: Plugin, s: Settings): SaveResult
 		end
 		-- Read-back same-tick to confirm the write actually persisted.
 		local readOk, readBack = pcall(function() return p:GetSetting(key) end)
-		print(string.format(
-			"[Yeet:settings] wrote %s = %s; readback ok=%s, type=%s, value=%s",
-			key, encoded,
-			tostring(readOk), typeof(readBack), tostring(readBack)
-		))
 		if not readOk or readBack == nil then
 			local msg = string.format(
 				"%s: did not persist (readback returned nil — Studio's "

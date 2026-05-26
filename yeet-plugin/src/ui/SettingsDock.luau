@@ -103,17 +103,6 @@ local function ToggleRow(props: ToggleRowProps)
 			size = UDim2.new(0, 60, 0, 28),
 			layoutOrder = 2,
 			onClick = function()
-				-- DEBUG: explicit print so a user reporting "settings
-				-- don't save" can confirm the click is propagating to
-				-- the handler. If you click the toggle and don't see
-				-- this line in Studio Output, the issue is upstream
-				-- of `onChange` (Button stroke / Roact event wiring).
-				print(string.format(
-					"[Yeet:settings] toggle '%s' clicked: %s -> %s",
-					tostring(props.label),
-					tostring(props.value),
-					tostring(not props.value)
-				))
 				props.onToggle(not props.value)
 			end,
 		}),
@@ -489,22 +478,10 @@ function SettingsDock._renderTree(self: SettingsDock)
 		recentlySaved = self.recentlySaved,
 		saveErrors = self.saveErrors,
 		onChange = function(key, value)
-			-- DEBUG: confirm onChange is firing. If a user reports
-			-- "toggle doesn't change" and doesn't see this line in
-			-- Studio Output, the click handler isn't reaching here
-			-- — investigate the Button → ToggleRow → onChange wire.
-			print(string.format(
-				"[Yeet:settings] onChange %s = %s (dirty=true)",
-				tostring(key),
-				tostring(value)
-			));
-			-- ^ explicit `;` so the Luau parser doesn't try to chain
-			-- the `(self.working :: any)` line below as an argument
-			-- list to `print(...)` (newline-call ambiguity).
-			-- typeof('table' field on a typed struct is awkward in
-			-- Luau without explicit casts; the dynamic indexing
-			-- below is intentional and the keys are validated
-			-- because we only render rows for known fields.
+			-- Dynamic indexing on a typed struct is awkward in Luau
+			-- without explicit casts; the cast is intentional and the
+			-- keys are validated because we only render rows for known
+			-- fields.
 			(self.working :: any)[key] = value
 			self.dirty = true
 			-- Editing after a save dismisses the "Saved" banner —

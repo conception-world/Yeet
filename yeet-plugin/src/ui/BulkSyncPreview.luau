@@ -1050,13 +1050,6 @@ function BulkSyncPreview.new(plugin: Plugin): BulkSyncPreview
   -- already allocated the slot from the first toggle.
   gui.Enabled = true
   gui.Enabled = false
-  print(
-    string.format(
-      "[Yeet] BulkSyncPreview.new: dock created, WIDGET_ID=%s, Enabled after warm-up=%s",
-      WIDGET_ID,
-      tostring(gui.Enabled)
-    )
-  )
 
   local self = setmetatable({
     plugin = plugin,
