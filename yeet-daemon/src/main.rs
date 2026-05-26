@@ -508,6 +508,9 @@ async fn handle_fs_event(
                 };
                 guard.tree_fs.insert(new_path.clone(), new_entry.clone());
                 guard.meta.insert(new_path.clone(), meta);
+                if let Some(attrs) = guard.meta_attributes.remove(&old_path) {
+                    guard.meta_attributes.insert(new_path.clone(), attrs);
+                }
                 if let Some(base) = guard.tree_base.remove(&old_path) {
                     guard.tree_base.insert(new_path.clone(), base);
                 }
@@ -984,6 +987,7 @@ async fn delete_from_fs(
     guard.tree_fs.remove(path);
     guard.tree_base.remove(path);
     guard.meta.remove(path);
+    guard.meta_attributes.remove(path);
     if broadcast_to_studio {
         guard.tree_studio.remove(path);
     }
@@ -2281,11 +2285,15 @@ async fn handle_studio_renamed(
         rekey_tree(&mut guard.tree_base, &old_dir_prefix, &new_dir_prefix);
         rekey_tree(&mut guard.tree_studio, &old_dir_prefix, &new_dir_prefix);
         rekey_meta(&mut guard.meta, &old_dir_prefix, &new_dir_prefix);
+        rekey_meta_attributes(&mut guard.meta_attributes, &old_dir_prefix, &new_dir_prefix);
     } else {
         guard.tree_fs.remove(&old_path);
         guard.tree_base.remove(&old_path);
         guard.tree_studio.remove(&old_path);
         guard.meta.remove(&old_path);
+        if let Some(attrs) = guard.meta_attributes.remove(&old_path) {
+            guard.meta_attributes.insert(new_path.clone(), attrs);
+        }
     }
     guard.tree_fs.insert(new_path.clone(), new_entry.clone());
     guard.tree_base.insert(new_path.clone(), new_entry.clone());
@@ -2402,6 +2410,25 @@ fn rekey_meta(meta: &mut HashMap<String, FileMeta>, old_prefix: &str, new_prefix
         let new_key = format!("{new_prefix}{suffix}");
         if let Some(entry) = meta.remove(&old_key) {
             meta.insert(new_key, entry);
+        }
+    }
+}
+
+fn rekey_meta_attributes<V>(
+    map: &mut HashMap<String, V>,
+    old_prefix: &str,
+    new_prefix: &str,
+) {
+    let to_move: Vec<String> = map
+        .keys()
+        .filter(|k: &&String| k.starts_with(old_prefix))
+        .cloned()
+        .collect();
+    for old_key in to_move {
+        let suffix = &old_key[old_prefix.len()..];
+        let new_key = format!("{new_prefix}{suffix}");
+        if let Some(entry) = map.remove(&old_key) {
+            map.insert(new_key, entry);
         }
     }
 }
