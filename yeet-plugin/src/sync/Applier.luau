@@ -336,6 +336,16 @@ end
 -- `LuaSourceContainer` descendant of a mapped `$path` — caller should
 -- treat that as a delete signal.
 function Applier.resolvePath(self: Applier, instance: Instance): (string?, ScriptKind?)
+	-- REGRESSION(M8): skip non-scripts up front, before the mapping loop and
+	-- `computePath`. computePath already returns nil for a non-
+	-- `LuaSourceContainer`, so resolvePath's result is unchanged (nil, nil);
+	-- this only saves the per-mapping IsDescendantOf + computePath work. It is
+	-- the resolver the SourceWatcher runs on every AncestryChanged, so when a
+	-- big container move fans that signal out across every tracked script the
+	-- non-script case bails immediately instead of scanning all mappings.
+	if not instance:IsA("LuaSourceContainer") then
+		return nil, nil
+	end
 	for mapPath, mapParent in pairs(self.mappings) do
 		if instance == mapParent or instance:IsDescendantOf(mapParent) then
 			local p, k = TreeBuilder.computePath(mapPath, mapParent, instance)
