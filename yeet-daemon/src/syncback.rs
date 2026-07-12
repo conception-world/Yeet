@@ -174,7 +174,7 @@ pub fn materialize(session: SyncbackSession, total_seq: u32) -> Result<SyncbackS
     let root_ordered = order_children(&root_children, ctx.instances);
 
     let src_dir = session.opts.target_path.join("src");
-    std::fs::create_dir_all(&src_dir)
+    std::fs::create_dir_all(extended_path(&src_dir))
         .with_context(|| format!("mkdir {}", src_dir.display()))?;
 
     for service_id in root_ordered {
@@ -184,7 +184,7 @@ pub fn materialize(session: SyncbackSession, total_seq: u32) -> Result<SyncbackS
         }
         let sanitized = sanitize_name(&service.name);
         let service_dir = src_dir.join(&sanitized);
-        std::fs::create_dir_all(&service_dir)
+        std::fs::create_dir_all(extended_path(&service_dir))
             .with_context(|| format!("mkdir {}", service_dir.display()))?;
         if has_custom_props(service) {
             ctx.stats.warnings.push(format!(
@@ -330,6 +330,19 @@ fn write_instance(
 ) -> Result<()> {
     let inst = &ctx.instances[&id];
 
+    // M7 (wally-6): never materialize a package-manager landing. These trees
+    // are generated and owned by Wally/pesde and get corrupted if syncback
+    // rewrites them (`.lua`→`.luau`, deformed structure); the package manager
+    // regenerates them via its own install step. Skip by name, mirroring the
+    // daemon's SWEEP_SKIP_DIR_NAMES.
+    if is_package_manager_dir(&sanitize_name(&inst.name)) {
+        ctx.stats.warnings.push(format!(
+            "skipped package-manager tree {}/{} during syncback (owned by the package manager, not written by Yeet)",
+            parent_rel, inst.name
+        ));
+        return Ok(());
+    }
+
     // Binary payloads carry their own subtree and aren't gated by
     // `include_non_script` — the plugin only emits them when the user has
     // explicitly opted in via `include_binary`. We still honor the daemon-side
@@ -358,11 +371,21 @@ fn write_instance(
     let script_kind = script_kind_of(inst);
     let child_ids = ctx.children.get(&id).cloned().unwrap_or_default();
 
-    let sanitized_base = sanitize_name(&inst.name);
+    let mut sanitized_base = sanitize_name(&inst.name);
+    // M21 (path-3): reserve the promotion stems (`init` / `init.server` /
+    // `init.client`) for a *leaf* script. Writing one as `init*.luau` lets the
+    // re-ingest reader promote the PARENT directory from it, absorbing this
+    // instance and shadowing a real folder-init.
+    if let Some(kind) = script_kind
+        && child_ids.is_empty()
+        && is_reserved_leaf_stem(&sanitized_base, kind)
+    {
+        sanitized_base = format!("_{sanitized_base}");
+    }
     let name = disambiguate(&sanitized_base, used_names);
     if name != inst.name {
         ctx.stats.warnings.push(format!(
-            "renamed {}/{} -> {}/{} (illegal or case-insensitive duplicate name)",
+            "renamed {}/{} -> {}/{} (illegal, reserved, or case-insensitive duplicate name)",
             parent_rel, inst.name, parent_rel, name
         ));
     }
@@ -383,7 +406,7 @@ fn write_instance(
         }
         (Some(kind), false) => {
             let dir_path = parent_dir.join(&name);
-            std::fs::create_dir_all(&dir_path)
+            std::fs::create_dir_all(extended_path(&dir_path))
                 .with_context(|| format!("mkdir {}", dir_path.display()))?;
             let init_name = format!("init{}.luau", script_suffix(kind));
             let init_path = dir_path.join(&init_name);
@@ -398,7 +421,7 @@ fn write_instance(
         }
         (None, has_no_children) => {
             let dir_path = parent_dir.join(&name);
-            std::fs::create_dir_all(&dir_path)
+            std::fs::create_dir_all(extended_path(&dir_path))
                 .with_context(|| format!("mkdir {}", dir_path.display()))?;
             let display_name = (inst.name != name).then(|| inst.name.clone());
             if has_custom_props(inst) || has_no_children || display_name.is_some() {
@@ -420,14 +443,21 @@ fn write_script_file(
     kind: ScriptKind,
     ctx: &mut WriteContext,
 ) -> Result<()> {
-    let source = inst
-        .properties
-        .get("Source")
-        .and_then(|p| match p {
-            SerializedProperty::String(s) => Some(s.clone()),
-            _ => None,
-        })
-        .unwrap_or_default();
+    // A5 (swallow-2, daemon guard): the plugin is contractually required to
+    // inject `Source` for LuaSourceContainers. If it's absent (or not a
+    // string), the body never crossed the wire — writing an empty `.luau` and
+    // counting it as a success would silently lose the script. Warn and skip
+    // instead. An explicitly empty Source *string* is a real empty script and
+    // is still written. The plugin now injects Source, so this is
+    // defense-in-depth.
+    let source = if let Some(SerializedProperty::String(s)) = inst.properties.get("Source") {
+        s.clone()
+    } else {
+        ctx.stats.warnings.push(format!(
+            "script {rel_for_tree} arrived without a Source property; skipped (no body to write)"
+        ));
+        return Ok(());
+    };
     atomic_write(path, source.as_bytes())
         .with_context(|| format!("write {}", path.display()))?;
     ctx.stats.scripts_written += 1;
@@ -500,6 +530,28 @@ const WINDOWS_RESERVED: &[&str] = &[
     "COM9", "LPT1", "LPT2", "LPT3", "LPT4", "LPT5", "LPT6", "LPT7", "LPT8", "LPT9",
 ];
 
+/// Package-manager landing directory names that syncback must never
+/// materialize (M7 / wally-6). These trees are generated and owned by the
+/// package manager (Wally / pesde) and get corrupted if the reverse-bootstrap
+/// rewrites them (`.lua`→`.luau`, deformed structure, lost nested project
+/// files). Mirrors `SWEEP_SKIP_DIR_NAMES` in `main.rs`, kept in sync by hand
+/// because that const lives in the binary crate root and isn't reachable from
+/// this library module.
+const PACKAGE_MANAGER_DIR_NAMES: &[&str] = &[
+    "Packages",
+    "_Index",
+    "roblox_packages",
+    ".pesde",
+    "node_modules",
+    ".yeet",
+];
+
+/// True when `name` (already sanitized) is a package-manager landing that
+/// syncback must skip. See `PACKAGE_MANAGER_DIR_NAMES`.
+fn is_package_manager_dir(name: &str) -> bool {
+    PACKAGE_MANAGER_DIR_NAMES.contains(&name)
+}
+
 fn sanitize_name(raw: &str) -> String {
     let mut out = String::with_capacity(raw.len());
     for ch in raw.chars() {
@@ -517,8 +569,13 @@ fn sanitize_name(raw: &str) -> String {
     } else {
         trimmed.to_owned()
     };
-    let upper = result.to_ascii_uppercase();
-    if WINDOWS_RESERVED.contains(&upper.as_str()) {
+    // M22 (path-4): compare the segment BEFORE the first '.'. Windows treats
+    // `CON.luau`, `aux.config`, `NUL.data`, … as the reserved *device* too, so
+    // matching the whole uppercased string (pre-M22) let them through and the
+    // OS write aborted the entire syncback. `trimmed` never starts with '.'
+    // (leading dots are trimmed above), so the first split segment is the stem.
+    let stem = result.split('.').next().unwrap_or(result.as_str());
+    if WINDOWS_RESERVED.contains(&stem.to_ascii_uppercase().as_str()) {
         result = format!("_{result}");
     }
     result
@@ -545,6 +602,20 @@ fn disambiguate(base: &str, used: &BTreeSet<String>) -> String {
         }
     }
     unreachable!("exhausted 2^32 name suffixes");
+}
+
+/// True when a LEAF script's generated on-disk stem (`name` + kind suffix, no
+/// `.luau` extension) would equal a directory-promotion stem — `init`,
+/// `init.server`, or `init.client`. Such a file is read back on the next
+/// Studio→disk round-trip as the *parent* directory's own source, silently
+/// absorbing this instance and shadowing a real folder-init (M21 / path-3).
+/// The match is case-sensitive because the promotion reader matches these
+/// literally. Callers must gate on the instance being a childless script; a
+/// folder or a script-with-children legitimately owns an `init.luau` inside
+/// its own directory and must not be renamed.
+fn is_reserved_leaf_stem(name: &str, kind: ScriptKind) -> bool {
+    let stem = format!("{name}{}", script_suffix(kind));
+    matches!(stem.as_str(), "init" | "init.server" | "init.client")
 }
 
 // ─── Instance classification helpers ──────────────────────────────────────
@@ -718,9 +789,44 @@ fn property_to_json(prop: &SerializedProperty) -> serde_json::Value {
 
 // ─── Atomic write ─────────────────────────────────────────────────────────
 
+/// On Windows, rewrites an absolute disk/UNC path to its extended-length
+/// `\\?\` verbatim form so `std::fs` (not long-path-aware by default) can
+/// create files and directories whose full path exceeds the legacy ~260-char
+/// MAX_PATH — routine under a deep OneDrive root (M23 / path-5). Verbatim
+/// paths disable normalization, so `/` is flipped to `\`. No-op for paths that
+/// are already verbatim, non-disk, or relative, and on non-Windows targets.
+#[cfg(windows)]
+fn extended_path(path: &Path) -> PathBuf {
+    use std::path::{Component, Prefix};
+    match path.components().next() {
+        Some(Component::Prefix(prefix)) => match prefix.kind() {
+            Prefix::VerbatimDisk(_) | Prefix::Verbatim(_) | Prefix::VerbatimUNC(_, _) => {
+                path.to_path_buf()
+            }
+            Prefix::Disk(_) => {
+                let s = path.to_string_lossy().replace('/', "\\");
+                PathBuf::from(format!(r"\\?\{s}"))
+            }
+            Prefix::UNC(_, _) => {
+                // \\server\share\… -> \\?\UNC\server\share\…
+                let s = path.to_string_lossy().replace('/', "\\");
+                PathBuf::from(format!(r"\\?\UNC\{}", s.trim_start_matches('\\')))
+            }
+            Prefix::DeviceNS(_) => path.to_path_buf(),
+        },
+        // Relative / rootless paths can't overflow on their own; leave them.
+        _ => path.to_path_buf(),
+    }
+}
+
+#[cfg(not(windows))]
+fn extended_path(path: &Path) -> PathBuf {
+    path.to_path_buf()
+}
+
 fn atomic_write(path: &Path, bytes: &[u8]) -> Result<()> {
     if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent)
+        std::fs::create_dir_all(extended_path(parent))
             .with_context(|| format!("mkdir {}", parent.display()))?;
     }
     let tmp = {
@@ -728,8 +834,9 @@ fn atomic_write(path: &Path, bytes: &[u8]) -> Result<()> {
         os.push(".tmp");
         PathBuf::from(os)
     };
-    std::fs::write(&tmp, bytes).with_context(|| format!("write {}", tmp.display()))?;
-    std::fs::rename(&tmp, path)
+    std::fs::write(extended_path(&tmp), bytes)
+        .with_context(|| format!("write {}", tmp.display()))?;
+    std::fs::rename(extended_path(&tmp), extended_path(path))
         .with_context(|| format!("rename {} -> {}", tmp.display(), path.display()))?;
     Ok(())
 }
@@ -1004,5 +1111,335 @@ mod tests {
             "non-colliding names must not trigger any warning, got: {:?}",
             ctx.stats.warnings
         );
+    }
+
+    // ─── M22: reserved device names WITH an extension (path-4) ────────────
+
+    #[test]
+    fn sanitize_reserves_device_names_with_extension() {
+        // The reserved-name guard must compare the segment BEFORE the first
+        // '.', because Windows treats `CON.luau`, `aux.config`, etc. as the
+        // reserved device too. Guarding only the whole string (pre-M22) let
+        // these through and the OS write aborted the entire syncback.
+        assert_eq!(sanitize_name("CON.luau"), "_CON.luau");
+        assert_eq!(sanitize_name("aux.config"), "_aux.config");
+        assert_eq!(sanitize_name("NUL.data"), "_NUL.data");
+        assert_eq!(sanitize_name("com1.server.luau"), "_com1.server.luau");
+        // Bare reserved names keep the pre-M22 behavior.
+        assert_eq!(sanitize_name("CON"), "_CON");
+        assert_eq!(sanitize_name("nul"), "_nul");
+        // No false positives: names that merely start with reserved letters.
+        assert_eq!(sanitize_name("console.luau"), "console.luau");
+        assert_eq!(sanitize_name("auxiliary"), "auxiliary");
+        assert_eq!(sanitize_name("Content.luau"), "Content.luau");
+    }
+
+    #[test]
+    fn materialize_completes_with_reserved_device_name_instance() {
+        // A single instance whose filename stem is a reserved device name
+        // (`aux.config` -> `aux.config.luau`, stem `aux`) must not abort the
+        // whole syncback. Before the fix the OS write fails on Windows and
+        // `materialize` returns Err without writing default.project.json.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut session =
+            SyncbackSession::new("req-m22".to_owned(), test_opts(dir.path().to_path_buf()));
+        session
+            .ingest_chunk(
+                0,
+                vec![
+                    inst(1, None, "DataModel", "game"),
+                    inst(2, Some(1), "Folder", "ServerScriptService"),
+                    script_inst(3, Some(2), "aux.config", "return 1\n"),
+                ],
+            )
+            .expect("ingest");
+        let stats = materialize(session, 1).expect("materialize must complete, not abort");
+        assert!(
+            dir.path().join("default.project.json").exists(),
+            "project file must be written"
+        );
+        assert!(
+            dir.path()
+                .join("src/ServerScriptService/_aux.config.luau")
+                .exists(),
+            "script must land under a de-reserved name"
+        );
+        // NB: we deliberately don't assert `!aux.config.luau.exists()` — on
+        // Windows a trailing `aux.config.luau` resolves to the AUX *device*,
+        // so `exists()` can report true regardless of what we wrote.
+        assert_eq!(stats.scripts_written, 1);
+    }
+
+    // ─── M21: leaf instance named `init` (path-3) ─────────────────────────
+
+    #[test]
+    fn write_instance_reserves_leaf_named_init_against_parent_promotion() {
+        // A leaf script literally named `init` collides with the PARENT's own
+        // promotion file (`init.luau`) and would clobber it; on re-ingest the
+        // parent absorbs the leaf. It must be renamed (`_init`) with a warning.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let opts = test_opts(dir.path().to_path_buf());
+        // Foo is a ModuleScript WITH a child -> promoted to Foo/init.luau (its
+        // own source). Its child is a leaf ModuleScript literally named `init`.
+        let mut instances = HashMap::new();
+        instances.insert(1, script_inst(1, Some(0), "Foo", "foo-source\n"));
+        instances.insert(2, script_inst(2, Some(1), "init", "leaf-source\n"));
+        let mut children = HashMap::new();
+        children.insert(0u64, vec![1u64]);
+        children.insert(1u64, vec![2u64]);
+
+        let mut ctx = WriteContext {
+            opts: &opts,
+            instances: &instances,
+            children: &children,
+            stats: SyncbackStats::default(),
+            tree_base: Tree::new(),
+        };
+        write_children(0, dir.path(), "src", &mut ctx).expect("write_children");
+
+        // Foo's own promotion source survives intact...
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join("Foo/init.luau")).unwrap(),
+            "foo-source\n"
+        );
+        // ...and the leaf `init` is written to a distinct, non-promotion file.
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join("Foo/_init.luau")).unwrap(),
+            "leaf-source\n"
+        );
+        assert!(
+            ctx.stats.warnings.iter().any(|w| w.contains("init")),
+            "expected a rename warning, got: {:?}",
+            ctx.stats.warnings
+        );
+    }
+
+    #[test]
+    fn write_instance_reserves_leaf_init_for_all_script_kinds() {
+        // Each leaf named `init`, one per kind, must be pushed off the
+        // promotion filename for that kind.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let opts = test_opts(dir.path().to_path_buf());
+        let mut instances = HashMap::new();
+        instances.insert(10, inst(10, Some(0), "Folder", "M"));
+        instances.insert(11, script_inst(11, Some(10), "init", "m\n")); // ModuleScript
+        instances.insert(20, inst(20, Some(0), "Folder", "S"));
+        let mut s = inst(21, Some(20), "Script", "init");
+        s.properties
+            .insert("Source".to_owned(), SerializedProperty::String("s\n".to_owned()));
+        instances.insert(21, s);
+        instances.insert(30, inst(30, Some(0), "Folder", "L"));
+        let mut l = inst(31, Some(30), "LocalScript", "init");
+        l.properties
+            .insert("Source".to_owned(), SerializedProperty::String("l\n".to_owned()));
+        instances.insert(31, l);
+        let mut children = HashMap::new();
+        children.insert(0u64, vec![10u64, 20u64, 30u64]);
+        children.insert(10u64, vec![11u64]);
+        children.insert(20u64, vec![21u64]);
+        children.insert(30u64, vec![31u64]);
+
+        let mut ctx = WriteContext {
+            opts: &opts,
+            instances: &instances,
+            children: &children,
+            stats: SyncbackStats::default(),
+            tree_base: Tree::new(),
+        };
+        write_children(0, dir.path(), "src", &mut ctx).expect("write_children");
+
+        assert!(dir.path().join("M/_init.luau").exists());
+        assert!(dir.path().join("S/_init.server.luau").exists());
+        assert!(dir.path().join("L/_init.client.luau").exists());
+        // No promotion-shaped leaf leaked through.
+        assert!(!dir.path().join("M/init.luau").exists());
+        assert!(!dir.path().join("S/init.server.luau").exists());
+        assert!(!dir.path().join("L/init.client.luau").exists());
+    }
+
+    // ─── A5: script instance missing `Source` (swallow-2 daemon guard) ────
+
+    #[test]
+    fn write_script_file_warns_on_missing_source_instead_of_empty() {
+        // A script that arrives WITHOUT a Source property must not be written
+        // as an empty `.luau` and counted as success — the body never crossed
+        // the wire. Warn and skip instead.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let opts = test_opts(dir.path().to_path_buf());
+        let mut instances = HashMap::new();
+        instances.insert(1, inst(1, Some(0), "ModuleScript", "Broken")); // no Source
+        let mut children = HashMap::new();
+        children.insert(0u64, vec![1u64]);
+
+        let mut ctx = WriteContext {
+            opts: &opts,
+            instances: &instances,
+            children: &children,
+            stats: SyncbackStats::default(),
+            tree_base: Tree::new(),
+        };
+        write_children(0, dir.path(), "src", &mut ctx).expect("write_children");
+
+        assert!(
+            !dir.path().join("Broken.luau").exists(),
+            "must not write an empty script file"
+        );
+        assert_eq!(
+            ctx.stats.scripts_written, 0,
+            "a body-less script must not count as written"
+        );
+        assert!(
+            ctx.stats
+                .warnings
+                .iter()
+                .any(|w| w.contains("Source") && w.contains("Broken")),
+            "expected a missing-Source warning, got: {:?}",
+            ctx.stats.warnings
+        );
+        assert!(
+            ctx.tree_base.is_empty(),
+            "no base-tree entry for an unwritten script"
+        );
+    }
+
+    #[test]
+    fn write_script_file_writes_empty_source_when_present() {
+        // Regression guard for A5: an explicitly empty Source (present, "") is
+        // a real empty script and must still be written and counted — only an
+        // ABSENT Source is the error case.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let opts = test_opts(dir.path().to_path_buf());
+        let mut instances = HashMap::new();
+        instances.insert(1, script_inst(1, Some(0), "Empty", ""));
+        let mut children = HashMap::new();
+        children.insert(0u64, vec![1u64]);
+
+        let mut ctx = WriteContext {
+            opts: &opts,
+            instances: &instances,
+            children: &children,
+            stats: SyncbackStats::default(),
+            tree_base: Tree::new(),
+        };
+        write_children(0, dir.path(), "src", &mut ctx).expect("write_children");
+
+        assert!(dir.path().join("Empty.luau").exists());
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join("Empty.luau")).unwrap(),
+            ""
+        );
+        assert_eq!(ctx.stats.scripts_written, 1);
+        assert!(ctx.stats.warnings.is_empty());
+    }
+
+    // ─── M7: skip package-manager landings during syncback (wally-6) ──────
+
+    #[test]
+    fn write_children_skips_package_manager_dirs() {
+        // A `Packages` landing (and its `_Index`) is owned by the package
+        // manager; syncback must not rewrite it. Skipped by name, mirroring
+        // the daemon's SWEEP_SKIP_DIR_NAMES.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let opts = test_opts(dir.path().to_path_buf());
+        let mut instances = HashMap::new();
+        instances.insert(1, inst(1, Some(0), "Folder", "Packages"));
+        instances.insert(2, inst(2, Some(1), "Folder", "_Index"));
+        instances.insert(3, script_inst(3, Some(2), "SomePkg", "return 'pkg'\n"));
+        instances.insert(4, script_inst(4, Some(0), "MyModule", "return 'mine'\n"));
+        let mut children = HashMap::new();
+        children.insert(0u64, vec![1u64, 4u64]);
+        children.insert(1u64, vec![2u64]);
+        children.insert(2u64, vec![3u64]);
+
+        let mut ctx = WriteContext {
+            opts: &opts,
+            instances: &instances,
+            children: &children,
+            stats: SyncbackStats::default(),
+            tree_base: Tree::new(),
+        };
+        write_children(0, dir.path(), "src", &mut ctx).expect("write_children");
+
+        assert!(
+            !dir.path().join("Packages").exists(),
+            "the Packages landing must be skipped entirely"
+        );
+        assert!(
+            dir.path().join("MyModule.luau").exists(),
+            "a normal sibling must still be materialized"
+        );
+        assert!(
+            ctx.stats
+                .warnings
+                .iter()
+                .any(|w| w.to_lowercase().contains("package")),
+            "expected a skip warning, got: {:?}",
+            ctx.stats.warnings
+        );
+    }
+
+    // ─── M23: long-path (MAX_PATH) handling under a deep root (path-5) ────
+
+    #[cfg(windows)]
+    #[test]
+    fn extended_path_verbatimizes_windows_disk_paths() {
+        assert_eq!(
+            extended_path(Path::new(r"C:\a\b")),
+            PathBuf::from(r"\\?\C:\a\b")
+        );
+        // Forward slashes are flipped (verbatim paths don't normalize).
+        assert_eq!(
+            extended_path(Path::new("C:/a/b")),
+            PathBuf::from(r"\\?\C:\a\b")
+        );
+        // Already-verbatim paths are left untouched.
+        assert_eq!(
+            extended_path(Path::new(r"\\?\C:\a\b")),
+            PathBuf::from(r"\\?\C:\a\b")
+        );
+        // Relative paths can't overflow on their own; unchanged.
+        assert_eq!(extended_path(Path::new(r"a\b")), PathBuf::from(r"a\b"));
+    }
+
+    #[cfg(not(windows))]
+    #[test]
+    fn extended_path_is_identity_off_windows() {
+        assert_eq!(extended_path(Path::new("/a/b/c")), PathBuf::from("/a/b/c"));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn write_children_handles_paths_over_max_path() {
+        // A tree deep enough that the full path exceeds ~260 chars must still
+        // materialize. Without the `\\?\` rewrite, std::fs aborts mid-write.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let opts = test_opts(dir.path().to_path_buf());
+        let mut instances = HashMap::new();
+        let mut children: HashMap<u64, Vec<u64>> = HashMap::new();
+        let seg = "verylongsegmentnamethatpadsthepath_"; // 35 chars
+        let depth: u64 = 8;
+        let mut parent = 0u64;
+        for i in 1..=depth {
+            instances.insert(i, inst(i, Some(parent), "Folder", &format!("{seg}{i:02}")));
+            children.entry(parent).or_default().push(i);
+            parent = i;
+        }
+        let leaf_id = depth + 1;
+        instances.insert(
+            leaf_id,
+            script_inst(leaf_id, Some(parent), "Deep", "return 'deep'\n"),
+        );
+        children.entry(parent).or_default().push(leaf_id);
+
+        let mut ctx = WriteContext {
+            opts: &opts,
+            instances: &instances,
+            children: &children,
+            stats: SyncbackStats::default(),
+            tree_base: Tree::new(),
+        };
+        write_children(0, dir.path(), "src", &mut ctx)
+            .expect("deep write must not fail on MAX_PATH");
+        assert_eq!(ctx.stats.scripts_written, 1);
     }
 }
