@@ -430,14 +430,21 @@ fn write_script_file(
     kind: ScriptKind,
     ctx: &mut WriteContext,
 ) -> Result<()> {
-    let source = inst
-        .properties
-        .get("Source")
-        .and_then(|p| match p {
-            SerializedProperty::String(s) => Some(s.clone()),
-            _ => None,
-        })
-        .unwrap_or_default();
+    // A5 (swallow-2, daemon guard): the plugin is contractually required to
+    // inject `Source` for LuaSourceContainers. If it's absent (or not a
+    // string), the body never crossed the wire — writing an empty `.luau` and
+    // counting it as a success would silently lose the script. Warn and skip
+    // instead. An explicitly empty Source *string* is a real empty script and
+    // is still written. The plugin now injects Source, so this is
+    // defense-in-depth.
+    let source = if let Some(SerializedProperty::String(s)) = inst.properties.get("Source") {
+        s.clone()
+    } else {
+        ctx.stats.warnings.push(format!(
+            "script {rel_for_tree} arrived without a Source property; skipped (no body to write)"
+        ));
+        return Ok(());
+    };
     atomic_write(path, source.as_bytes())
         .with_context(|| format!("write {}", path.display()))?;
     ctx.stats.scripts_written += 1;
@@ -1177,5 +1184,80 @@ mod tests {
         assert!(!dir.path().join("M/init.luau").exists());
         assert!(!dir.path().join("S/init.server.luau").exists());
         assert!(!dir.path().join("L/init.client.luau").exists());
+    }
+
+    // ─── A5: script instance missing `Source` (swallow-2 daemon guard) ────
+
+    #[test]
+    fn write_script_file_warns_on_missing_source_instead_of_empty() {
+        // A script that arrives WITHOUT a Source property must not be written
+        // as an empty `.luau` and counted as success — the body never crossed
+        // the wire. Warn and skip instead.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let opts = test_opts(dir.path().to_path_buf());
+        let mut instances = HashMap::new();
+        instances.insert(1, inst(1, Some(0), "ModuleScript", "Broken")); // no Source
+        let mut children = HashMap::new();
+        children.insert(0u64, vec![1u64]);
+
+        let mut ctx = WriteContext {
+            opts: &opts,
+            instances: &instances,
+            children: &children,
+            stats: SyncbackStats::default(),
+            tree_base: Tree::new(),
+        };
+        write_children(0, dir.path(), "src", &mut ctx).expect("write_children");
+
+        assert!(
+            !dir.path().join("Broken.luau").exists(),
+            "must not write an empty script file"
+        );
+        assert_eq!(
+            ctx.stats.scripts_written, 0,
+            "a body-less script must not count as written"
+        );
+        assert!(
+            ctx.stats
+                .warnings
+                .iter()
+                .any(|w| w.contains("Source") && w.contains("Broken")),
+            "expected a missing-Source warning, got: {:?}",
+            ctx.stats.warnings
+        );
+        assert!(
+            ctx.tree_base.is_empty(),
+            "no base-tree entry for an unwritten script"
+        );
+    }
+
+    #[test]
+    fn write_script_file_writes_empty_source_when_present() {
+        // Regression guard for A5: an explicitly empty Source (present, "") is
+        // a real empty script and must still be written and counted — only an
+        // ABSENT Source is the error case.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let opts = test_opts(dir.path().to_path_buf());
+        let mut instances = HashMap::new();
+        instances.insert(1, script_inst(1, Some(0), "Empty", ""));
+        let mut children = HashMap::new();
+        children.insert(0u64, vec![1u64]);
+
+        let mut ctx = WriteContext {
+            opts: &opts,
+            instances: &instances,
+            children: &children,
+            stats: SyncbackStats::default(),
+            tree_base: Tree::new(),
+        };
+        write_children(0, dir.path(), "src", &mut ctx).expect("write_children");
+
+        assert!(dir.path().join("Empty.luau").exists());
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join("Empty.luau")).unwrap(),
+            ""
+        );
+        assert_eq!(ctx.stats.scripts_written, 1);
+        assert!(ctx.stats.warnings.is_empty());
     }
 }
