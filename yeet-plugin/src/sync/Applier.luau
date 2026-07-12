@@ -150,11 +150,15 @@ type self = {
 	log: Log,
 	-- Hash of the content we last wrote into `Source` for each path.
 	-- Used by SourceWatcher to reject self-triggered property changes.
-	-- Map from path → { hash, sentAt } pair recording the last Applier-driven
+	-- Map from path → { hash, sentAt, size } recording the last Applier-driven
 	-- Source write. `isEcho` rejects matches older than ECHO_WINDOW_SEC so a
 	-- user reverting to the same content (e.g. via Ctrl+Z) is not silently
-	-- swallowed as our own bounce.
-	recentlyApplied: { [string]: { hash: string, sentAt: number } },
+	-- swallowed as our own bounce. `size` is the byte length of the hashed
+	-- content; it lets `isEcho` reject a Source of different length WITHOUT
+	-- hashing it (A12 — avoids a full SHA-256 per keystroke). `nil` when the
+	-- seating site had no content on hand, in which case `isEcho` falls back
+	-- to hashing (correct, just not cheap).
+	recentlyApplied: { [string]: { hash: string, sentAt: number, size: number? } },
 	-- Live entry count for `recentlyApplied`. Tracked explicitly because
 	-- Luau hash tables don't expose `#table` — we'd otherwise have to
 	-- iterate to know when to sweep. Updated in `seatEcho`, reset on
@@ -229,6 +233,14 @@ type self = {
 	-- Kept so `reset()` can disconnect them alongside the rest of the
 	-- bootstrap-owned state.
 	liveConnections: { RBXScriptConnection },
+	-- True only while `applyFileCreated` is materializing a daemon-driven
+	-- create. The live `DescendantAdded` watcher checks it and skips, so the
+	-- create we were told to make does NOT bounce a `file_created` back to the
+	-- daemon (M9 — amplifies badly during an IDE→Studio bulk sync).
+	-- `registerTracked` already seatEchoes to suppress this, but the signal
+	-- fires synchronously mid-materialize, BEFORE `fileToInstance[path]` is
+	-- set, so the intended dedup (`existing == desc`) was bypassed.
+	applyingDaemonCreate: boolean,
 }
 
 export type Applier = typeof(setmetatable({} :: self, Applier))
@@ -264,6 +276,7 @@ function Applier.new(log: Log): Applier
 		onProjectRootMismatch = nil :: ((expected: string, got: string) -> ())?,
 		pendingEditProbe = nil :: ((path: string) -> (string?, string?))?,
 		liveConnections = {} :: { RBXScriptConnection },
+		applyingDaemonCreate = false,
 	}, Applier)
 end
 
@@ -365,6 +378,16 @@ end
 -- `LuaSourceContainer` descendant of a mapped `$path` — caller should
 -- treat that as a delete signal.
 function Applier.resolvePath(self: Applier, instance: Instance): (string?, ScriptKind?)
+	-- REGRESSION(M8): skip non-scripts up front, before the mapping loop and
+	-- `computePath`. computePath already returns nil for a non-
+	-- `LuaSourceContainer`, so resolvePath's result is unchanged (nil, nil);
+	-- this only saves the per-mapping IsDescendantOf + computePath work. It is
+	-- the resolver the SourceWatcher runs on every AncestryChanged, so when a
+	-- big container move fans that signal out across every tracked script the
+	-- non-script case bails immediately instead of scanning all mappings.
+	if not instance:IsA("LuaSourceContainer") then
+		return nil, nil
+	end
 	for mapPath, mapParent in pairs(self.mappings) do
 		if instance == mapParent or instance:IsDescendantOf(mapParent) then
 			local p, k = TreeBuilder.computePath(mapPath, mapParent, instance)
@@ -376,16 +399,38 @@ function Applier.resolvePath(self: Applier, instance: Instance): (string?, Scrip
 	return nil, nil
 end
 
-function Applier.isEcho(self: Applier, path: string, hash: string): boolean
+-- `content` is the raw Source string, NOT a precomputed hash. `isEcho` does
+-- the cheap rejects (stale window, then byte-length mismatch) BEFORE it ever
+-- computes the SHA-256, so the SourceWatcher hot path no longer hashes the
+-- whole Source on every keystroke — during normal typing the length differs
+-- each stroke and this returns `false` without hashing (A12).
+--
+-- REGRESSION(A12): the result is identical to the old hash-based check. The
+-- old form returned true iff (entry exists AND hash matches AND within
+-- window); this returns true iff (entry exists AND within window AND size
+-- matches AND hash matches) — the same conjunction, only reordered so the
+-- cheap terms short-circuit first. `size` always equals the byte length of
+-- the content behind `entry.hash` (seated together), so whenever the hash
+-- would match, the length matches too; the length test can only reject
+-- cases the hash test would also reject.
+function Applier.isEcho(self: Applier, path: string, content: string): boolean
 	local entry = self.recentlyApplied[path]
-	if entry == nil or entry.hash ~= hash then
+	if entry == nil then
 		return false
 	end
-	-- Hash matches a previous self-write — but only treat it as an echo if
-	-- that write happened recently. A stale match (user reverted to old
-	-- content via undo, or rewrote the same lines) must propagate to the
-	-- daemon as a real edit.
-	return (os.clock() - entry.sentAt) < ECHO_WINDOW_SEC
+	-- A stale match (user reverted to old content via undo, or rewrote the
+	-- same lines) must propagate to the daemon as a real edit. Checking the
+	-- window first also means an expired entry never triggers a hash.
+	if (os.clock() - entry.sentAt) >= ECHO_WINDOW_SEC then
+		return false
+	end
+	-- A differing byte length cannot be an echo of what we wrote; skip the
+	-- SHA-256 entirely. `size` is nil only at seating sites that lacked the
+	-- content, where we must fall through and hash to stay correct.
+	if entry.size ~= nil and #content ~= entry.size then
+		return false
+	end
+	return entry.hash == Sha256.hex(content)
 end
 
 -- Symmetrical to `seatEcho`: drops the entry and keeps the live count
@@ -426,11 +471,11 @@ end
 -- stale (renames, deletions whose paths never come back) would let the
 -- table grow without bound — irrelevant for memory in any short session
 -- but a real production-soak risk.
-local function seatEcho(self: Applier, path: string, hash: string)
+local function seatEcho(self: Applier, path: string, hash: string, size: number?)
 	if self.recentlyApplied[path] == nil then
 		self.recentlyAppliedCount += 1
 	end
-	self.recentlyApplied[path] = { hash = hash, sentAt = os.clock() }
+	self.recentlyApplied[path] = { hash = hash, sentAt = os.clock(), size = size }
 	if self.recentlyAppliedCount >= MAX_RECENTLY_APPLIED then
 		local kept = sweepStaleEchos(self)
 		self.log(`recentlyApplied swept: kept {kept} of {MAX_RECENTLY_APPLIED} entries`)
@@ -457,13 +502,19 @@ function Applier.forgetLocalRename(
 	hash: string
 )
 	local instance = self.fileToInstance[oldPath]
+	local size: number? = nil
 	if instance ~= nil then
 		self.fileToInstance[oldPath] = nil
 		self.fileToInstance[newPath] = instance
 		self.instanceToPath[instance] = newPath
+		if instance:IsA("LuaSourceContainer") then
+			-- SourceWatcher fires its rename hook synchronously right after
+			-- hashing this content, so #Source still matches `hash` (A12).
+			size = #(instance :: LuaSourceContainer).Source
+		end
 	end
 	forgetEcho(self, oldPath)
-	seatEcho(self, newPath, hash)
+	seatEcho(self, newPath, hash, size)
 end
 
 local function withRecording(name: string, action: () -> ()): (boolean, string?)
@@ -486,8 +537,8 @@ end
 -- Seeds `recentlyApplied` for every path we just materialized and notifies the
 -- watcher. Called inside the bootstrap/create recording so the initial Source
 -- assignment in `TreeBuilder` is already committed when we reach here.
-local function registerTracked(self: Applier, path: string, inst: Instance, hash: string)
-	seatEcho(self, path, hash)
+local function registerTracked(self: Applier, path: string, inst: Instance, hash: string, size: number?)
+	seatEcho(self, path, hash, size)
 	local hook = self.onTracked
 	if hook ~= nil then
 		hook(path, inst)
@@ -545,7 +596,7 @@ local function applyProjectOpenedForPreview(self: Applier, project: Project)
 		})
 		self.fileToInstance[entry.path] = entry.instance
 		self.instanceToPath[entry.instance] = entry.path
-		registerTracked(self, entry.path, entry.instance, sha)
+		registerTracked(self, entry.path, entry.instance, sha, #entry.studio_content)
 	end
 
 	self:startLiveWatcher()
@@ -677,19 +728,25 @@ local function applyProjectOpened(self: Applier, msg: any)
 		self.mappings = result.mappings
 		self.bootstrapped = true
 		divergent = result.divergent
-		untracked = result.untracked
 	end)
 	if not ok then
 		self.log(`bootstrap failed: {err}`)
 		return
 	end
+	-- M9: discover Studio-only scripts OUTSIDE the recording. It is read-only
+	-- (no DataModel mutation to roll back) and yields periodically, so running
+	-- it here avoids holding a ChangeHistoryService recording open across
+	-- frames on a large place. `self.fileToInstance`/`self.mappings` are
+	-- already the just-materialized maps, so the result is identical to the
+	-- old in-recording call.
+	untracked = TreeBuilder.findUntracked(self.mappings, self.fileToInstance)
 	-- Register tracking outside the recording: SourceWatcher connects signals
 	-- but does not mutate Source, so there is nothing to roll back.
 	for _, file in initialFiles do
 		local inst = self.fileToInstance[file.path]
 		if inst ~= nil then
 			self.instanceToPath[inst] = file.path
-			registerTracked(self, file.path, inst, file.sha256)
+			registerTracked(self, file.path, inst, file.sha256, #file.content)
 		end
 	end
 	self.log(`bootstrap: {#initialFiles} file(s) materialized`)
@@ -715,12 +772,12 @@ local function applyProjectOpened(self: Applier, msg: any)
 			-- matter to the daemon but the log reads top-down.
 			for _, entry in divergent do
 				local sha = Sha256.hex(entry.studio_content)
-				seatEcho(self, entry.path, sha)
+				seatEcho(self, entry.path, sha, #entry.studio_content)
 				hook(entry.path, entry.kind, entry.studio_content, sha)
 			end
 			for _, entry in untracked do
 				local sha = Sha256.hex(entry.studio_content)
-				seatEcho(self, entry.path, sha)
+				seatEcho(self, entry.path, sha, #entry.studio_content)
 				hook(entry.path, entry.kind, entry.studio_content, sha)
 			end
 			self.log(
@@ -742,6 +799,14 @@ local function applyFileCreated(self: Applier, msg: any)
 		sha256 = msg.sha256,
 	}
 	local created: Instance? = nil
+	-- Mute the live watcher while WE create the instance: materializeFile
+	-- parents it synchronously, firing `DescendantAdded` before fileToInstance
+	-- is set, so without this the watcher would echo a `file_created` for the
+	-- very file the daemon just told us to create (M9 — amplifies across a
+	-- bulk IDE→Studio sync). Save/restore so a nested apply (applyFileRenamed
+	-- degrading to a create) stays correct.
+	local prevApplying = self.applyingDaemonCreate
+	self.applyingDaemonCreate = true
 	local ok, err = withRecording("YeetFileCreated", function()
 		created = TreeBuilder.materializeFile(snap, self.mappings)
 		if created ~= nil then
@@ -749,12 +814,13 @@ local function applyFileCreated(self: Applier, msg: any)
 			self.instanceToPath[created] = snap.path
 		end
 	end)
+	self.applyingDaemonCreate = prevApplying
 	if not ok then
 		self.log(`create failed {snap.path}: {err}`)
 		return
 	end
 	if created ~= nil then
-		registerTracked(self, snap.path, created, snap.sha256)
+		registerTracked(self, snap.path, created, snap.sha256, #snap.content)
 		self.log(`+ {snap.path}`)
 	else
 		self.log(`skipped (no mapping): {snap.path}`)
@@ -812,7 +878,7 @@ local function applyFileChanged(self: Applier, msg: any)
 	-- Seat the hash BEFORE the assignment: `GetPropertyChangedSignal` fires
 	-- synchronously during the write, and the watcher will read
 	-- `recentlyApplied` inside that callback.
-	seatEcho(self, msg.path, hash)
+	seatEcho(self, msg.path, hash, #content)
 	local ok, err = withRecording("YeetFileChanged", function()
 		(inst :: LuaSourceContainer).Source = content
 	end)
@@ -954,7 +1020,7 @@ local function applyFileRenamed(self: Applier, msg: any)
 		})
 		return
 	end
-	seatEcho(self, newPath, hash)
+	seatEcho(self, newPath, hash, #content)
 	local newName = TreeBuilder.basenameFor(newPath)
 	local oldDir = dirPortion(oldPath)
 	local newDir = dirPortion(newPath)
@@ -1076,7 +1142,16 @@ end
 -- so the daemon's echoed `file_changed` broadcast (if it ever gets one) is
 -- absorbed cleanly.
 function Applier.recordSelfEdit(self: Applier, path: string, hash: string)
-	seatEcho(self, path, hash)
+	-- `hash` was just computed by SourceWatcher from the live Source and we run
+	-- synchronously before any yield, so #Source still matches it. Seating the
+	-- length lets the next keystroke be rejected as a non-echo without a
+	-- re-hash (A12).
+	local inst = self.fileToInstance[path]
+	local size: number? = nil
+	if inst ~= nil and inst:IsA("LuaSourceContainer") then
+		size = #(inst :: LuaSourceContainer).Source
+	end
+	seatEcho(self, path, hash, size)
 end
 
 -- Called by SourceWatcher when the user deletes a tracked script in Studio.
@@ -1269,13 +1344,18 @@ local function detectPromotionChain(self: Applier, mapPath: string, mapParent: I
 					self.fileToInstance[newPath] = cursor
 					self.instanceToPath[cursor] = newPath
 					forgetEcho(self, cached)
-					seatEcho(self, newPath, sha)
+					seatEcho(self, newPath, sha, #src)
 				end
 			end
 		end
 		cursor = cursor.Parent
 	end
 end
+
+-- Yield cadence for the demotion scan so a place with thousands of tracked
+-- scripts doesn't block a whole frame recomputing paths (A11). Matches the
+-- spirit of `TreeBuilder.discover`'s per-descendant yield.
+local DEMOTION_SCAN_YIELD_EVERY = 500
 
 -- After the tree settles following a `DescendantRemoving`, scan every
 -- tracked `LuaSourceContainer` under this mapping and recompute its
@@ -1287,56 +1367,89 @@ end
 -- when the handler runs. For non-script descendants (RemoteEvent,
 -- Folder, Model, etc.) Studio frequently dispatches the ancestor signal
 -- only after `Parent` has already been set to `nil`, leaving us with
--- no anchor to walk up from. Iterating the tracked map is O(scripts in
--- mapping) per delete event, but deletes are human-frequency (not hot
--- path), so the cost is invisible in practice.
-local function detectDemotionChain(self: Applier, mapPath: string, mapParent: Instance, removed: Instance)
-	local _ = removed -- kept for callsite symmetry; deferred scan iterates the tracked map
+-- no anchor to walk up from.
+local function runDemotionScan(self: Applier, mapPath: string, mapParent: Instance)
+	-- Snapshot the keys first so we can iterate while the rename
+	-- callbacks mutate `instanceToPath`/`fileToInstance` in lockstep.
+	local candidates: { Instance } = {}
+	for instance in pairs(self.instanceToPath) do
+		table.insert(candidates, instance)
+	end
+	local processed = 0
+	for _, instance in ipairs(candidates) do
+		processed += 1
+		if processed % DEMOTION_SCAN_YIELD_EVERY == 0 then
+			task.wait()
+		end
+		local cached = self.instanceToPath[instance]
+		if cached == nil then
+			continue
+		end
+		-- REGRESSION(M8): skip non-scripts before `computePath`. instanceToPath
+		-- only ever holds LuaSourceContainers, so this is defensive, but it
+		-- keeps the guaranteed non-script skip on the recompute path.
+		if not instance:IsA("LuaSourceContainer") then
+			continue
+		end
+		if instance ~= mapParent and not instance:IsDescendantOf(mapParent) then
+			continue
+		end
+		local newPath, kind = TreeBuilder.computePath(mapPath, mapParent, instance)
+		if newPath == nil or kind == nil then
+			continue
+		end
+		if cached == newPath then
+			continue
+		end
+		local ok, src = pcall(function()
+			return (instance :: LuaSourceContainer).Source
+		end)
+		if not ok then
+			self.log(`rename detect: read Source failed for {instance.Name}`)
+			continue
+		end
+		local sha = Sha256.hex(src)
+		local hook = self.onStudioRenamed
+		if hook ~= nil then
+			hook(cached, newPath, kind, src, sha)
+		end
+		if self.fileToInstance[cached] == instance then
+			self.fileToInstance[cached] = nil
+		end
+		self.fileToInstance[newPath] = instance
+		self.instanceToPath[instance] = newPath
+		forgetEcho(self, cached)
+		seatEcho(self, newPath, sha, #src)
+	end
+end
+
+-- Coalesces demotion scans: moving or deleting a subtree fires one
+-- `DescendantRemoving` per descendant, and each used to `task.defer` its own
+-- full O(tracked-scripts) scan — N events × O(M) scans froze Studio (A11/M8).
+-- Now the first event of a burst schedules a SINGLE deferred scan and the
+-- rest are dropped. `state.pending` clears at the START of the deferred body
+-- so events arriving during the scan's yields queue a fresh follow-up instead
+-- of being lost.
+--
+-- REGRESSION(A11): the emitted renames are unchanged. Each scan is a full
+-- idempotent recompute of the settled tree; the old per-event scheduling had
+-- only the first post-burst scan observe a changed shape and emit — later
+-- scans found the cache already updated and no-op'd. Coalescing keeps exactly
+-- that one emitting scan.
+type ScanState = { pending: boolean }
+local function scheduleDemotionScan(
+	self: Applier,
+	state: ScanState,
+	mapPath: string,
+	mapParent: Instance
+)
+	if state.pending then
+		return
+	end
+	state.pending = true
 	task.defer(function()
-		-- Snapshot the keys first so we can iterate while the rename
-		-- callbacks mutate `instanceToPath`/`fileToInstance` in lockstep.
-		local candidates: { Instance } = {}
-		for instance in pairs(self.instanceToPath) do
-			table.insert(candidates, instance)
-		end
-		for _, instance in ipairs(candidates) do
-			local cached = self.instanceToPath[instance]
-			if cached == nil then
-				continue
-			end
-			if not instance:IsA("LuaSourceContainer") then
-				continue
-			end
-			if instance ~= mapParent and not instance:IsDescendantOf(mapParent) then
-				continue
-			end
-			local newPath, kind = TreeBuilder.computePath(mapPath, mapParent, instance)
-			if newPath == nil or kind == nil then
-				continue
-			end
-			if cached == newPath then
-				continue
-			end
-			local ok, src = pcall(function()
-				return (instance :: LuaSourceContainer).Source
-			end)
-			if not ok then
-				self.log(`rename detect: read Source failed for {instance.Name}`)
-				continue
-			end
-			local sha = Sha256.hex(src)
-			local hook = self.onStudioRenamed
-			if hook ~= nil then
-				hook(cached, newPath, kind, src, sha)
-			end
-			if self.fileToInstance[cached] == instance then
-				self.fileToInstance[cached] = nil
-			end
-			self.fileToInstance[newPath] = instance
-			self.instanceToPath[instance] = newPath
-			forgetEcho(self, cached)
-			seatEcho(self, newPath, sha)
-		end
+		state.pending = false
+		runDemotionScan(self, mapPath, mapParent)
 	end)
 end
 
@@ -1348,7 +1461,17 @@ function Applier.startLiveWatcher(self: Applier)
 	table.clear(self.liveConnections)
 
 	for mapPath, mapParent in pairs(self.mappings) do
+		-- One coalescing flag per mapping: a burst of `DescendantRemoving`
+		-- events schedules a single demotion scan instead of one each (A11).
+		local demotionScan: ScanState = { pending = false }
 		local addedConn = mapParent.DescendantAdded:Connect(function(desc: Instance)
+			if self.applyingDaemonCreate then
+				-- M9: this DescendantAdded is the Applier itself materializing a
+				-- daemon-driven create. applyFileCreated does the tracking and
+				-- seatEcho; reacting here would bounce a `file_created` (and any
+				-- promotion) straight back to the daemon.
+				return
+			end
 			-- Promotion: a non-script child landing under a tracked script
 			-- moves the script's path from leaf to container. Run this
 			-- BEFORE handling `desc` as a new script, so the rename frame
@@ -1404,7 +1527,7 @@ function Applier.startLiveWatcher(self: Applier)
 			-- Seat the hash in `recentlyApplied` BEFORE the hook fires its
 			-- `file_created` — our eventual daemon FileChanged echo (if any)
 			-- would otherwise be treated as a user edit and rebound.
-			seatEcho(self, path, sha)
+			seatEcho(self, path, sha, #source)
 			self.fileToInstance[path] = desc
 			self.instanceToPath[desc] = path
 			hook(path, kind, source, sha)
@@ -1418,9 +1541,12 @@ function Applier.startLiveWatcher(self: Applier)
 		table.insert(self.liveConnections, addedConn)
 
 		local removingConn = mapParent.DescendantRemoving:Connect(function(desc: Instance)
-			-- Defer the check so `desc.Parent:GetChildren()` reflects the
-			-- post-removal state. Demotion fires from there.
-			detectDemotionChain(self, mapPath, mapParent, desc)
+			-- Coalesced: a burst of removals schedules ONE deferred scan (the
+			-- scan reads the settled tree). `desc` is unused — Roblox may
+			-- already have nil'd its Parent, which is why the scan brute-forces
+			-- the tracked map instead of walking up from `desc`.
+			local _ = desc
+			scheduleDemotionScan(self, demotionScan, mapPath, mapParent)
 		end)
 		table.insert(self.liveConnections, removingConn)
 	end

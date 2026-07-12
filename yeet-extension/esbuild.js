@@ -1,6 +1,7 @@
 "use strict";
 
 const esbuild = require("esbuild");
+const packageJson = require("./package.json");
 
 const watch = process.argv.includes("--watch");
 
@@ -14,6 +15,13 @@ const ctx = {
   sourcemap: true,
   external: ["vscode"],
   logLevel: "info",
+  define: {
+    // Textually replaces `__YEET_CLIENT_VERSION__` (declared ambient
+    // in src/websocket.ts) with the quoted package.json version at
+    // bundle time, so the wire-protocol handshake version can never
+    // drift from the extension's own release version again.
+    __YEET_CLIENT_VERSION__: JSON.stringify(packageJson.version),
+  },
 };
 
 async function run() {

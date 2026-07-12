@@ -1,4 +1,4 @@
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeSet, HashMap, HashSet};
 use std::io::Write as _;
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
@@ -286,6 +286,11 @@ async fn main() -> Result<()> {
     let sessions: Arc<Mutex<SyncbackSessions>> = Arc::new(Mutex::new(SyncbackSessions::default()));
 
     let bind_addr = args.bind.as_deref().unwrap_or(BIND_ADDR);
+    // When bound to loopback (the default), enforce a loopback `Host` header
+    // on the WS upgrade as extra anti-rebinding defence. A non-loopback bind
+    // (only reachable via `--allow-remote`) legitimately sees remote Hosts,
+    // so the check is disabled there.
+    let enforce_loopback_host = is_loopback_bind_addr(bind_addr);
     let listener = TcpListener::bind(bind_addr)
         .await
         .with_context(|| format!("bind {bind_addr}"))?;
@@ -298,7 +303,7 @@ async fn main() -> Result<()> {
     info!(addr = %actual_addr, "yeet-daemon listening");
 
     tokio::select! {
-        res = accept_loop(listener, state, sessions, bcast_tx) => res,
+        res = accept_loop(listener, state, sessions, bcast_tx, enforce_loopback_host) => res,
         res = tokio::signal::ctrl_c() => {
             res.context("install ctrl+c handler")?;
             info!("shutdown: ctrl+c received");
@@ -313,12 +318,40 @@ fn init_tracing() {
     tracing_subscriber::fmt().with_env_filter(filter).init();
 }
 
+/// Refuses a non-loopback `--bind` unless `--allow-remote` was passed, and
+/// emits a prominent warning when a remote bind is allowed (AUDITORIA-YEET.md
+/// B13). Loopback binds (the default) always pass silently. Split out from
+/// `parse_args` so the policy is unit-testable without touching argv.
+fn validate_bind_addr(bind: Option<&str>, allow_remote: bool) -> Result<()> {
+    let Some(addr) = bind else {
+        return Ok(());
+    };
+    if is_loopback_bind_addr(addr) {
+        return Ok(());
+    }
+    if !allow_remote {
+        bail!(
+            "--bind {addr} is not a loopback address. Binding to a non-loopback \
+             interface exposes your project's source code to the network — anyone who \
+             can reach this port could read and write it. Re-run with --allow-remote to \
+             confirm you intend this."
+        );
+    }
+    warn!(
+        bind = %addr,
+        "SECURITY: binding to a non-loopback address (--allow-remote). The daemon is \
+         reachable from the network; only do this on a trusted network."
+    );
+    Ok(())
+}
+
 fn parse_args() -> Result<CliArgs> {
     let mut positional: Option<String> = None;
     let mut debug_echo = false;
     let mut bind: Option<String> = None;
     let mut reset_base_tree = false;
     let mut dry_run = false;
+    let mut allow_remote = false;
     let mut iter = std::env::args().skip(1);
     while let Some(arg) = iter.next() {
         if arg == "--debug-echo" {
@@ -327,6 +360,8 @@ fn parse_args() -> Result<CliArgs> {
             reset_base_tree = true;
         } else if arg == "--dry-run" {
             dry_run = true;
+        } else if arg == "--allow-remote" {
+            allow_remote = true;
         } else if arg == "--bind" {
             bind = Some(
                 iter.next()
@@ -342,6 +377,9 @@ fn parse_args() -> Result<CliArgs> {
             bail!("unexpected extra argument: {arg}");
         }
     }
+    // A non-loopback bind must be opted into explicitly — the default stays
+    // loopback and unaffected.
+    validate_bind_addr(bind.as_deref(), allow_remote)?;
 
     let dir = match positional {
         Some(s) => PathBuf::from(s),
@@ -389,6 +427,8 @@ async fn handle_fs_event(
     // three-way source merge.
     let abs_for_meta = match &event {
         FileEvent::Touched(p) | FileEvent::Removed(p) => p.clone(),
+        // Backend error/overflow: re-scan the whole tree and reconcile.
+        FileEvent::Rescan => return handle_rescan(state, bcast_tx).await,
     };
     if is_meta_file(&abs_for_meta) {
         return handle_meta_event(state, event, bcast_tx).await;
@@ -434,6 +474,16 @@ async fn handle_fs_event(
 
     let path = match event {
         FileEvent::Touched(abs) => {
+            // A directory Touched is the signal for a folder rename/move: on
+            // Windows a folder rename emits only a dir-level rename pair with
+            // NO per-child events, so the moved subtree would otherwise
+            // desync until the daemon restarts (AUDITORIA-YEET.md A7). Try to
+            // pair it as a directory rename (re-key subtree + per-child
+            // FileRenamed); if it isn't one, `handle_dir_touched` drops it,
+            // matching the previous not-a-file behavior.
+            if abs.is_dir() {
+                return handle_dir_touched(state, &abs, bcast_tx).await;
+            }
             // Each early return here would otherwise silently swallow the
             // event with no signal to the user, making "files don't appear
             // in Studio" undebuggable. Log every drop with the path and the
@@ -453,16 +503,12 @@ async fn handle_fs_event(
                 debug!(path = %rel, "fs drop: path is not under any $path mapping in default.project.json");
                 return Ok(());
             }
-            // Drop watcher echoes from a daemon-initiated `fs::rename`. The
-            // matching Remove(old) + Touched(new) pair is one-shot so the
-            // second `consume_rename_echo` call returns false naturally.
-            {
-                let mut guard = state.write().await;
-                if guard.consume_rename_echo(&rel) {
-                    debug!(path = %rel, "fs drop: suppressed echo of daemon rename");
-                    return Ok(());
-                }
-            }
+            // No path-based echo suppression here (AUDITORIA-YEET.md M17):
+            // the daemon's own rename echo is already dropped safely by the
+            // content-hash check below (`prev_hash == sha`) and the
+            // untracked-path check on the removal side. A path-based guard
+            // that ran before the hash check could instead swallow a REAL
+            // user edit to a just-renamed file inside the TTL window.
             let file_name = abs
                 .file_name()
                 .and_then(|s| s.to_str())
@@ -496,8 +542,43 @@ async fn handle_fs_event(
             // never trip it, but tight enough that the Modify(From) +
             // Modify(To) pair the OS emits for a rename always lands
             // inside it.
-            if let Some(pending) = guard.fs_removed_pending.remove(&sha) {
-                let old_path = pending.path.clone();
+            //
+            // `fs_removed_pending` is keyed by path now (AUDITORIA-YEET.md
+            // A1), so pairing means scanning for an entry whose content
+            // sha matches — guarded by two checks before it's promoted to
+            // a rename:
+            //   - watcher-4: only pair when `rel` (the new path) was NOT
+            //     already a tracked file (`prev_hash.is_none()`). If it
+            //     was, this Touched is an edit of a pre-existing file, not
+            //     a rename target — pairing would clobber its identity
+            //     (attributes/tags) with the deleted file's.
+            //   - move-2: never pair a removed entry with empty content.
+            //     Unrelated delete+create of empty stub files must stay
+            //     an independent delete+create, not leak the deleted
+            //     file's meta_attributes onto an unrelated new file.
+            // When several pending entries share the sha, prefer the one
+            // whose basename (file stem) matches the new path, else the
+            // oldest by `since`.
+            let rename_pick = if prev_hash.is_none() {
+                let new_stem = Path::new(&rel).file_stem().and_then(|s| s.to_str());
+                guard
+                    .fs_removed_pending
+                    .values()
+                    .filter(|p| p.entry.sha256 == sha && !p.entry.content.is_empty())
+                    .min_by_key(|p| {
+                        let same_stem =
+                            Path::new(&p.path).file_stem().and_then(|s| s.to_str()) == new_stem;
+                        (!same_stem, p.since)
+                    })
+                    .map(|p| p.path.clone())
+            } else {
+                None
+            };
+            if let Some(old_path) = rename_pick {
+                let pending = guard
+                    .fs_removed_pending
+                    .remove(&old_path)
+                    .expect("rename_pick was just read from fs_removed_pending");
                 let new_path = rel.clone();
                 let kind_resolved = pending.entry.kind; // preserve the original kind, matches `kind` here too
                 let _ = kind_resolved;
@@ -522,7 +603,6 @@ async fn handle_fs_event(
                 // event per child, so each child rename is handled on its
                 // own; the top-level rename only needs to move the script
                 // entry itself.
-                guard.note_rename_echo(old_path.clone(), new_path.clone());
                 persist_base(&guard)?;
                 let root = guard.root.clone();
                 let session_id = guard.session_id.clone();
@@ -588,15 +668,12 @@ async fn handle_fs_event(
         }
         FileEvent::Removed(abs) => {
             let mut guard = state.write().await;
-            let rel_for_echo = guard.relative(&abs);
-            if let Some(rel) = rel_for_echo.as_deref() {
-                if guard.consume_rename_echo(rel) {
-                    debug!(path = %rel, "fs drop: suppressed echo of daemon rename (removal side)");
-                    return Ok(());
-                }
-            }
+            // No path-based echo suppression (AUDITORIA-YEET.md M17): a
+            // daemon-initiated rename removes the old key from `tree_fs`
+            // first, so the watcher's Remove(old) lands on the untracked-path
+            // check below and is dropped there without a TTL guard.
             // Capture the entry BEFORE forgetting it so a later Touched
-            // with the same sha can promote the pair to a FileRenamed.
+            // with a matching sha can promote the pair to a FileRenamed.
             let rel = match guard.relative(&abs) {
                 Some(r) => r,
                 None => {
@@ -609,11 +686,14 @@ async fn handle_fs_event(
                 return Ok(());
             };
             let entry_meta = guard.meta_for(&rel);
-            let sha = entry.sha256.clone();
             guard.tree_fs.remove(&rel);
             guard.meta.remove(&rel);
+            // Keyed by path (AUDITORIA-YEET.md A1) — every removal gets its
+            // own slot, so two same-content deletes in the same window can
+            // no longer clobber each other. `entry.sha256` is what a later
+            // Touched matches against for rename pairing.
             guard.fs_removed_pending.insert(
-                sha.clone(),
+                rel.clone(),
                 FsRemovedPending {
                     path: rel.clone(),
                     entry,
@@ -625,17 +705,18 @@ async fn handle_fs_event(
             // Defer the actual reconcile (which would emit FileDeleted to
             // Studio + drop the tree_base entry) until the pairing window
             // expires. If a matching Touched lands inside the window, it
-            // consumes `fs_removed_pending[sha]` and the rename is emitted
-            // as a single `FileRenamed` instead.
+            // consumes `fs_removed_pending[rel]` and the rename is emitted
+            // as a single `FileRenamed` instead. Removing by its own path
+            // means this reconcile is independent of any other pending
+            // removal, even one with identical content.
             let state2 = state.clone();
             let bcast_tx2 = bcast_tx.clone();
-            let sha2 = sha.clone();
             let rel2 = rel.clone();
             tokio::spawn(async move {
                 tokio::time::sleep(FS_RENAME_PAIR_TTL).await;
                 let still_pending = {
                     let mut guard = state2.write().await;
-                    guard.fs_removed_pending.remove(&sha2).is_some()
+                    guard.fs_removed_pending.remove(&rel2).is_some()
                 };
                 if still_pending {
                     if let Err(e) = reconcile_path(&state2, &rel2, &bcast_tx2).await {
@@ -645,10 +726,276 @@ async fn handle_fs_event(
             });
             return Ok(());
         }
+        // `Rescan` is intercepted at the top of the function; this arm only
+        // satisfies match exhaustiveness.
+        FileEvent::Rescan => return Ok(()),
     };
 
     // From here on we're holding nothing; re-acquire to run the merge step.
     reconcile_path(state, &path, bcast_tx).await
+}
+
+/// Recovers from a watcher backend error/overflow (AUDITORIA-YEET.md M19):
+/// re-reads the entire tracked tree from disk, then reconciles every path
+/// whose state could have changed while notifications were being dropped.
+/// Heavier than a single-path reconcile, but a backend error is rare (a
+/// storm — git checkout, bulk `wally install`) and the alternative is a
+/// silent desync that only heals on the next reconnect.
+async fn handle_rescan(
+    state: &SharedState,
+    bcast_tx: &broadcast::Sender<Arc<ServerMsg>>,
+) -> Result<()> {
+    warn!("watcher backend error: re-scanning tracked tree and reconciling");
+    let paths: Vec<String> = {
+        let mut guard = state.write().await;
+        // Union the paths from BEFORE and AFTER the rescan: files that
+        // vanished during the storm survive only in base/studio, while ones
+        // that appeared or changed show up in the freshly rebuilt tree_fs.
+        let mut union: BTreeSet<String> = BTreeSet::new();
+        union.extend(guard.tree_fs.keys().cloned());
+        union.extend(guard.tree_studio.keys().cloned());
+        union.extend(guard.tree_base.keys().cloned());
+        guard.rescan_fs()?;
+        union.extend(guard.tree_fs.keys().cloned());
+        union.into_iter().collect()
+    };
+    for path in paths {
+        if let Err(e) = reconcile_path(state, &path, bcast_tx).await {
+            warn!(path = %path, error = ?e, "rescan reconcile failed");
+        }
+    }
+    Ok(())
+}
+
+/// A tracked source file found on disk under a directory being fingerprinted
+/// for rename detection: its forward-slashed sub-path relative to that
+/// directory plus its normalized-content sha256.
+struct DirScanFile {
+    subpath: String,
+    sha256: String,
+}
+
+/// Walks `dir_abs` recursively and returns every classifiable Roblox source
+/// file (skipping `.meta.json` sidecars and anything that doesn't classify),
+/// each with its sub-path relative to `dir_abs` and its normalized-content
+/// sha256. Used to fingerprint a directory's contents so a folder rename can
+/// be matched against a tracked `tree_fs` subtree.
+fn scan_dir_source_files(dir_abs: &Path) -> Vec<DirScanFile> {
+    let mut out = Vec::new();
+    for entry in walkdir::WalkDir::new(dir_abs).follow_links(false) {
+        let Ok(entry) = entry else { continue };
+        if !entry.file_type().is_file() {
+            continue;
+        }
+        let path = entry.path();
+        if is_meta_file(path) {
+            continue;
+        }
+        let Some(file_name) = path.file_name().and_then(|s| s.to_str()) else {
+            continue;
+        };
+        if classify(file_name).is_none() {
+            continue;
+        }
+        let Ok(rel) = path.strip_prefix(dir_abs) else {
+            continue;
+        };
+        let mut subpath = String::new();
+        for (i, comp) in rel.components().enumerate() {
+            let Some(part) = comp.as_os_str().to_str() else {
+                subpath.clear();
+                break;
+            };
+            if i > 0 {
+                subpath.push('/');
+            }
+            subpath.push_str(part);
+        }
+        if subpath.is_empty() {
+            continue;
+        }
+        let Ok(raw) = std::fs::read_to_string(path) else {
+            continue;
+        };
+        let (content, _meta) = normalize_from_disk(&raw);
+        out.push(DirScanFile {
+            subpath,
+            sha256: sha256_hex(content.as_bytes()),
+        });
+    }
+    out
+}
+
+/// Finds a tracked directory subtree that was renamed *to* `new_dir_rel`.
+/// A candidate old directory qualifies when (a) it is not `new_dir_rel`
+/// itself, (b) its on-disk path no longer exists — a rename removes the old
+/// dir, whereas a copy leaves it in place so copies never false-match — and
+/// (c) the `(sub-path, sha256)` signature of its `tree_fs` entries exactly
+/// equals `disk_sig` (the signature of the files now on disk under the new
+/// dir).
+///
+/// Candidates are derived from the directory prefixes present in `tree_fs`,
+/// so pairing works whether the old dir's `Removed` event was processed
+/// before or after this `Touched` — a directory `Removed` is a harmless
+/// no-op that leaves the subtree entries in `tree_fs`.
+fn find_dir_rename_source(
+    guard: &ProjectState,
+    new_dir_rel: &str,
+    disk_sig: &BTreeSet<(String, String)>,
+) -> Option<String> {
+    // Every ancestor directory prefix that appears in tree_fs is a candidate.
+    let mut candidates: BTreeSet<String> = BTreeSet::new();
+    for key in guard.tree_fs.keys() {
+        let mut start = 0usize;
+        while let Some(rel_pos) = key[start..].find('/') {
+            let end = start + rel_pos;
+            candidates.insert(key[..end].to_owned());
+            start = end + 1;
+        }
+    }
+    for cand in candidates {
+        if cand == new_dir_rel {
+            continue;
+        }
+        // A rename removes the old directory; a copy leaves it on disk.
+        if guard.root.join(&cand).exists() {
+            continue;
+        }
+        let prefix = format!("{cand}/");
+        let sig: BTreeSet<(String, String)> = guard
+            .tree_fs
+            .iter()
+            .filter(|(k, _)| k.starts_with(&prefix))
+            .map(|(k, e)| (k[prefix.len()..].to_owned(), e.sha256.clone()))
+            .collect();
+        if !sig.is_empty() && &sig == disk_sig {
+            return Some(cand);
+        }
+    }
+    None
+}
+
+/// Handles a `Touched` event whose path is a directory. On Windows a folder
+/// rename/move surfaces as a single dir-level rename pair with no per-child
+/// events, so the moved subtree would otherwise desync (AUDITORIA-YEET.md
+/// A7). We detect the rename by matching the new directory's on-disk source
+/// files against a tracked `tree_fs` subtree whose old directory has
+/// disappeared, then re-key every affected `tree_fs`/`tree_base`/
+/// `tree_studio`/`meta`/`meta_attributes` entry by prefix (the disk-side
+/// analog of `handle_studio_renamed`'s DirToDir re-key) and emit a per-child
+/// `FileRenamed` so Studio-side instance state (attributes, tags, non-script
+/// children) survives the move.
+///
+/// When the directory doesn't match a rename source it is dropped: brand-new
+/// directories arrive with their own per-file `Touched` events, which the
+/// normal file path already handles.
+async fn handle_dir_touched(
+    state: &SharedState,
+    new_dir_abs: &Path,
+    bcast_tx: &broadcast::Sender<Arc<ServerMsg>>,
+) -> Result<()> {
+    let new_dir_rel = {
+        let guard = state.read().await;
+        let Some(rel) = guard.relative(new_dir_abs) else {
+            return Ok(());
+        };
+        if !guard.is_under_mapping(&rel) {
+            return Ok(());
+        }
+        rel
+    };
+    // Fingerprint the source files now living under the new directory.
+    let disk = scan_dir_source_files(new_dir_abs);
+    if disk.is_empty() {
+        return Ok(());
+    }
+    let disk_sig: BTreeSet<(String, String)> = disk
+        .iter()
+        .map(|f| (f.subpath.clone(), f.sha256.clone()))
+        .collect();
+
+    let mut guard = state.write().await;
+    let Some(old_dir_rel) = find_dir_rename_source(&guard, &new_dir_rel, &disk_sig) else {
+        // Not attributable to a rename — drop (new dirs come with per-file
+        // events). Leaving `tree_fs` untouched preserves the old behavior.
+        return Ok(());
+    };
+
+    let old_prefix = format!("{old_dir_rel}/");
+    let new_prefix = format!("{new_dir_rel}/");
+    // Snapshot the per-child renames before re-keying so we can broadcast a
+    // FileRenamed for each. Content/sha/kind come from the tracked entry,
+    // which by construction (the signature match) equals what is on disk.
+    let mut children: Vec<(String, String, TreeEntry)> = Vec::new();
+    let old_keys: Vec<String> = guard
+        .tree_fs
+        .keys()
+        .filter(|k| k.starts_with(&old_prefix))
+        .cloned()
+        .collect();
+    for old_key in old_keys {
+        let suffix = &old_key[old_prefix.len()..];
+        let new_key = format!("{new_prefix}{suffix}");
+        if let Some(entry) = guard.tree_fs.get(&old_key).cloned() {
+            children.push((old_key, new_key, entry));
+        }
+    }
+
+    rekey_tree(&mut guard.tree_fs, &old_prefix, &new_prefix);
+    rekey_tree(&mut guard.tree_base, &old_prefix, &new_prefix);
+    rekey_tree(&mut guard.tree_studio, &old_prefix, &new_prefix);
+    rekey_meta(&mut guard.meta, &old_prefix, &new_prefix);
+    rekey_meta_attributes(&mut guard.meta_attributes, &old_prefix, &new_prefix);
+    // Re-key any collision flags so a paused path follows the rename.
+    let moved_collisions: Vec<String> = guard
+        .pending_collisions
+        .iter()
+        .filter(|p| p.starts_with(&old_prefix))
+        .cloned()
+        .collect();
+    for old_c in moved_collisions {
+        guard.pending_collisions.remove(&old_c);
+        let suffix = old_c[old_prefix.len()..].to_owned();
+        guard.pending_collisions.insert(format!("{new_prefix}{suffix}"));
+    }
+    persist_base(&guard)?;
+    let root = guard.root.clone();
+    let session_id = guard.session_id.clone();
+    drop(guard);
+
+    info!(
+        old_dir = %old_dir_rel,
+        new_dir = %new_dir_rel,
+        children = children.len(),
+        "fs directory rename detected; re-keyed subtree and emitting per-child FileRenamed"
+    );
+    for (old_key, new_key, entry) in children {
+        audit::record(
+            &root,
+            &audit::Entry {
+                ts: audit::now_rfc3339(),
+                kind: audit::Kind::FsRename,
+                path: &new_key,
+                sha_before: Some(&old_key),
+                sha_after: Some(&entry.sha256),
+                session_id: &session_id,
+                note: Some("ide-side directory rename (A7)"),
+            },
+        );
+        broadcast_server_msg(
+            state,
+            bcast_tx,
+            ServerMsg::FileRenamed {
+                old_path: old_key,
+                new_path: new_key,
+                content: entry.content,
+                sha256: entry.sha256,
+                kind: entry.kind,
+            },
+        )
+        .await;
+    }
+    Ok(())
 }
 
 /// Handles a `.meta.json` create/change/delete. Emits `AttributesChanged`
@@ -707,6 +1054,9 @@ async fn handle_meta_event(
             )
             .await;
         }
+        // Rescan is intercepted in `handle_fs_event`; it never reaches the
+        // meta-file router.
+        FileEvent::Rescan => {}
     }
     Ok(())
 }
@@ -758,15 +1108,30 @@ async fn reconcile_path(
     path: &str,
     bcast_tx: &broadcast::Sender<Arc<ServerMsg>>,
 ) -> Result<()> {
-    let outcome = {
+    let (outcome, has_pending) = {
         let guard = state.read().await;
-        merge_file(
+        let outcome = merge_file(
             path,
             guard.tree_base.get(path),
             guard.tree_studio.get(path),
             guard.tree_fs.get(path),
-        )
+        );
+        (outcome, guard.pending_conflicts.contains_key(path))
     };
+    // A2/race-1: while a conflict for `path` is awaiting the user's
+    // resolution, `pending_conflicts` is authoritative over the path. FS and
+    // Studio run as concurrent tokio tasks, so a clean / auto-merge / adopt
+    // outcome can arrive from the *other* side while the snapshot is open.
+    // Letting `apply_outcome` run it would rewrite disk/Studio and advance
+    // `tree_base` out from under the snapshot — the eventual `ConflictResolved`
+    // rebuilds from the snapshot's now-stale `base_content` and silently
+    // reverts that change (and, for AutoMerge, discards the merged code).
+    // Freeze the path on disk and re-sync the snapshot to the current trees
+    // instead; the explicit resolution paths (handshake, bulk resolutions)
+    // call `apply_outcome` directly and are unaffected.
+    if has_pending {
+        return refresh_pending_conflict(state, path, outcome, bcast_tx).await;
+    }
     apply_outcome(state, path, outcome, bcast_tx).await
 }
 
@@ -1587,6 +1952,91 @@ async fn record_conflict(
     Ok(())
 }
 
+/// Called from `reconcile_path` when a background reconcile fires for a path
+/// that already has an open conflict (AUDITORIA-YEET.md A2/race-1). Rather
+/// than let the freshly-recomputed outcome mutate disk/Studio/`tree_base`, it
+/// keeps the path frozen on disk and re-syncs the pending snapshot to the
+/// current trees. The eventual `ConflictResolved` then rebuilds from a
+/// snapshot that matches the live state instead of the stale base captured at
+/// first detection.
+async fn refresh_pending_conflict(
+    state: &SharedState,
+    path: &str,
+    outcome: MergeOutcome,
+    bcast_tx: &broadcast::Sender<Arc<ServerMsg>>,
+) -> Result<()> {
+    // Build the refreshed snapshot from `outcome` (already merged against the
+    // current trees) plus each side's current content for display. A genuine
+    // `Conflict` is adopted verbatim; a clean / auto-merge outcome is captured
+    // as a hunk-less conflict whose `base_content` already equals the resolved
+    // content, so `rebuild_resolved` reproduces it exactly on resolution.
+    let fresh: Option<FileConflict> = {
+        let guard = state.read().await;
+        let studio_content = guard.tree_studio.get(path).map(|e| e.content.clone());
+        let fs_content = guard.tree_fs.get(path).map(|e| e.content.clone());
+        let resolvable = |content: String, kind: ScriptKind| FileConflict {
+            path: path.to_owned(),
+            conflict_kind: ConflictKind::Edit,
+            script_kind: kind,
+            base_content: Some(content),
+            studio_content: studio_content.clone(),
+            fs_content: fs_content.clone(),
+            conflict_hunks: Vec::new(),
+            auto_hunks: Vec::new(),
+        };
+        match outcome {
+            MergeOutcome::Conflict(c) => Some(c),
+            MergeOutcome::AutoMerge { content, kind } => Some(resolvable(content, kind)),
+            MergeOutcome::Apply {
+                content: Some(c),
+                kind,
+                ..
+            } => Some(resolvable(c, kind)),
+            MergeOutcome::AdoptBase => guard
+                .tree_fs
+                .get(path)
+                .or_else(|| guard.tree_studio.get(path))
+                .map(|e| resolvable(e.content.clone(), e.kind)),
+            // A delete-side clean outcome or a genuine no-op: leave the
+            // existing snapshot frozen. Nothing is lost — the open snapshot
+            // still carries both sides' content and disk stays untouched until
+            // the user resolves.
+            MergeOutcome::Apply { content: None, .. } | MergeOutcome::Noop => None,
+        }
+    };
+    let Some(fresh) = fresh else {
+        debug!(path = %path, "reconcile frozen: conflict pending, snapshot left as-is");
+        return Ok(());
+    };
+    // Preserve the conflict-vs-conflict guard (commit 7ca88f4): if the live
+    // divergence is byte-for-byte what the user is already resolving, don't
+    // clobber their in-progress hunk selection with an identical
+    // re-detection, and don't re-broadcast. Only replace when the trees moved.
+    let view = conflict_to_view(&fresh);
+    {
+        let mut guard = state.write().await;
+        if let Some(existing) = guard.pending_conflicts.get(path) {
+            if existing.base_content == fresh.base_content
+                && existing.studio_content == fresh.studio_content
+                && existing.fs_content == fresh.fs_content
+            {
+                debug!(path = %path, "reconcile frozen: pending conflict already matches current trees");
+                return Ok(());
+            }
+        }
+        guard.pending_conflicts.insert(path.to_owned(), fresh);
+    }
+    broadcast_server_msg(
+        state,
+        bcast_tx,
+        ServerMsg::ConflictDetected {
+            conflicts: vec![view],
+        },
+    )
+    .await;
+    Ok(())
+}
+
 fn persist_base(guard: &ProjectState) -> Result<()> {
     tree::save_base_tree(&guard.root, &guard.tree_base)?;
     Ok(())
@@ -2302,7 +2752,6 @@ async fn handle_studio_renamed(
         guard.meta.insert(new_path.clone(), meta);
     }
 
-    guard.note_rename_echo(old_path.clone(), new_path.clone());
     let collision_cleared =
         guard.pending_collisions.remove(&old_path) | guard.pending_collisions.remove(&new_path);
     if let Err(e) = persist_base(&guard) {
@@ -3155,6 +3604,7 @@ async fn accept_loop(
     state: SharedState,
     sessions: Arc<Mutex<SyncbackSessions>>,
     bcast_tx: broadcast::Sender<Arc<ServerMsg>>,
+    enforce_loopback_host: bool,
 ) -> Result<()> {
     // Counter of currently-open WebSocket connections. Bounded by
     // `MAX_CONCURRENT_CONNECTIONS` to prevent a malicious local client
@@ -3202,11 +3652,95 @@ async fn accept_loop(
             // `guard` lives for the lifetime of this task; the counter
             // is decremented on every exit path via Drop.
             let _guard = guard;
-            if let Err(e) = handle_connection(stream, peer, state, sessions, bcast_tx).await {
+            if let Err(e) =
+                handle_connection(stream, peer, state, sessions, bcast_tx, enforce_loopback_host)
+                    .await
+            {
                 error!(%peer, error = ?e, "connection closed with error");
             }
         });
     }
+}
+
+/// Strips the `:port` (or `]:port` for a bracketed IPv6 literal) from a
+/// `host[:port]` authority, returning just the host. IPv6 literals keep their
+/// brackets so `host_is_loopback` can strip them uniformly.
+fn split_host(authority: &str) -> &str {
+    if let Some(close) = authority.find(']') {
+        // Bracketed IPv6 literal: the host is `[..]`; drop any trailing `:port`.
+        return &authority[..=close];
+    }
+    match authority.rsplit_once(':') {
+        Some((host, _port)) => host,
+        None => authority,
+    }
+}
+
+/// True iff `host` (no port; IPv6 may be bracketed) is a loopback host: the
+/// literal `localhost`, or an IP that parses into the loopback range
+/// (127.0.0.0/8 or ::1). Parsing as an IP is what defeats DNS-rebinding
+/// look-alikes — `127.0.0.1.evil.com` and `localhost.evil.com` are neither
+/// `localhost` nor a valid loopback IP, so they fail.
+fn host_is_loopback(host: &str) -> bool {
+    if host.eq_ignore_ascii_case("localhost") {
+        return true;
+    }
+    let bare = host
+        .strip_prefix('[')
+        .and_then(|s| s.strip_suffix(']'))
+        .unwrap_or(host);
+    bare.parse::<std::net::IpAddr>()
+        .map(|ip| ip.is_loopback())
+        .unwrap_or(false)
+}
+
+/// Origin allowlist for the WS upgrade (AUDITORIA-YEET.md M24). An absent /
+/// empty / `null` Origin passes — native clients (the Studio plugin) send no
+/// browser Origin. A present http(s) Origin passes ONLY when its host is an
+/// exact loopback host; every other http(s) Origin (any routable or look-alike
+/// host, e.g. `localhost.evil.com`) is rejected. A non-http(s) Origin
+/// (`file://`, an app scheme) passes — it is not a browser page on a routable
+/// host. The old code used `host.starts_with("localhost")`/`"127."`, which
+/// accepted rebinding look-alikes.
+fn origin_is_allowed(origin: &str) -> bool {
+    let origin = origin.trim();
+    if origin.is_empty() || origin.eq_ignore_ascii_case("null") {
+        return true;
+    }
+    let lower = origin.to_ascii_lowercase();
+    let rest = match lower
+        .strip_prefix("http://")
+        .or_else(|| lower.strip_prefix("https://"))
+    {
+        Some(rest) => rest,
+        None => return true,
+    };
+    let authority = rest
+        .split(|c| c == '/' || c == '?' || c == '#')
+        .next()
+        .unwrap_or("");
+    // Drop any userinfo (`user:pass@host`).
+    let hostport = authority.rsplit('@').next().unwrap_or(authority);
+    host_is_loopback(split_host(hostport))
+}
+
+/// Validates the WS upgrade `Host` header is loopback — defence against a
+/// DNS-rebound name reaching a loopback-bound daemon. An absent/empty Host
+/// passes (the Origin check is the primary gate and an absent Host is not a
+/// rebinding vector). Only enforced when the daemon is bound to loopback;
+/// `--allow-remote` deliberately opts out.
+fn host_header_is_loopback(host: Option<&str>) -> bool {
+    match host.map(str::trim) {
+        None | Some("") => true,
+        Some(h) => host_is_loopback(split_host(h)),
+    }
+}
+
+/// True iff a `--bind` address targets a loopback interface only. Gates the
+/// `--allow-remote` requirement (B13) and decides whether the loopback `Host`
+/// header check (M24) is enforced.
+fn is_loopback_bind_addr(addr: &str) -> bool {
+    host_is_loopback(split_host(addr.trim()))
 }
 
 async fn handle_connection(
@@ -3215,6 +3749,7 @@ async fn handle_connection(
     state: SharedState,
     sessions: Arc<Mutex<SyncbackSessions>>,
     bcast_tx: broadcast::Sender<Arc<ServerMsg>>,
+    enforce_loopback_host: bool,
 ) -> Result<()> {
     // Pin the frame/message cap explicitly. `WS_MAX_FRAME_BYTES` is set
     // tighter than tungstenite's defaults to bound peak attacker-
@@ -3227,60 +3762,45 @@ async fn handle_connection(
         max_message_size: Some(WS_MAX_MESSAGE_BYTES),
         ..WebSocketConfig::default()
     };
-    // Origin header allowlist. Browsers ALWAYS attach `Origin: <page>`
-    // when opening a WebSocket; the assumption was that a native
-    // client (Roblox Studio's HttpService, Node's `ws`, curl, custom
-    // CLI tools) wouldn't. In practice Studio DOES send an Origin
-    // header on its WebStreamClient — exact value depends on Studio
-    // build — so a blanket "reject any Origin" was too aggressive
-    // and broke the very plugin we're trying to authenticate.
+    // Origin header allowlist. Browsers ALWAYS attach `Origin: <page>` when
+    // opening a WebSocket; native clients (Roblox Studio's WebStreamClient,
+    // the extension, curl) send either no Origin, `null`, or a non-http(s)
+    // scheme — all of which pass. A present http(s) Origin passes ONLY when
+    // its host is an EXACT loopback host (`origin_is_allowed`): the realistic
+    // DNS-rebinding attack lands on a rebound name like `localhost.evil.com`
+    // whose Origin host is not loopback, so it is rejected. The old code
+    // matched hosts by prefix (`starts_with("localhost")`), which let
+    // `localhost.evil.com` through.
     //
-    // The narrower rule: reject ONLY origins that are unambiguously
-    // browser pages on a public HTTP(S) host. `loopback.localhost`,
-    // `127.0.0.1`, IPv6 loopback, and `null` (file:// origins,
-    // sandboxed iframes, Studio's plugin scheme) all PASS. The
-    // realistic browser-driven attack (random web page on the
-    // internet hijacking the daemon via DNS rebinding) lands on a
-    // rebound name like `evil.com` resolving to 127.0.0.1, where
-    // the page's Origin is still `https://evil.com` — that case is
-    // still rejected. Trade-off: a malicious local web page hosted
-    // at http://localhost can still connect, but anyone running an
-    // attacker-controlled localhost server already has process-level
-    // access to bypass the auth gate by other means.
-    let origin_check = |req: &Request, response: Response| -> Result<Response, ErrorResponse> {
-        let origin_header = req.headers().get("origin");
-        let origin_str = match origin_header {
-            Some(v) => v.to_str().unwrap_or(""),
-            None => "",
-        };
+    // When bound to loopback we additionally require the `Host` header to be
+    // loopback — a rebound name shows up there too. This is skipped under
+    // `--allow-remote`, where a non-loopback Host is expected.
+    let origin_check = move |req: &Request, response: Response| -> Result<Response, ErrorResponse> {
+        let origin_str = req
+            .headers()
+            .get("origin")
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or("");
         // Always log so future debugging has visibility into what
         // Studio / extensions / ad-hoc clients send.
         info!(origin = %origin_str, "ws upgrade origin");
-        if origin_str.is_empty() || origin_str == "null" {
-            return Ok(response);
-        }
-        // Strip scheme to look at the host part. We accept anything
-        // that doesn't look like an externally-routable HTTP(S) URL.
-        let lower = origin_str.to_ascii_lowercase();
-        let host_part = lower
-            .strip_prefix("http://")
-            .or_else(|| lower.strip_prefix("https://"))
-            .unwrap_or(&lower);
-        let host = host_part.split('/').next().unwrap_or("");
-        let is_loopback = host.starts_with("localhost")
-            || host.starts_with("127.")
-            || host.starts_with("[::1]")
-            || host.starts_with("[::ffff:127.")
-            || host.starts_with("0.0.0.0");
-        let is_http_scheme =
-            lower.starts_with("http://") || lower.starts_with("https://");
-        if is_http_scheme && !is_loopback {
-            let body = format!(
-                "yeet-daemon: refusing remote-host browser origin ({origin_str})"
-            );
+        if !origin_is_allowed(origin_str) {
+            let body = format!("yeet-daemon: refusing non-loopback browser origin ({origin_str})");
             let mut err = ErrorResponse::new(Some(body));
             *err.status_mut() = StatusCode::FORBIDDEN;
             return Err(err);
+        }
+        if enforce_loopback_host {
+            let host_hdr = req.headers().get("host").and_then(|v| v.to_str().ok());
+            if !host_header_is_loopback(host_hdr) {
+                let body = format!(
+                    "yeet-daemon: refusing non-loopback Host header ({})",
+                    host_hdr.unwrap_or("")
+                );
+                let mut err = ErrorResponse::new(Some(body));
+                *err.status_mut() = StatusCode::FORBIDDEN;
+                return Err(err);
+            }
         }
         Ok(response)
     };
@@ -3420,41 +3940,68 @@ type WsWriter = futures_util::stream::SplitSink<
 >;
 type WsReader = futures_util::stream::SplitStream<tokio_tungstenite::WebSocketStream<TcpStream>>;
 
-/// Lightweight auth gate. Threat model: the only realistic attacker
-/// at this layer is a remote browser tab (DNS rebinding) — that
-/// attack is blocked entirely by the Origin allowlist enforced
-/// during the WS upgrade (see `handle_connection`). A local
-/// malicious process with same-user privileges can read every file
-/// the daemon writes anyway, so adding cryptographic ceremony here
-/// just degrades UX without raising the security bar.
+/// Auth decision, factored out of `authenticate_or_pair` so the policy is
+/// unit-testable without a live socket. The I/O (sending `AuthGranted`,
+/// deleting the breadcrumb, closing the connection) is the caller's job.
+#[derive(Debug, PartialEq, Eq)]
+enum AuthOutcome {
+    /// Client is authorized; proceed to the session without sending a frame.
+    Proceed,
+    /// A plugin presented no token but a fresh pairing breadcrumb vouches for
+    /// it: send `AuthGranted` (so it can cache the token) then proceed.
+    GrantAndPair,
+    /// Reject the connection. The caller closes the socket WITHOUT sending the
+    /// server token; the `&'static str` is the log reason.
+    Reject(&'static str),
+}
+
+/// Pure auth policy (AUDITORIA-YEET.md A16). Rules:
+///   * A supplied token must match (constant-time). A mismatch is `Reject` —
+///     the server token is NEVER echoed back. That echo was the A16 leak:
+///     any client that guessed wrong received the real credential.
+///   * `role == "extension"` (and any non-plugin role) MUST present a valid
+///     token up-front. Those clients can read `.yeet/auth-token`, so there is
+///     no breadcrumb fallback for them.
+///   * A plugin with no token pairs via a fresh breadcrumb, or proceeds
+///     tokenless when none is present (first-run Studio before the extension
+///     is up — a legitimate flow we must keep).
+fn decide_auth(
+    claimed_auth: Option<&str>,
+    role: &str,
+    server_token: &str,
+    breadcrumb_valid: bool,
+) -> AuthOutcome {
+    if let Some(token) = claimed_auth.filter(|t| !t.is_empty()) {
+        return if auth::constant_time_eq(token, server_token) {
+            AuthOutcome::Proceed
+        } else {
+            AuthOutcome::Reject("auth token mismatch")
+        };
+    }
+    // No token offered. Breadcrumb pairing is a plugin-only convenience.
+    if role != "plugin" {
+        return AuthOutcome::Reject("missing auth token (required for this role)");
+    }
+    if breadcrumb_valid {
+        AuthOutcome::GrantAndPair
+    } else {
+        AuthOutcome::Proceed
+    }
+}
+
+/// Auth gate, run after the version check and before the role session starts.
+/// Threat model: the realistic attacker at this layer is a remote browser tab
+/// (DNS rebinding), blocked by the Origin/Host allowlist during the WS upgrade
+/// (`handle_connection`) plus the loopback bind. The token/breadcrumb gate is
+/// defence-in-depth so a local process still has to read a per-project file
+/// rather than merely open the socket.
 ///
-/// Behaviour:
-///   * If the client supplied a token: do a constant-time compare
-///     and log the result. **Never reject on mismatch** — the
-///     practical effect of mismatch is "the client used to pair
-///     against an older daemon instance and forgot to re-pair", and
-///     the right move is to just accept and let the connection
-///     proceed. The mismatch log is the breadcrumb a security-
-///     conscious operator can grep for.
-///   * If the client supplied no token AND a `yeet-pairing.txt`
-///     breadcrumb is fresh: opportunistically issue `AuthGranted`
-///     so the client can save the token and skip the dance on
-///     future reconnects. The breadcrumb is created automatically
-///     by `Yeet: Start` in the extension, so this happens without
-///     any user action in the normal flow.
-///   * If neither: just proceed silently. Connection works; the
-///     client doesn't get a token but it doesn't matter — the next
-///     time the extension is running, the breadcrumb appears and
-///     the client gets paired then.
-///
-/// The function never sends `AuthRejected` and never bails. It
-/// always returns Ok so the connection moves on to the version /
-/// role / handshake flow. Earlier versions enforced strict rejection
-/// here and the symptom was "Studio plugin can't connect" with no
-/// signal pointing at the auth gate as the culprit; switching to a
-/// best-effort posture keeps the convenience of automatic pairing
-/// while preserving the only defence that actually mattered (Origin
-/// allowlist).
+/// On rejection an `AuthRejected { reason }` frame is written (reason only) and
+/// the connection is closed (`bail`). The server token is never sent to a
+/// client that presented a wrong one, and the session never reaches
+/// `ProjectOpened { initial_files }` (that frame is emitted only inside the role
+/// session, after this returns `Ok`). The `AuthRejected` frame lets a plugin
+/// holding a stale token clear it and re-pair instead of looping.
 async fn authenticate_or_pair(
     state: &SharedState,
     claimed_auth: &Option<String>,
@@ -3467,59 +4014,63 @@ async fn authenticate_or_pair(
         let guard = state.read().await;
         (guard.auth_token.clone(), guard.root.clone())
     };
-    if let Some(t) = claimed_auth.as_deref().filter(|t| !t.is_empty()) {
-        if auth::constant_time_eq(t, &server_token) {
-            info!(%peer, %role, "auth: token matched");
-        } else {
-            warn!(
-                %peer,
-                %role,
-                "auth: token mismatch (accepting anyway — likely stale token from previous daemon instance)"
-            );
-            // Re-issue the current token so the client can refresh
-            // its stored value and skip the mismatch on next connect.
-            let _ = write_frame(
+    // The breadcrumb is consulted only for the plugin's no-token path; skip
+    // the filesystem read entirely for every other role.
+    let breadcrumb_valid =
+        role == "plugin" && auth::pairing_breadcrumb_valid(&project_root_path);
+    match decide_auth(claimed_auth.as_deref(), role, &server_token, breadcrumb_valid) {
+        AuthOutcome::Proceed => {
+            info!(%peer, %role, "auth: proceeding");
+            Ok(())
+        }
+        AuthOutcome::GrantAndPair => {
+            if let Err(e) = write_frame(
                 writer,
                 &ServerMsg::AuthGranted {
                     auth_token: server_token,
                 },
             )
-            .await;
+            .await
+            {
+                warn!(error = ?e, "auth: failed to send opportunistic auth_granted");
+            } else {
+                info!(%peer, %role, "auth: paired via breadcrumb (no token, fresh breadcrumb)");
+            }
+            // One-shot breadcrumb: delete after use so it can't pair a second
+            // client. The extension's refresh timer recreates it within ~30s.
+            if let Err(e) = auth::delete_pairing_breadcrumb(&project_root_path) {
+                warn!(error = ?e, "failed to delete pairing breadcrumb after pair");
+            }
+            Ok(())
         }
-        return Ok(());
+        AuthOutcome::Reject(reason) => {
+            warn!(
+                %peer,
+                %role,
+                reason,
+                "auth: rejecting connection (closing socket, server token NOT sent)"
+            );
+            // Send an actionable AuthRejected (reason only, NEVER the token)
+            // before closing. The daemon regenerates its auth_token every boot,
+            // so a plugin that cached a token from a previous instance will
+            // present a stale one after a restart; without this signal it would
+            // reconnect with the same wrong token forever. On AuthRejected the
+            // plugin clears its stored token and re-pairs tokenless via the
+            // breadcrumb. Echoing the server token here is exactly the A16 leak
+            // we are closing, so it is never included.
+            if let Err(e) = write_frame(
+                writer,
+                &ServerMsg::AuthRejected {
+                    reason: reason.to_string(),
+                },
+            )
+            .await
+            {
+                warn!(error = ?e, "auth: failed to send auth_rejected before close");
+            }
+            bail!("auth rejected: {reason}");
+        }
     }
-    // No token offered. If the breadcrumb is fresh (extension is
-    // running and keeping it alive), opportunistically pair.
-    if role == "plugin" && auth::pairing_breadcrumb_valid(&project_root_path) {
-        if let Err(e) = write_frame(
-            writer,
-            &ServerMsg::AuthGranted {
-                auth_token: server_token,
-            },
-        )
-        .await
-        {
-            warn!(error = ?e, "auth: failed to send opportunistic auth_granted");
-        } else {
-            info!(%peer, %role, "auth: paired via breadcrumb (no token, fresh breadcrumb)");
-        }
-        // Delete the breadcrumb after pair to keep it short-lived;
-        // extension's refresh timer will recreate it within ~30s,
-        // so a second plugin connect window is tiny but exists.
-        if let Err(e) = auth::delete_pairing_breadcrumb(&project_root_path) {
-            warn!(error = ?e, "failed to delete yeet-pairing.txt after pair");
-        }
-    } else {
-        // No token, no breadcrumb. Allow the connection regardless —
-        // see function docstring rationale. Just log so it's
-        // greppable.
-        info!(
-            %peer,
-            %role,
-            "auth: proceeding without token (no breadcrumb available; client will pair on next start)"
-        );
-    }
-    Ok(())
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -4625,6 +5176,88 @@ async fn handle_pick_folder_prompt(
 }
 
 #[allow(clippy::too_many_arguments)]
+/// Resolves the current user's home directory (`%USERPROFILE%` on Windows,
+/// `$HOME` elsewhere). Returns `None` when the variable is unset or empty, in
+/// which case a syncback is refused rather than allowed to write anywhere.
+fn user_home_dir() -> Option<PathBuf> {
+    let var = if cfg!(windows) { "USERPROFILE" } else { "HOME" };
+    std::env::var_os(var)
+        .map(PathBuf::from)
+        .filter(|p| !p.as_os_str().is_empty())
+}
+
+/// Confines a syncback `target_path` to the user's home directory
+/// (AUDITORIA-YEET.md A17 — arbitrary file write). The legitimate
+/// reverse-bootstrap targets a user-chosen NEW folder, so we cannot require
+/// it inside the served project root — but we can require it under `home`,
+/// reject `..` traversal, and canonicalize the nearest EXISTING ancestor so a
+/// symlinked ancestor cannot escape home. Returns a human-readable reason on
+/// rejection.
+fn validate_syncback_target(target: &Path, home: &Path) -> Result<(), String> {
+    if !target.is_absolute() {
+        return Err(format!("target_path must be absolute: {}", target.display()));
+    }
+    if target
+        .components()
+        .any(|c| matches!(c, std::path::Component::ParentDir))
+    {
+        return Err(format!(
+            "target_path must not contain '..' components: {}",
+            target.display()
+        ));
+    }
+    let canonical_home = home
+        .canonicalize()
+        .map_err(|e| format!("cannot resolve home directory {}: {e}", home.display()))?;
+    // Walk up to the nearest existing ancestor (the target leaf is typically
+    // new). Canonicalizing it resolves any symlink in the existing portion, so
+    // a `home/link -> C:\elsewhere` ancestor is caught here rather than
+    // silently followed at write time.
+    let mut cursor: &Path = target;
+    let existing = loop {
+        if cursor.exists() {
+            break cursor;
+        }
+        match cursor.parent() {
+            Some(parent) => cursor = parent,
+            None => {
+                return Err(format!(
+                    "target_path has no existing ancestor: {}",
+                    target.display()
+                ));
+            }
+        }
+    };
+    let canonical_existing = existing
+        .canonicalize()
+        .map_err(|e| format!("cannot resolve {}: {e}", existing.display()))?;
+    if !canonical_existing.starts_with(&canonical_home) {
+        return Err(format!(
+            "target_path {} resolves outside the home directory ({}); refusing arbitrary file write",
+            target.display(),
+            home.display()
+        ));
+    }
+    Ok(())
+}
+
+/// Refuses to overwrite a non-empty target directory unless the message
+/// carries explicit overwrite intent (`MergeExisting { overwrite: true }`). A
+/// missing / empty / new directory always passes.
+fn syncback_overwrite_ok(target: &Path, mode: SyncbackMode) -> Result<(), String> {
+    let non_empty = std::fs::read_dir(target)
+        .map(|mut entries| entries.next().is_some())
+        .unwrap_or(false);
+    if non_empty && !matches!(mode, SyncbackMode::MergeExisting { overwrite: true }) {
+        return Err(format!(
+            "target_path {} is a non-empty directory; refusing to overwrite without \
+             explicit merge-overwrite intent",
+            target.display()
+        ));
+    }
+    Ok(())
+}
+
 async fn handle_syncback_begin(
     state: &SharedState,
     sessions: &Arc<Mutex<SyncbackSessions>>,
@@ -4638,15 +5271,45 @@ async fn handle_syncback_begin(
     bcast_tx: &broadcast::Sender<Arc<ServerMsg>>,
 ) -> Result<()> {
     let target = PathBuf::from(&target_path);
-    if !target.is_absolute() {
+    // A17: the target comes straight off the wire. Confine it to the user's
+    // home dir, reject `..` traversal, and refuse to clobber a non-empty
+    // directory without explicit overwrite intent, before any write happens.
+    let Some(home) = user_home_dir() else {
         send_syncback_error(
             state,
             bcast_tx,
             request_id,
-            format!("target_path must be absolute: {target_path}"),
+            "daemon cannot determine the user home directory; refusing syncback".to_owned(),
         )
         .await;
         return Ok(());
+    };
+    if let Err(reason) = validate_syncback_target(&target, &home) {
+        send_syncback_error(state, bcast_tx, request_id.clone(), reason).await;
+        return Ok(());
+    }
+    if let Err(reason) = syncback_overwrite_ok(&target, mode) {
+        send_syncback_error(state, bcast_tx, request_id.clone(), reason).await;
+        return Ok(());
+    }
+    // Durable record of every accepted destination: reverse-bootstrap is the
+    // one path that writes outside the served project on the client's say-so.
+    {
+        let guard = state.read().await;
+        let session_id = guard.session_id.clone();
+        let target_str = target.display().to_string();
+        audit::record(
+            &guard.root,
+            &audit::Entry {
+                ts: audit::now_rfc3339(),
+                kind: audit::Kind::FsWrite,
+                path: &target_str,
+                sha_before: None,
+                sha_after: None,
+                session_id: &session_id,
+                note: Some("syncback target accepted"),
+            },
+        );
     }
     let opts = SyncbackOptions {
         target_path: target,
@@ -5875,5 +6538,1111 @@ mod bulk_tests {
             "ide_keeps",
             "KeepIde should overwrite tree_studio"
         );
+    }
+}
+
+#[cfg(test)]
+mod fs_removed_pending_tests {
+    //! Direct tests of `handle_fs_event`'s `fs_removed_pending` flow — the
+    //! fix for AUDITORIA-YEET.md A1 (plus the move-2 and watcher-4 guards).
+    //! Mirrors the `bulk_tests` harness style: tempdir-backed project,
+    //! bootstrap, fire raw `FileEvent`s, inspect broadcasts + tree state.
+
+    use super::{handle_fs_event, FS_RENAME_PAIR_TTL};
+    use std::sync::Arc;
+    use std::time::Duration;
+    use tokio::sync::{broadcast, RwLock};
+    use yeet_daemon::project::Project;
+    use yeet_daemon::protocol::ServerMsg;
+    use yeet_daemon::state::{ProjectState, SharedState};
+    use yeet_daemon::watcher::FileEvent;
+
+    /// A test environment: temp project root, daemon state, broadcast bus.
+    /// Drop order matters — `_root` must outlive `state` (which holds paths
+    /// relative to it), so the tempdir guard is the last field.
+    struct Env {
+        state: SharedState,
+        bcast_tx: broadcast::Sender<Arc<ServerMsg>>,
+        _root: tempfile::TempDir,
+    }
+
+    /// Builds a project with a single `src` mount under `ServerScriptService`,
+    /// writes `disk_files` to disk so `rescan_fs` ingests them, and
+    /// bootstraps `ProjectState`. `bootstrap` alone leaves `tree_studio`
+    /// empty (it only fills in once the plugin reports a snapshot), so this
+    /// also seeds `tree_studio` from `tree_fs` to model an already-synced
+    /// project — matching the audit's repro, which starts from files
+    /// already synced to Studio.
+    async fn make_env(disk_files: &[(&str, &str)]) -> Env {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let root = dir.path();
+        let project_json = r#"{
+            "name": "FsRemovedPendingTest",
+            "tree": {
+                "$className": "DataModel",
+                "ServerScriptService": {
+                    "$className": "ServerScriptService",
+                    "$path": "src"
+                }
+            }
+        }"#;
+        std::fs::write(root.join("default.project.json"), project_json).expect("write project");
+        std::fs::create_dir(root.join("src")).expect("mkdir src");
+        for (rel, content) in disk_files {
+            let abs = root.join(rel);
+            if let Some(p) = abs.parent() {
+                std::fs::create_dir_all(p).expect("mkdir -p");
+            }
+            std::fs::write(&abs, content).expect("write file");
+        }
+        let project = Project::load(&root.join("default.project.json")).expect("load project");
+        let state_inner =
+            ProjectState::bootstrap(root, project, false, false).expect("bootstrap");
+        let state: SharedState = Arc::new(RwLock::new(state_inner));
+        {
+            let mut guard = state.write().await;
+            guard.tree_studio = guard.tree_fs.clone();
+        }
+        let (bcast_tx, _) = broadcast::channel(64);
+        Env {
+            state,
+            bcast_tx,
+            _root: dir,
+        }
+    }
+
+    fn root_of(env: &Env) -> std::path::PathBuf {
+        env._root.path().to_path_buf()
+    }
+
+    /// Drains everything currently in `rx` with a short timeout. Tests use
+    /// this after triggering fs events to inspect what got broadcast.
+    async fn drain(rx: &mut broadcast::Receiver<Arc<ServerMsg>>) -> Vec<ServerMsg> {
+        let mut out = Vec::new();
+        loop {
+            match tokio::time::timeout(Duration::from_millis(20), rx.recv()).await {
+                Ok(Ok(m)) => out.push((*m).clone()),
+                _ => break,
+            }
+        }
+        out
+    }
+
+    /// Sleeps past the rename-pairing TTL so any deferred reconcile task
+    /// spawned by a `Removed` event (see `handle_fs_event`) has run.
+    async fn wait_out_pairing_window() {
+        tokio::time::sleep(FS_RENAME_PAIR_TTL + Duration::from_millis(400)).await;
+    }
+
+    // ─── A1 core: two same-content deletes must NOT clobber each other ───
+
+    #[tokio::test]
+    async fn two_identical_content_deletes_within_window_both_propagate() {
+        let env = make_env(&[("src/A.luau", "return {}"), ("src/B.luau", "return {}")]).await;
+        let mut rx = env.bcast_tx.subscribe();
+        let root = root_of(&env);
+
+        std::fs::remove_file(root.join("src/A.luau")).expect("rm A");
+        handle_fs_event(
+            &env.state,
+            FileEvent::Removed(root.join("src/A.luau")),
+            &env.bcast_tx,
+        )
+        .await
+        .expect("handle removed A");
+        std::fs::remove_file(root.join("src/B.luau")).expect("rm B");
+        handle_fs_event(
+            &env.state,
+            FileEvent::Removed(root.join("src/B.luau")),
+            &env.bcast_tx,
+        )
+        .await
+        .expect("handle removed B");
+
+        wait_out_pairing_window().await;
+        let msgs = drain(&mut rx).await;
+
+        let deleted_a = msgs
+            .iter()
+            .any(|m| matches!(m, ServerMsg::FileDeleted { path } if path == "src/A.luau"));
+        let deleted_b = msgs
+            .iter()
+            .any(|m| matches!(m, ServerMsg::FileDeleted { path } if path == "src/B.luau"));
+        assert!(deleted_a, "expected FileDeleted for A; got {msgs:?}");
+        assert!(
+            deleted_b,
+            "expected FileDeleted for B too (lost under sha-keying); got {msgs:?}"
+        );
+
+        let guard = env.state.read().await;
+        assert!(
+            !guard.tree_base.contains_key("src/A.luau"),
+            "A must not linger as a phantom in tree_base"
+        );
+        assert!(
+            !guard.tree_base.contains_key("src/B.luau"),
+            "B must not linger as a phantom in tree_base"
+        );
+        assert!(!guard.tree_studio.contains_key("src/A.luau"));
+        assert!(!guard.tree_studio.contains_key("src/B.luau"));
+    }
+
+    // ─── watcher-4: Touched on a PRE-EXISTING file must not pair ─────────
+
+    #[tokio::test]
+    async fn remove_a_then_touch_preexisting_b_with_as_content_is_not_a_rename() {
+        let env = make_env(&[
+            ("src/A.luau", "local A = 1\nreturn A\n"),
+            ("src/B.luau", "local B = 2\nreturn B\n"),
+        ])
+        .await;
+        let mut rx = env.bcast_tx.subscribe();
+        let root = root_of(&env);
+
+        std::fs::remove_file(root.join("src/A.luau")).expect("rm A");
+        handle_fs_event(
+            &env.state,
+            FileEvent::Removed(root.join("src/A.luau")),
+            &env.bcast_tx,
+        )
+        .await
+        .expect("handle removed A");
+
+        // Overwrite pre-existing B with A's old content within the window.
+        std::fs::write(root.join("src/B.luau"), "local A = 1\nreturn A\n").expect("overwrite B");
+        handle_fs_event(
+            &env.state,
+            FileEvent::Touched(root.join("src/B.luau")),
+            &env.bcast_tx,
+        )
+        .await
+        .expect("handle touched B");
+
+        wait_out_pairing_window().await;
+        let msgs = drain(&mut rx).await;
+
+        let renamed = msgs
+            .iter()
+            .any(|m| matches!(m, ServerMsg::FileRenamed { .. }));
+        assert!(
+            !renamed,
+            "must NOT pair as a rename when B pre-existed; got {msgs:?}"
+        );
+
+        let deleted_a = msgs
+            .iter()
+            .any(|m| matches!(m, ServerMsg::FileDeleted { path } if path == "src/A.luau"));
+        assert!(
+            deleted_a,
+            "expected an independent FileDeleted for A; got {msgs:?}"
+        );
+
+        let changed_b = msgs.iter().any(|m| {
+            matches!(m, ServerMsg::FileChanged { path, content, .. }
+                if path == "src/B.luau" && content == "local A = 1\nreturn A\n")
+        });
+        assert!(
+            changed_b,
+            "expected a normal FileChanged for B; got {msgs:?}"
+        );
+
+        let guard = env.state.read().await;
+        assert_eq!(
+            guard
+                .tree_studio
+                .get("src/B.luau")
+                .map(|e| e.content.as_str()),
+            Some("local A = 1\nreturn A\n"),
+            "B's identity must be its own, not clobbered by A's rename"
+        );
+    }
+
+    // ─── Regression: a genuine single rename must still pair ─────────────
+
+    #[tokio::test]
+    async fn single_rename_still_pairs_as_filerenamed() {
+        let env = make_env(&[("src/Old.luau", "hello")]).await;
+        let mut rx = env.bcast_tx.subscribe();
+        let root = root_of(&env);
+
+        std::fs::remove_file(root.join("src/Old.luau")).expect("rm Old");
+        handle_fs_event(
+            &env.state,
+            FileEvent::Removed(root.join("src/Old.luau")),
+            &env.bcast_tx,
+        )
+        .await
+        .expect("handle removed Old");
+
+        std::fs::write(root.join("src/New.luau"), "hello").expect("write New");
+        handle_fs_event(
+            &env.state,
+            FileEvent::Touched(root.join("src/New.luau")),
+            &env.bcast_tx,
+        )
+        .await
+        .expect("handle touched New");
+
+        wait_out_pairing_window().await;
+        let msgs = drain(&mut rx).await;
+
+        let renames: Vec<_> = msgs
+            .iter()
+            .filter(|m| {
+                matches!(m, ServerMsg::FileRenamed { old_path, new_path, .. }
+                    if old_path == "src/Old.luau" && new_path == "src/New.luau")
+            })
+            .collect();
+        assert_eq!(
+            renames.len(),
+            1,
+            "expected exactly one FileRenamed; got {msgs:?}"
+        );
+
+        let stray_delete = msgs
+            .iter()
+            .any(|m| matches!(m, ServerMsg::FileDeleted { path } if path == "src/Old.luau"));
+        assert!(
+            !stray_delete,
+            "rename must not ALSO emit a stray FileDeleted; got {msgs:?}"
+        );
+
+        let guard = env.state.read().await;
+        assert!(!guard.fs_removed_pending.contains_key("src/Old.luau"));
+    }
+
+    // ─── M17: a real edit to a just-renamed file must not be swallowed ───
+
+    #[tokio::test]
+    async fn real_edit_after_rename_is_not_swallowed_as_echo() {
+        let env = make_env(&[("src/Old.luau", "hello")]).await;
+        let mut rx = env.bcast_tx.subscribe();
+        let root = root_of(&env);
+
+        // Rename Old -> New (pairs into a FileRenamed; pre-M17 this armed the
+        // path-based rename-echo guard for `src/New.luau`).
+        std::fs::remove_file(root.join("src/Old.luau")).expect("rm Old");
+        handle_fs_event(
+            &env.state,
+            FileEvent::Removed(root.join("src/Old.luau")),
+            &env.bcast_tx,
+        )
+        .await
+        .expect("handle removed Old");
+        std::fs::write(root.join("src/New.luau"), "hello").expect("write New");
+        handle_fs_event(
+            &env.state,
+            FileEvent::Touched(root.join("src/New.luau")),
+            &env.bcast_tx,
+        )
+        .await
+        .expect("handle touched New");
+
+        // A genuine user edit to the freshly-renamed file, well inside the old
+        // 500ms echo TTL. Pre-M17 `consume_rename_echo` dropped this silently.
+        std::fs::write(root.join("src/New.luau"), "hello world").expect("edit New");
+        handle_fs_event(
+            &env.state,
+            FileEvent::Touched(root.join("src/New.luau")),
+            &env.bcast_tx,
+        )
+        .await
+        .expect("handle edit New");
+
+        let msgs = drain(&mut rx).await;
+        let changed = msgs.iter().any(|m| {
+            matches!(m, ServerMsg::FileChanged { path, content, .. }
+                if path == "src/New.luau" && content == "hello world")
+        });
+        assert!(
+            changed,
+            "real edit to a just-renamed file must propagate, not be swallowed; got {msgs:?}"
+        );
+
+        let guard = env.state.read().await;
+        assert_eq!(
+            guard.tree_fs.get("src/New.luau").map(|e| e.content.as_str()),
+            Some("hello world")
+        );
+    }
+
+    // ─── A7: renaming a directory on disk re-keys the subtree ────────────
+
+    #[tokio::test]
+    async fn directory_rename_removed_then_touched_emits_per_child_filerenamed() {
+        let env = make_env(&[("src/Foo/Bar.luau", "return 1\n")]).await;
+        let mut rx = env.bcast_tx.subscribe();
+        let root = root_of(&env);
+
+        // Windows emits only a dir-level rename pair (Removed(Foo) +
+        // Touched(Baz)) with no per-child events — deliver them in that order.
+        std::fs::rename(root.join("src/Foo"), root.join("src/Baz")).expect("rename dir");
+        handle_fs_event(
+            &env.state,
+            FileEvent::Removed(root.join("src/Foo")),
+            &env.bcast_tx,
+        )
+        .await
+        .expect("handle removed dir");
+        handle_fs_event(
+            &env.state,
+            FileEvent::Touched(root.join("src/Baz")),
+            &env.bcast_tx,
+        )
+        .await
+        .expect("handle touched dir");
+
+        let msgs = drain(&mut rx).await;
+        let renamed = msgs.iter().any(|m| {
+            matches!(m, ServerMsg::FileRenamed { old_path, new_path, .. }
+                if old_path == "src/Foo/Bar.luau" && new_path == "src/Baz/Bar.luau")
+        });
+        assert!(renamed, "expected FileRenamed for the moved child; got {msgs:?}");
+
+        let guard = env.state.read().await;
+        assert!(
+            !guard.tree_fs.contains_key("src/Foo/Bar.luau"),
+            "old key must not linger in tree_fs"
+        );
+        assert!(guard.tree_fs.contains_key("src/Baz/Bar.luau"));
+        assert!(!guard.tree_studio.contains_key("src/Foo/Bar.luau"));
+        assert!(guard.tree_studio.contains_key("src/Baz/Bar.luau"));
+        assert!(!guard.tree_base.contains_key("src/Foo/Bar.luau"));
+        assert!(guard.tree_base.contains_key("src/Baz/Bar.luau"));
+    }
+
+    #[tokio::test]
+    async fn directory_rename_touched_before_removed_still_pairs() {
+        let env = make_env(&[("src/Foo/Bar.luau", "return 1\n")]).await;
+        let mut rx = env.bcast_tx.subscribe();
+        let root = root_of(&env);
+
+        std::fs::rename(root.join("src/Foo"), root.join("src/Baz")).expect("rename dir");
+        // Reverse order: the To event lands before the From event (HashMap
+        // flush order is non-deterministic, so both orders must work).
+        handle_fs_event(
+            &env.state,
+            FileEvent::Touched(root.join("src/Baz")),
+            &env.bcast_tx,
+        )
+        .await
+        .expect("handle touched dir");
+        handle_fs_event(
+            &env.state,
+            FileEvent::Removed(root.join("src/Foo")),
+            &env.bcast_tx,
+        )
+        .await
+        .expect("handle removed dir");
+
+        let msgs = drain(&mut rx).await;
+        let renames: Vec<_> = msgs
+            .iter()
+            .filter(|m| {
+                matches!(m, ServerMsg::FileRenamed { old_path, new_path, .. }
+                    if old_path == "src/Foo/Bar.luau" && new_path == "src/Baz/Bar.luau")
+            })
+            .collect();
+        assert_eq!(
+            renames.len(),
+            1,
+            "expected exactly one FileRenamed; got {msgs:?}"
+        );
+
+        let guard = env.state.read().await;
+        assert!(!guard.tree_fs.contains_key("src/Foo/Bar.luau"));
+        assert!(guard.tree_fs.contains_key("src/Baz/Bar.luau"));
+    }
+
+    #[tokio::test]
+    async fn directory_rename_rekeys_nested_subtree() {
+        let env = make_env(&[
+            ("src/Foo/init.luau", "return {}\n"),
+            ("src/Foo/Sub/Deep.luau", "return 2\n"),
+        ])
+        .await;
+        let mut rx = env.bcast_tx.subscribe();
+        let root = root_of(&env);
+
+        std::fs::rename(root.join("src/Foo"), root.join("src/Baz")).expect("rename dir");
+        handle_fs_event(
+            &env.state,
+            FileEvent::Removed(root.join("src/Foo")),
+            &env.bcast_tx,
+        )
+        .await
+        .expect("handle removed dir");
+        handle_fs_event(
+            &env.state,
+            FileEvent::Touched(root.join("src/Baz")),
+            &env.bcast_tx,
+        )
+        .await
+        .expect("handle touched dir");
+
+        let msgs = drain(&mut rx).await;
+        let renamed_deep = msgs.iter().any(|m| {
+            matches!(m, ServerMsg::FileRenamed { old_path, new_path, .. }
+                if old_path == "src/Foo/Sub/Deep.luau" && new_path == "src/Baz/Sub/Deep.luau")
+        });
+        let renamed_init = msgs.iter().any(|m| {
+            matches!(m, ServerMsg::FileRenamed { old_path, new_path, .. }
+                if old_path == "src/Foo/init.luau" && new_path == "src/Baz/init.luau")
+        });
+        assert!(renamed_deep, "nested child must be re-keyed; got {msgs:?}");
+        assert!(renamed_init, "init child must be re-keyed; got {msgs:?}");
+
+        let guard = env.state.read().await;
+        assert!(guard.tree_fs.contains_key("src/Baz/Sub/Deep.luau"));
+        assert!(guard.tree_fs.contains_key("src/Baz/init.luau"));
+        assert!(!guard.tree_fs.contains_key("src/Foo/Sub/Deep.luau"));
+        assert!(!guard.tree_fs.contains_key("src/Foo/init.luau"));
+    }
+
+    #[tokio::test]
+    async fn directory_copy_does_not_false_match_as_rename() {
+        // A copy leaves the original dir in place; the daemon must not treat
+        // the new dir as a rename of the still-present one.
+        let env = make_env(&[("src/Foo/Bar.luau", "return 1\n")]).await;
+        let mut rx = env.bcast_tx.subscribe();
+        let root = root_of(&env);
+
+        std::fs::create_dir_all(root.join("src/Baz")).expect("mkdir Baz");
+        std::fs::copy(
+            root.join("src/Foo/Bar.luau"),
+            root.join("src/Baz/Bar.luau"),
+        )
+        .expect("copy file");
+        handle_fs_event(
+            &env.state,
+            FileEvent::Touched(root.join("src/Baz")),
+            &env.bcast_tx,
+        )
+        .await
+        .expect("handle touched dir");
+
+        let msgs = drain(&mut rx).await;
+        let renamed = msgs.iter().any(|m| matches!(m, ServerMsg::FileRenamed { .. }));
+        assert!(
+            !renamed,
+            "a copy (original still present) must not pair as a rename; got {msgs:?}"
+        );
+
+        let guard = env.state.read().await;
+        assert!(
+            guard.tree_fs.contains_key("src/Foo/Bar.luau"),
+            "original entry must stay put"
+        );
+    }
+
+    // ─── M19: a Rescan reconciles changes the backend dropped ────────────
+
+    #[tokio::test]
+    async fn rescan_event_reconciles_a_missed_disk_change() {
+        let env = make_env(&[("src/A.luau", "return 1\n")]).await;
+        let mut rx = env.bcast_tx.subscribe();
+        let root = root_of(&env);
+
+        // Simulate a notification the backend dropped during a storm: change
+        // the file on disk but never deliver its individual Touched event.
+        std::fs::write(root.join("src/A.luau"), "return 2\n").expect("edit A");
+
+        // The backend error surfaces to the daemon as a Rescan.
+        handle_fs_event(&env.state, FileEvent::Rescan, &env.bcast_tx)
+            .await
+            .expect("handle rescan");
+
+        let msgs = drain(&mut rx).await;
+        let changed = msgs.iter().any(|m| {
+            matches!(m, ServerMsg::FileChanged { path, content, .. }
+                if path == "src/A.luau" && content == "return 2\n")
+        });
+        assert!(
+            changed,
+            "rescan must reconcile the change the backend dropped; got {msgs:?}"
+        );
+
+        let guard = env.state.read().await;
+        assert_eq!(
+            guard.tree_fs.get("src/A.luau").map(|e| e.content.as_str()),
+            Some("return 2\n")
+        );
+    }
+}
+
+#[cfg(test)]
+mod pending_conflict_authority_tests {
+    //! Regression tests for AUDITORIA-YEET.md A2 (`race-1`): while a conflict
+    //! is awaiting the user's resolution, `pending_conflicts` must be
+    //! authoritative over the path. A clean / auto-merge reconcile arriving
+    //! from the *other* concurrent task (FS vs Studio) must NOT rewrite
+    //! disk/Studio or advance `tree_base` out from under the open snapshot —
+    //! the later `ConflictResolved` would rebuild from the stale
+    //! `base_content` and silently revert the intermediate change (or, in the
+    //! AutoMerge case, discard the merged code). Instead the path is frozen on
+    //! disk and the snapshot is refreshed to the current trees.
+    //!
+    //! Mirrors the `fs_removed_pending_tests` harness: tempdir-backed project,
+    //! already-synced `tree_studio == tree_fs`, drive the real handlers, then
+    //! inspect trees / disk / broadcasts.
+
+    use super::{
+        handle_conflict_resolved, handle_fs_event, handle_studio_changed, reconcile_path,
+    };
+    use std::collections::HashMap;
+    use std::sync::Arc;
+    use std::time::Duration;
+    use tokio::sync::{broadcast, RwLock};
+    use yeet_daemon::project::Project;
+    use yeet_daemon::protocol::{FileResolution, ScriptKind, ServerMsg};
+    use yeet_daemon::state::{sha256_hex, ProjectState, SharedState};
+    use yeet_daemon::tree::TreeEntry;
+    use yeet_daemon::watcher::FileEvent;
+
+    struct Env {
+        state: SharedState,
+        bcast_tx: broadcast::Sender<Arc<ServerMsg>>,
+        _root: tempfile::TempDir,
+    }
+
+    async fn make_env(disk_files: &[(&str, &str)]) -> Env {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let root = dir.path();
+        let project_json = r#"{
+            "name": "PendingConflictTest",
+            "tree": {
+                "$className": "DataModel",
+                "ServerScriptService": {
+                    "$className": "ServerScriptService",
+                    "$path": "src"
+                }
+            }
+        }"#;
+        std::fs::write(root.join("default.project.json"), project_json).expect("write project");
+        std::fs::create_dir(root.join("src")).expect("mkdir src");
+        for (rel, content) in disk_files {
+            let abs = root.join(rel);
+            if let Some(p) = abs.parent() {
+                std::fs::create_dir_all(p).expect("mkdir -p");
+            }
+            std::fs::write(&abs, content).expect("write file");
+        }
+        let project = Project::load(&root.join("default.project.json")).expect("load project");
+        let state_inner =
+            ProjectState::bootstrap(root, project, false, false).expect("bootstrap");
+        let state: SharedState = Arc::new(RwLock::new(state_inner));
+        {
+            // Model an already-synced project: Studio agrees with disk/base.
+            let mut guard = state.write().await;
+            guard.tree_studio = guard.tree_fs.clone();
+        }
+        let (bcast_tx, _) = broadcast::channel(64);
+        Env {
+            state,
+            bcast_tx,
+            _root: dir,
+        }
+    }
+
+    fn root_of(env: &Env) -> std::path::PathBuf {
+        env._root.path().to_path_buf()
+    }
+
+    fn entry(content: &str) -> TreeEntry {
+        TreeEntry {
+            kind: ScriptKind::ModuleScript,
+            content: content.to_owned(),
+            sha256: sha256_hex(content.as_bytes()),
+        }
+    }
+
+    async fn drain(rx: &mut broadcast::Receiver<Arc<ServerMsg>>) -> Vec<ServerMsg> {
+        let mut out = Vec::new();
+        loop {
+            match tokio::time::timeout(Duration::from_millis(20), rx.recv()).await {
+                Ok(Ok(m)) => out.push((*m).clone()),
+                _ => break,
+            }
+        }
+        out
+    }
+
+    /// Drives base/studio/fs entries directly (bypassing the merge engine)
+    /// AND writes `fs` to disk, so a subsequent single `reconcile_path`
+    /// observes the exact 3-way divergence — the deterministic stand-in for
+    /// "edited Studio and disk nearly at once" from the audit repro.
+    async fn set_trees(env: &Env, path: &str, base: &str, studio: &str, fs: &str) {
+        std::fs::write(root_of(env).join(path), fs).expect("write fs to disk");
+        let mut g = env.state.write().await;
+        g.tree_base.insert(path.to_owned(), entry(base));
+        g.tree_studio.insert(path.to_owned(), entry(studio));
+        g.tree_fs.insert(path.to_owned(), entry(fs));
+    }
+
+    /// Forms a real overlapping-edit conflict at `path` and returns once it is
+    /// recorded in `pending_conflicts`. Drains the `ConflictDetected` frame.
+    async fn form_conflict(
+        env: &Env,
+        path: &str,
+        base: &str,
+        studio: &str,
+        fs: &str,
+    ) {
+        set_trees(env, path, base, studio, fs).await;
+        let mut rx = env.bcast_tx.subscribe();
+        reconcile_path(&env.state, path, &env.bcast_tx)
+            .await
+            .expect("reconcile forms conflict");
+        let _ = drain(&mut rx).await;
+        let g = env.state.read().await;
+        assert!(
+            g.pending_conflicts.contains_key(path),
+            "precondition: a conflict must be pending after form_conflict"
+        );
+    }
+
+    async fn resolve_taking_snapshot(env: &Env, path: &str) {
+        // Empty hunk map: `rebuild_resolved` falls back to the snapshot's
+        // `base_content`, i.e. whatever the authoritative snapshot currently
+        // resolves to. This is exactly the "user clicks resolve" moment.
+        handle_conflict_resolved(
+            &env.state,
+            vec![FileResolution {
+                path: path.to_owned(),
+                hunks: HashMap::new(),
+            }],
+            &env.bcast_tx,
+        )
+        .await
+        .expect("resolve");
+    }
+
+    // ─── A2 case 1: a clean revert during an open conflict must not silently
+    //     overwrite disk / advance base; resolution reflects current trees ──
+
+    #[tokio::test]
+    async fn clean_revert_during_conflict_freezes_disk_and_does_not_advance_base() {
+        let path = "src/Foo.luau";
+        let base = "line1\nBASE\nline3\n";
+        let studio = "line1\nSTUDIO\nline3\n";
+        let fs = "line1\nFS\nline3\n";
+        let env = make_env(&[(path, base)]).await;
+
+        form_conflict(&env, path, base, studio, fs).await;
+
+        // The user reverts the disk back to base while the conflict is open.
+        // Under the bug, `reconcile_path` runs `Apply { side: Fs }` (Studio's
+        // edit wins because disk == base again), overwriting disk with STUDIO
+        // and advancing tree_base — all while the stale snapshot lingers.
+        std::fs::write(root_of(&env).join(path), base).expect("revert disk to base");
+        let mut rx = env.bcast_tx.subscribe();
+        handle_fs_event(
+            &env.state,
+            FileEvent::Touched(root_of(&env).join(path)),
+            &env.bcast_tx,
+        )
+        .await
+        .expect("handle revert");
+        let _ = drain(&mut rx).await;
+
+        // A2 fix: disk stays at the reverted content, tree_base is NOT
+        // advanced, and the conflict is still authoritative over the path.
+        {
+            let g = env.state.read().await;
+            assert!(
+                g.pending_conflicts.contains_key(path),
+                "conflict must remain pending after a clean revert reconcile"
+            );
+            assert_eq!(
+                g.tree_base.get(path).map(|e| e.content.as_str()),
+                Some(base),
+                "tree_base must NOT be advanced by a reconcile while a conflict is open"
+            );
+        }
+        assert_eq!(
+            std::fs::read_to_string(root_of(&env).join(path)).expect("read disk"),
+            base,
+            "disk must stay at the user's reverted content, not be overwritten by Studio's edit"
+        );
+
+        // Resolving now reflects the CURRENT trees (Studio's live edit applied
+        // to a base == disk), NOT the stale base and NOT the vanished FS side.
+        resolve_taking_snapshot(&env, path).await;
+        assert_eq!(
+            std::fs::read_to_string(root_of(&env).join(path)).expect("read resolved"),
+            studio,
+            "resolution must reflect the current state (Studio's edit), not the stale base or discarded FS content"
+        );
+        let g = env.state.read().await;
+        assert!(
+            !g.pending_conflicts.contains_key(path),
+            "conflict must clear after resolution"
+        );
+    }
+
+    // ─── A2 case 2 (the data-loss core): an AutoMerge that lands during an
+    //     open conflict must NOT be discarded by the stale resolution ───────
+
+    #[tokio::test]
+    async fn automerge_during_conflict_is_not_discarded_by_stale_resolution() {
+        let path = "src/Mod.luau";
+        let base = "a\nb\nc\nd\ne\n";
+        let studio1 = "a\nS1\nc\nd\ne\n"; // line 2 — overlaps fs1
+        let fs1 = "a\nF1\nc\nd\ne\n"; // line 2 — overlaps studio1 → conflict
+        let env = make_env(&[(path, base)]).await;
+
+        form_conflict(&env, path, base, studio1, fs1).await;
+
+        // A new Studio edit arrives that is DISJOINT from the FS side (line 5,
+        // not line 2). The 3-way merge now resolves to a clean AutoMerge that
+        // keeps BOTH sides' changes.
+        let studio2 = "a\nb\nc\nd\nS2\n";
+        let merged = "a\nF1\nc\nd\nS2\n"; // F1 (line 2) + S2 (line 5)
+        let mut rx = env.bcast_tx.subscribe();
+        handle_studio_changed(
+            &env.state,
+            path.to_owned(),
+            studio2.to_owned(),
+            sha256_hex(studio2.as_bytes()),
+            None,
+            false,
+            &env.bcast_tx,
+        )
+        .await
+        .expect("studio edit");
+        let _ = drain(&mut rx).await;
+
+        // The AutoMerge must NOT have been written straight to disk + base
+        // (which is what strands the snapshot under the bug). Disk stays at
+        // the FS side; the merged content lives only in the refreshed snapshot
+        // until the user resolves.
+        {
+            let g = env.state.read().await;
+            assert!(
+                g.pending_conflicts.contains_key(path),
+                "conflict must remain pending; the AutoMerge is captured in the snapshot"
+            );
+            assert_eq!(
+                g.tree_base.get(path).map(|e| e.content.as_str()),
+                Some(base),
+                "tree_base must NOT be advanced to the auto-merged content while a conflict is open"
+            );
+        }
+        assert_eq!(
+            std::fs::read_to_string(root_of(&env).join(path)).expect("read disk"),
+            fs1,
+            "disk must stay frozen at the FS side until resolution"
+        );
+
+        // The user resolves. Under the bug the stale {base, studio1, fs1}
+        // snapshot rebuilds to studio1, discarding BOTH the merged FS change
+        // and the later Studio edit. With the fix, resolution yields the
+        // merged content.
+        resolve_taking_snapshot(&env, path).await;
+        assert_eq!(
+            std::fs::read_to_string(root_of(&env).join(path)).expect("read resolved"),
+            merged,
+            "the auto-merged content must survive the resolution, not be discarded for a stale side"
+        );
+    }
+
+    // ─── Guard preserved: an identical re-detection must not clobber the
+    //     in-progress resolution nor re-broadcast (commit 7ca88f4) ──────────
+
+    #[tokio::test]
+    async fn identical_reconflict_does_not_clobber_or_respam() {
+        let path = "src/Bar.luau";
+        let base = "a\nb\nc\nd\ne\n";
+        let studio = "a\nS\nc\nd\ne\n";
+        let fs = "a\nF\nc\nd\ne\n";
+        let env = make_env(&[(path, base)]).await;
+
+        form_conflict(&env, path, base, studio, fs).await;
+        let hunks_before = {
+            let g = env.state.read().await;
+            g.pending_conflicts.get(path).unwrap().conflict_hunks.len()
+        };
+
+        // Re-run reconcile with the trees unchanged (e.g. a bulk reconcile
+        // sweep touching an already-conflicted path). The snapshot must be
+        // left intact and nothing re-broadcast.
+        let mut rx = env.bcast_tx.subscribe();
+        reconcile_path(&env.state, path, &env.bcast_tx)
+            .await
+            .expect("re-reconcile");
+        let msgs = drain(&mut rx).await;
+        assert!(
+            !msgs
+                .iter()
+                .any(|m| matches!(m, ServerMsg::ConflictDetected { .. })),
+            "identical re-detection must not re-broadcast ConflictDetected; got {msgs:?}"
+        );
+
+        let g = env.state.read().await;
+        assert!(g.pending_conflicts.contains_key(path));
+        assert_eq!(
+            g.pending_conflicts.get(path).unwrap().conflict_hunks.len(),
+            hunks_before,
+            "the in-progress snapshot's hunks must be preserved verbatim"
+        );
+        assert_eq!(
+            g.tree_base.get(path).map(|e| e.content.as_str()),
+            Some(base),
+            "an identical re-reconcile must not advance tree_base"
+        );
+    }
+}
+
+#[cfg(test)]
+mod security_tests {
+    //! Regression tests for AUDITORIA-YEET.md security findings A16 (auth gate
+    //! leaked the token / never rejected), A17 (syncback arbitrary file write),
+    //! M24 (Origin/Host prefix-match DNS-rebinding bypass) and B13 (silent
+    //! non-loopback `--bind`). The policy for each finding is factored into a
+    //! pure function so it can be exercised without a live socket, mirroring
+    //! how the rest of the daemon tests its decision cores.
+
+    // ─── A16: auth gate ──────────────────────────────────────────────────
+    use super::{decide_auth, AuthOutcome};
+
+    const TOKEN: &str = "0011223344556677889900aabbccddee";
+
+    #[test]
+    fn matching_token_proceeds() {
+        assert_eq!(
+            decide_auth(Some(TOKEN), "plugin", TOKEN, false),
+            AuthOutcome::Proceed
+        );
+        assert_eq!(
+            decide_auth(Some(TOKEN), "extension", TOKEN, false),
+            AuthOutcome::Proceed
+        );
+    }
+
+    #[test]
+    fn wrong_token_is_rejected_and_never_grants() {
+        // The A16 leak: a mismatched token used to be answered with
+        // AuthGranted { server token }. It must now close the connection and
+        // MUST NOT reach the GrantAndPair (token-sending) arm — even when a
+        // breadcrumb happens to be fresh.
+        assert_eq!(
+            decide_auth(Some("deadbeef"), "plugin", TOKEN, false),
+            AuthOutcome::Reject("auth token mismatch")
+        );
+        assert_eq!(
+            decide_auth(Some("deadbeef"), "plugin", TOKEN, true),
+            AuthOutcome::Reject("auth token mismatch")
+        );
+        assert_eq!(
+            decide_auth(Some("deadbeef"), "extension", TOKEN, false),
+            AuthOutcome::Reject("auth token mismatch")
+        );
+    }
+
+    #[test]
+    fn extension_without_token_is_rejected() {
+        // Extension/CLI clients can read `.yeet/auth-token`, so they must
+        // present it up-front. No token → refused, breadcrumb or not.
+        assert_eq!(
+            decide_auth(None, "extension", TOKEN, false),
+            AuthOutcome::Reject("missing auth token (required for this role)")
+        );
+        assert_eq!(
+            decide_auth(None, "extension", TOKEN, true),
+            AuthOutcome::Reject("missing auth token (required for this role)")
+        );
+        // Empty string counts as "no token".
+        assert_eq!(
+            decide_auth(Some(""), "extension", TOKEN, false),
+            AuthOutcome::Reject("missing auth token (required for this role)")
+        );
+    }
+
+    #[test]
+    fn plugin_without_token_pairs_via_fresh_breadcrumb() {
+        assert_eq!(
+            decide_auth(None, "plugin", TOKEN, true),
+            AuthOutcome::GrantAndPair
+        );
+        // Empty string is treated as no token.
+        assert_eq!(
+            decide_auth(Some(""), "plugin", TOKEN, true),
+            AuthOutcome::GrantAndPair
+        );
+    }
+
+    #[test]
+    fn plugin_without_token_or_breadcrumb_still_proceeds() {
+        // First-run Studio before the extension is up (no breadcrumb yet)
+        // must still connect — the legitimate flow the audit says to keep.
+        assert_eq!(
+            decide_auth(None, "plugin", TOKEN, false),
+            AuthOutcome::Proceed
+        );
+    }
+
+    // ─── A17: syncback target confinement ────────────────────────────────
+    use super::{syncback_overwrite_ok, validate_syncback_target};
+    use yeet_daemon::protocol::SyncbackMode;
+
+    #[test]
+    fn syncback_accepts_new_folder_under_home() {
+        let home = tempfile::tempdir().expect("home");
+        // Brand-new leaf directly under home (the reverse-bootstrap case).
+        let target = home.path().join("MyNewGame");
+        assert!(validate_syncback_target(&target, home.path()).is_ok());
+        // Nested new folder whose nearest existing ancestor is still home.
+        std::fs::create_dir(home.path().join("Projects")).expect("mkdir");
+        let nested = home.path().join("Projects").join("Deep").join("Game");
+        assert!(validate_syncback_target(&nested, home.path()).is_ok());
+    }
+
+    #[test]
+    fn syncback_rejects_target_outside_home() {
+        let home = tempfile::tempdir().expect("home");
+        let elsewhere = tempfile::tempdir().expect("elsewhere");
+        let target = elsewhere.path().join("victim");
+        let err = validate_syncback_target(&target, home.path())
+            .expect_err("target outside home must be rejected");
+        assert!(err.contains("outside the home directory"), "got: {err}");
+    }
+
+    #[test]
+    fn syncback_rejects_parent_dir_traversal() {
+        let home = tempfile::tempdir().expect("home");
+        // Absolute path that escapes home via `..` — canonicalize can't
+        // resolve it past the non-existent leaf, so it's refused outright.
+        let target = home.path().join("..").join("escaped");
+        let err = validate_syncback_target(&target, home.path())
+            .expect_err("`..` traversal must be rejected");
+        assert!(err.contains("must not contain '..'"), "got: {err}");
+    }
+
+    #[test]
+    fn syncback_rejects_relative_target() {
+        let home = tempfile::tempdir().expect("home");
+        let target = std::path::Path::new("relative/evil");
+        let err = validate_syncback_target(target, home.path())
+            .expect_err("relative target must be rejected");
+        assert!(err.contains("must be absolute"), "got: {err}");
+    }
+
+    #[test]
+    fn syncback_overwrite_blocks_nonempty_dir_without_intent() {
+        let dir = tempfile::tempdir().expect("dir");
+        std::fs::write(dir.path().join("keep.luau"), "return {}").expect("seed");
+        // No explicit overwrite intent → refused.
+        assert!(syncback_overwrite_ok(dir.path(), SyncbackMode::NewProject).is_err());
+        assert!(
+            syncback_overwrite_ok(dir.path(), SyncbackMode::MergeExisting { overwrite: false })
+                .is_err()
+        );
+        // Explicit intent → allowed.
+        assert!(
+            syncback_overwrite_ok(dir.path(), SyncbackMode::MergeExisting { overwrite: true })
+                .is_ok()
+        );
+    }
+
+    #[test]
+    fn syncback_overwrite_allows_empty_or_missing_dir() {
+        let empty = tempfile::tempdir().expect("empty");
+        assert!(syncback_overwrite_ok(empty.path(), SyncbackMode::NewProject).is_ok());
+        let missing = empty.path().join("does-not-exist-yet");
+        assert!(syncback_overwrite_ok(&missing, SyncbackMode::NewProject).is_ok());
+    }
+
+    // ─── M24: Origin / Host exact-loopback matching (DNS rebinding) ───────
+    use super::{host_header_is_loopback, is_loopback_bind_addr, origin_is_allowed};
+
+    #[test]
+    fn origin_absent_or_non_browser_is_allowed() {
+        // The Studio plugin sends no browser Origin; these must all pass.
+        assert!(origin_is_allowed(""));
+        assert!(origin_is_allowed("null"));
+        assert!(origin_is_allowed("NULL"));
+        // Non-http(s) scheme (file://, app scheme) is not a routable browser
+        // page — passes.
+        assert!(origin_is_allowed("file://"));
+        assert!(origin_is_allowed("roblox-studio://plugin"));
+    }
+
+    #[test]
+    fn origin_exact_loopback_hosts_pass() {
+        for ok in [
+            "http://localhost",
+            "http://localhost:34872",
+            "https://localhost",
+            "http://127.0.0.1",
+            "http://127.0.0.1:34872",
+            "http://[::1]",
+            "http://[::1]:34872",
+            "http://user:pass@localhost:34872",
+        ] {
+            assert!(origin_is_allowed(ok), "should accept {ok}");
+        }
+    }
+
+    #[test]
+    fn origin_rebinding_lookalikes_are_rejected() {
+        // The M24 bug: `starts_with("localhost")` / `"127."` accepted these.
+        for bad in [
+            "http://localhost.evil.com",
+            "http://localhost.evil.com:34872",
+            "http://127.0.0.1.evil.com",
+            "http://localhostx",
+            "http://evil.com",
+            "https://evil.com:34872",
+            "http://0.0.0.0",
+            "http://169.254.0.1",
+        ] {
+            assert!(!origin_is_allowed(bad), "should reject {bad}");
+        }
+    }
+
+    #[test]
+    fn host_header_loopback_matching() {
+        assert!(host_header_is_loopback(None));
+        assert!(host_header_is_loopback(Some("")));
+        assert!(host_header_is_loopback(Some("127.0.0.1:34872")));
+        assert!(host_header_is_loopback(Some("localhost:34872")));
+        assert!(host_header_is_loopback(Some("[::1]:34872")));
+        assert!(!host_header_is_loopback(Some("localhost.evil.com:34872")));
+        assert!(!host_header_is_loopback(Some("evil.com")));
+        assert!(!host_header_is_loopback(Some("192.168.1.5:34872")));
+    }
+
+    #[test]
+    fn loopback_bind_addr_matching() {
+        assert!(is_loopback_bind_addr("127.0.0.1:34872"));
+        assert!(is_loopback_bind_addr("127.0.0.1:0"));
+        assert!(is_loopback_bind_addr("localhost:34872"));
+        assert!(is_loopback_bind_addr("[::1]:0"));
+        assert!(!is_loopback_bind_addr("0.0.0.0:34872"));
+        assert!(!is_loopback_bind_addr("192.168.1.5:34872"));
+    }
+
+    // ─── B13: --bind requires --allow-remote for non-loopback ────────────
+    use super::validate_bind_addr;
+
+    #[test]
+    fn bind_default_and_loopback_pass_without_flag() {
+        // No override → default 127.0.0.1 behaviour, unchanged.
+        assert!(validate_bind_addr(None, false).is_ok());
+        assert!(validate_bind_addr(Some("127.0.0.1:34872"), false).is_ok());
+        assert!(validate_bind_addr(Some("127.0.0.1:0"), false).is_ok());
+        assert!(validate_bind_addr(Some("[::1]:0"), false).is_ok());
+    }
+
+    #[test]
+    fn bind_non_loopback_refused_without_allow_remote() {
+        assert!(validate_bind_addr(Some("0.0.0.0:34872"), false).is_err());
+        assert!(validate_bind_addr(Some("192.168.1.5:34872"), false).is_err());
+    }
+
+    #[test]
+    fn bind_non_loopback_allowed_with_flag() {
+        assert!(validate_bind_addr(Some("0.0.0.0:34872"), true).is_ok());
+        assert!(validate_bind_addr(Some("192.168.1.5:34872"), true).is_ok());
     }
 }

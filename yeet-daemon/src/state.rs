@@ -1,7 +1,7 @@
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::time::Instant;
 
 use anyhow::{Context, Result};
 use sha2::{Digest, Sha256};
@@ -19,12 +19,6 @@ const SESSION_FILE: &str = ".yeet/session.json";
 /// full handshake instead of trying to resume from a buffer that's missing
 /// frames. 1000 events is enough for ~hours of typical edits.
 const MAX_PENDING_DELTAS: usize = 1000;
-
-/// How long the daemon remembers that it just did a `fs::rename`, so the
-/// matching `notify::Remove(old) + Create(new)` pair from the filesystem
-/// watcher can be suppressed and not echoed back to the plugin. Sized to
-/// cover the watcher's 100 ms debounce window plus channel slack.
-const RENAME_ECHO_TTL: Duration = Duration::from_millis(500);
 
 /// A `tree_fs` entry that just disappeared from the watcher's point of
 /// view but might be the source half of a rename. Held briefly so a
@@ -153,22 +147,23 @@ pub struct ProjectState {
     /// also reachable from the on-disk file with the same lifetime —
     /// process-memory zeroization gives no extra protection here.
     pub auth_token: String,
-    /// Suppresses the watcher echo from a daemon-initiated `fs::rename`.
-    /// Populated immediately before the rename, consumed by `handle_fs_event`
-    /// when the `Remove(old) + Touched(new)` pair surfaces. Entries older than
-    /// `RENAME_ECHO_TTL` are dropped opportunistically — no background sweep.
-    pub recently_renamed: HashMap<(String, String), Instant>,
     /// Paths currently flagged as colliding (two Studio instances resolving
     /// to the same project-relative path). Sync for these paths is paused
     /// until the plugin notifies a rename that clears the collision. Used
     /// by the studio-side mutation handlers to reject incoming `FileChanged`
     /// / `FileRenamed` with `SyncErrorKind::NameCollisionPending`.
     pub pending_collisions: HashSet<String>,
-    /// Recently observed filesystem removes, indexed by `sha256` of the
-    /// content that disappeared. When a `Touched` event later carries the
-    /// same hash, the pair is promoted to a `FileRenamed` instead of a
-    /// destructive Delete+Create — preserves Studio-side state
-    /// (attributes, tags, non-script children) across IDE-side renames.
+    /// Recently observed filesystem removes, indexed by **path** (not by
+    /// `sha256` of the content — see AUDITORIA-YEET.md finding A1). Keying
+    /// by content hash let two same-content deletes clobber each other's
+    /// entry (losing one deletion) and let unrelated delete+create pairs
+    /// of identical content pair up as a false rename. Each removal now
+    /// owns its own slot and reconciles independently by its own path.
+    /// When a `Touched` event later carries a matching `entry.sha256`
+    /// (subject to the watcher-4 / move-2 guards in `handle_fs_event`),
+    /// the pair is promoted to a `FileRenamed` instead of a destructive
+    /// Delete+Create — preserves Studio-side state (attributes, tags,
+    /// non-script children) across IDE-side renames.
     pub fs_removed_pending: HashMap<String, FsRemovedPending>,
 }
 
@@ -241,7 +236,6 @@ impl ProjectState {
             pending_bulk_sync: HashMap::new(),
             mapping_roots_canonical,
             auth_token,
-            recently_renamed: HashMap::new(),
             pending_collisions: HashSet::new(),
             fs_removed_pending: HashMap::new(),
         };
@@ -324,8 +318,10 @@ impl ProjectState {
     }
 
     /// Walks every `$path`-mapped directory and seeds `tree_fs` + `meta`.
-    /// `tree_base` and `tree_studio` are left untouched.
-    fn rescan_fs(&mut self) -> Result<()> {
+    /// `tree_base` and `tree_studio` are left untouched. Public so the FS
+    /// event pipeline can re-run a full scan after a watcher backend
+    /// error/overflow dropped notifications (AUDITORIA-YEET.md M19).
+    pub fn rescan_fs(&mut self) -> Result<()> {
         self.tree_fs.clear();
         self.meta.clear();
         self.meta_attributes.clear();
@@ -502,40 +498,6 @@ impl ProjectState {
                 .to_ascii_lowercase();
             rel_lower == dir_lower || rel_lower.starts_with(&format!("{dir_lower}/"))
         })
-    }
-
-    /// Records that the daemon is about to perform a `fs::rename` from
-    /// `old_path` to `new_path`. The watcher will emit `Remove(old) +
-    /// Touched(new)` shortly after; `consume_rename_echo` swallows that
-    /// pair so the daemon does not re-broadcast its own work.
-    pub fn note_rename_echo(&mut self, old_path: String, new_path: String) {
-        self.prune_rename_echoes();
-        self.recently_renamed
-            .insert((old_path, new_path), Instant::now());
-    }
-
-    /// Checks whether a watcher event for `path` (either side of a recent
-    /// rename) should be suppressed. Removes the matching entry so the
-    /// echo is one-shot. Stale entries are pruned opportunistically.
-    pub fn consume_rename_echo(&mut self, path: &str) -> bool {
-        self.prune_rename_echoes();
-        let hit = self
-            .recently_renamed
-            .keys()
-            .find(|(old, new)| old == path || new == path)
-            .cloned();
-        if let Some(key) = hit {
-            self.recently_renamed.remove(&key);
-            true
-        } else {
-            false
-        }
-    }
-
-    fn prune_rename_echoes(&mut self) {
-        let now = Instant::now();
-        self.recently_renamed
-            .retain(|_, ts| now.duration_since(*ts) < RENAME_ECHO_TTL);
     }
 
     /// Convenience accessor: meta for `path`, or a sensible default if the

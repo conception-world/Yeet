@@ -1,0 +1,4 @@
+std = "roblox"
+
+# Yeet plugin is bundled/loaded by Studio; the Roblox std library covers the
+# Instance/DataModel/task API surface used throughout src/.
