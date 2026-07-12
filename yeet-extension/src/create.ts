@@ -253,7 +253,12 @@ function writeGitignore(folder: string, output: vscode.OutputChannel): void {
 	const lines = [".yeet/", "build/", "*.rbxm", "*.rbxl", "*.rbxlx"];
 	if (fs.existsSync(file)) {
 		const existing = fs.readFileSync(file, "utf8");
-		const missing = lines.filter((l) => !existing.includes(l));
+		// Exact line match, not substring — `existing.includes(l)` would
+		// treat a negated pattern like `!build/` as covering `build/`
+		// (it contains the substring), silently skipping the entry we
+		// actually need.
+		const existingLines = new Set(existing.split(/\r?\n/).map((s) => s.trim()));
+		const missing = lines.filter((l) => !existingLines.has(l));
 		if (missing.length === 0) {
 			return;
 		}
