@@ -835,15 +835,30 @@ async fn reconcile_path(
     path: &str,
     bcast_tx: &broadcast::Sender<Arc<ServerMsg>>,
 ) -> Result<()> {
-    let outcome = {
+    let (outcome, has_pending) = {
         let guard = state.read().await;
-        merge_file(
+        let outcome = merge_file(
             path,
             guard.tree_base.get(path),
             guard.tree_studio.get(path),
             guard.tree_fs.get(path),
-        )
+        );
+        (outcome, guard.pending_conflicts.contains_key(path))
     };
+    // A2/race-1: while a conflict for `path` is awaiting the user's
+    // resolution, `pending_conflicts` is authoritative over the path. FS and
+    // Studio run as concurrent tokio tasks, so a clean / auto-merge / adopt
+    // outcome can arrive from the *other* side while the snapshot is open.
+    // Letting `apply_outcome` run it would rewrite disk/Studio and advance
+    // `tree_base` out from under the snapshot — the eventual `ConflictResolved`
+    // rebuilds from the snapshot's now-stale `base_content` and silently
+    // reverts that change (and, for AutoMerge, discards the merged code).
+    // Freeze the path on disk and re-sync the snapshot to the current trees
+    // instead; the explicit resolution paths (handshake, bulk resolutions)
+    // call `apply_outcome` directly and are unaffected.
+    if has_pending {
+        return refresh_pending_conflict(state, path, outcome, bcast_tx).await;
+    }
     apply_outcome(state, path, outcome, bcast_tx).await
 }
 
@@ -1653,6 +1668,91 @@ async fn record_conflict(
     let view = conflict_to_view(&conflict);
     guard.pending_conflicts.insert(conflict.path.clone(), conflict);
     drop(guard);
+    broadcast_server_msg(
+        state,
+        bcast_tx,
+        ServerMsg::ConflictDetected {
+            conflicts: vec![view],
+        },
+    )
+    .await;
+    Ok(())
+}
+
+/// Called from `reconcile_path` when a background reconcile fires for a path
+/// that already has an open conflict (AUDITORIA-YEET.md A2/race-1). Rather
+/// than let the freshly-recomputed outcome mutate disk/Studio/`tree_base`, it
+/// keeps the path frozen on disk and re-syncs the pending snapshot to the
+/// current trees. The eventual `ConflictResolved` then rebuilds from a
+/// snapshot that matches the live state instead of the stale base captured at
+/// first detection.
+async fn refresh_pending_conflict(
+    state: &SharedState,
+    path: &str,
+    outcome: MergeOutcome,
+    bcast_tx: &broadcast::Sender<Arc<ServerMsg>>,
+) -> Result<()> {
+    // Build the refreshed snapshot from `outcome` (already merged against the
+    // current trees) plus each side's current content for display. A genuine
+    // `Conflict` is adopted verbatim; a clean / auto-merge outcome is captured
+    // as a hunk-less conflict whose `base_content` already equals the resolved
+    // content, so `rebuild_resolved` reproduces it exactly on resolution.
+    let fresh: Option<FileConflict> = {
+        let guard = state.read().await;
+        let studio_content = guard.tree_studio.get(path).map(|e| e.content.clone());
+        let fs_content = guard.tree_fs.get(path).map(|e| e.content.clone());
+        let resolvable = |content: String, kind: ScriptKind| FileConflict {
+            path: path.to_owned(),
+            conflict_kind: ConflictKind::Edit,
+            script_kind: kind,
+            base_content: Some(content),
+            studio_content: studio_content.clone(),
+            fs_content: fs_content.clone(),
+            conflict_hunks: Vec::new(),
+            auto_hunks: Vec::new(),
+        };
+        match outcome {
+            MergeOutcome::Conflict(c) => Some(c),
+            MergeOutcome::AutoMerge { content, kind } => Some(resolvable(content, kind)),
+            MergeOutcome::Apply {
+                content: Some(c),
+                kind,
+                ..
+            } => Some(resolvable(c, kind)),
+            MergeOutcome::AdoptBase => guard
+                .tree_fs
+                .get(path)
+                .or_else(|| guard.tree_studio.get(path))
+                .map(|e| resolvable(e.content.clone(), e.kind)),
+            // A delete-side clean outcome or a genuine no-op: leave the
+            // existing snapshot frozen. Nothing is lost — the open snapshot
+            // still carries both sides' content and disk stays untouched until
+            // the user resolves.
+            MergeOutcome::Apply { content: None, .. } | MergeOutcome::Noop => None,
+        }
+    };
+    let Some(fresh) = fresh else {
+        debug!(path = %path, "reconcile frozen: conflict pending, snapshot left as-is");
+        return Ok(());
+    };
+    // Preserve the conflict-vs-conflict guard (commit 7ca88f4): if the live
+    // divergence is byte-for-byte what the user is already resolving, don't
+    // clobber their in-progress hunk selection with an identical
+    // re-detection, and don't re-broadcast. Only replace when the trees moved.
+    let view = conflict_to_view(&fresh);
+    {
+        let mut guard = state.write().await;
+        if let Some(existing) = guard.pending_conflicts.get(path) {
+            if existing.base_content == fresh.base_content
+                && existing.studio_content == fresh.studio_content
+                && existing.fs_content == fresh.fs_content
+            {
+                debug!(path = %path, "reconcile frozen: pending conflict already matches current trees");
+                return Ok(());
+            }
+        }
+        guard.pending_conflicts.insert(path.to_owned(), fresh);
+    }
     broadcast_server_msg(
         state,
         bcast_tx,
@@ -6437,6 +6537,329 @@ mod fs_removed_pending_tests {
 
         let guard = env.state.read().await;
         assert!(!guard.fs_removed_pending.contains_key("src/Old.luau"));
+    }
+}
+
+#[cfg(test)]
+mod pending_conflict_authority_tests {
+    //! Regression tests for AUDITORIA-YEET.md A2 (`race-1`): while a conflict
+    //! is awaiting the user's resolution, `pending_conflicts` must be
+    //! authoritative over the path. A clean / auto-merge reconcile arriving
+    //! from the *other* concurrent task (FS vs Studio) must NOT rewrite
+    //! disk/Studio or advance `tree_base` out from under the open snapshot —
+    //! the later `ConflictResolved` would rebuild from the stale
+    //! `base_content` and silently revert the intermediate change (or, in the
+    //! AutoMerge case, discard the merged code). Instead the path is frozen on
+    //! disk and the snapshot is refreshed to the current trees.
+    //!
+    //! Mirrors the `fs_removed_pending_tests` harness: tempdir-backed project,
+    //! already-synced `tree_studio == tree_fs`, drive the real handlers, then
+    //! inspect trees / disk / broadcasts.
+
+    use super::{
+        handle_conflict_resolved, handle_fs_event, handle_studio_changed, reconcile_path,
+    };
+    use std::collections::HashMap;
+    use std::sync::Arc;
+    use std::time::Duration;
+    use tokio::sync::{broadcast, RwLock};
+    use yeet_daemon::project::Project;
+    use yeet_daemon::protocol::{FileResolution, ScriptKind, ServerMsg};
+    use yeet_daemon::state::{sha256_hex, ProjectState, SharedState};
+    use yeet_daemon::tree::TreeEntry;
+    use yeet_daemon::watcher::FileEvent;
+
+    struct Env {
+        state: SharedState,
+        bcast_tx: broadcast::Sender<Arc<ServerMsg>>,
+        _root: tempfile::TempDir,
+    }
+
+    async fn make_env(disk_files: &[(&str, &str)]) -> Env {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let root = dir.path();
+        let project_json = r#"{
+            "name": "PendingConflictTest",
+            "tree": {
+                "$className": "DataModel",
+                "ServerScriptService": {
+                    "$className": "ServerScriptService",
+                    "$path": "src"
+                }
+            }
+        }"#;
+        std::fs::write(root.join("default.project.json"), project_json).expect("write project");
+        std::fs::create_dir(root.join("src")).expect("mkdir src");
+        for (rel, content) in disk_files {
+            let abs = root.join(rel);
+            if let Some(p) = abs.parent() {
+                std::fs::create_dir_all(p).expect("mkdir -p");
+            }
+            std::fs::write(&abs, content).expect("write file");
+        }
+        let project = Project::load(&root.join("default.project.json")).expect("load project");
+        let state_inner =
+            ProjectState::bootstrap(root, project, false, false).expect("bootstrap");
+        let state: SharedState = Arc::new(RwLock::new(state_inner));
+        {
+            // Model an already-synced project: Studio agrees with disk/base.
+            let mut guard = state.write().await;
+            guard.tree_studio = guard.tree_fs.clone();
+        }
+        let (bcast_tx, _) = broadcast::channel(64);
+        Env {
+            state,
+            bcast_tx,
+            _root: dir,
+        }
+    }
+
+    fn root_of(env: &Env) -> std::path::PathBuf {
+        env._root.path().to_path_buf()
+    }
+
+    fn entry(content: &str) -> TreeEntry {
+        TreeEntry {
+            kind: ScriptKind::ModuleScript,
+            content: content.to_owned(),
+            sha256: sha256_hex(content.as_bytes()),
+        }
+    }
+
+    async fn drain(rx: &mut broadcast::Receiver<Arc<ServerMsg>>) -> Vec<ServerMsg> {
+        let mut out = Vec::new();
+        loop {
+            match tokio::time::timeout(Duration::from_millis(20), rx.recv()).await {
+                Ok(Ok(m)) => out.push((*m).clone()),
+                _ => break,
+            }
+        }
+        out
+    }
+
+    /// Drives base/studio/fs entries directly (bypassing the merge engine)
+    /// AND writes `fs` to disk, so a subsequent single `reconcile_path`
+    /// observes the exact 3-way divergence — the deterministic stand-in for
+    /// "edited Studio and disk nearly at once" from the audit repro.
+    async fn set_trees(env: &Env, path: &str, base: &str, studio: &str, fs: &str) {
+        std::fs::write(root_of(env).join(path), fs).expect("write fs to disk");
+        let mut g = env.state.write().await;
+        g.tree_base.insert(path.to_owned(), entry(base));
+        g.tree_studio.insert(path.to_owned(), entry(studio));
+        g.tree_fs.insert(path.to_owned(), entry(fs));
+    }
+
+    /// Forms a real overlapping-edit conflict at `path` and returns once it is
+    /// recorded in `pending_conflicts`. Drains the `ConflictDetected` frame.
+    async fn form_conflict(
+        env: &Env,
+        path: &str,
+        base: &str,
+        studio: &str,
+        fs: &str,
+    ) {
+        set_trees(env, path, base, studio, fs).await;
+        let mut rx = env.bcast_tx.subscribe();
+        reconcile_path(&env.state, path, &env.bcast_tx)
+            .await
+            .expect("reconcile forms conflict");
+        let _ = drain(&mut rx).await;
+        let g = env.state.read().await;
+        assert!(
+            g.pending_conflicts.contains_key(path),
+            "precondition: a conflict must be pending after form_conflict"
+        );
+    }
+
+    async fn resolve_taking_snapshot(env: &Env, path: &str) {
+        // Empty hunk map: `rebuild_resolved` falls back to the snapshot's
+        // `base_content`, i.e. whatever the authoritative snapshot currently
+        // resolves to. This is exactly the "user clicks resolve" moment.
+        handle_conflict_resolved(
+            &env.state,
+            vec![FileResolution {
+                path: path.to_owned(),
+                hunks: HashMap::new(),
+            }],
+            &env.bcast_tx,
+        )
+        .await
+        .expect("resolve");
+    }
+
+    // ─── A2 case 1: a clean revert during an open conflict must not silently
+    //     overwrite disk / advance base; resolution reflects current trees ──
+
+    #[tokio::test]
+    async fn clean_revert_during_conflict_freezes_disk_and_does_not_advance_base() {
+        let path = "src/Foo.luau";
+        let base = "line1\nBASE\nline3\n";
+        let studio = "line1\nSTUDIO\nline3\n";
+        let fs = "line1\nFS\nline3\n";
+        let env = make_env(&[(path, base)]).await;
+
+        form_conflict(&env, path, base, studio, fs).await;
+
+        // The user reverts the disk back to base while the conflict is open.
+        // Under the bug, `reconcile_path` runs `Apply { side: Fs }` (Studio's
+        // edit wins because disk == base again), overwriting disk with STUDIO
+        // and advancing tree_base — all while the stale snapshot lingers.
+        std::fs::write(root_of(&env).join(path), base).expect("revert disk to base");
+        let mut rx = env.bcast_tx.subscribe();
+        handle_fs_event(
+            &env.state,
+            FileEvent::Touched(root_of(&env).join(path)),
+            &env.bcast_tx,
+        )
+        .await
+        .expect("handle revert");
+        let _ = drain(&mut rx).await;
+
+        // A2 fix: disk stays at the reverted content, tree_base is NOT
+        // advanced, and the conflict is still authoritative over the path.
+        {
+            let g = env.state.read().await;
+            assert!(
+                g.pending_conflicts.contains_key(path),
+                "conflict must remain pending after a clean revert reconcile"
+            );
+            assert_eq!(
+                g.tree_base.get(path).map(|e| e.content.as_str()),
+                Some(base),
+                "tree_base must NOT be advanced by a reconcile while a conflict is open"
+            );
+        }
+        assert_eq!(
+            std::fs::read_to_string(root_of(&env).join(path)).expect("read disk"),
+            base,
+            "disk must stay at the user's reverted content, not be overwritten by Studio's edit"
+        );
+
+        // Resolving now reflects the CURRENT trees (Studio's live edit applied
+        // to a base == disk), NOT the stale base and NOT the vanished FS side.
+        resolve_taking_snapshot(&env, path).await;
+        assert_eq!(
+            std::fs::read_to_string(root_of(&env).join(path)).expect("read resolved"),
+            studio,
+            "resolution must reflect the current state (Studio's edit), not the stale base or discarded FS content"
+        );
+        let g = env.state.read().await;
+        assert!(
+            !g.pending_conflicts.contains_key(path),
+            "conflict must clear after resolution"
+        );
+    }
+
+    // ─── A2 case 2 (the data-loss core): an AutoMerge that lands during an
+    //     open conflict must NOT be discarded by the stale resolution ───────
+
+    #[tokio::test]
+    async fn automerge_during_conflict_is_not_discarded_by_stale_resolution() {
+        let path = "src/Mod.luau";
+        let base = "a\nb\nc\nd\ne\n";
+        let studio1 = "a\nS1\nc\nd\ne\n"; // line 2 — overlaps fs1
+        let fs1 = "a\nF1\nc\nd\ne\n"; // line 2 — overlaps studio1 → conflict
+        let env = make_env(&[(path, base)]).await;
+
+        form_conflict(&env, path, base, studio1, fs1).await;
+
+        // A new Studio edit arrives that is DISJOINT from the FS side (line 5,
+        // not line 2). The 3-way merge now resolves to a clean AutoMerge that
+        // keeps BOTH sides' changes.
+        let studio2 = "a\nb\nc\nd\nS2\n";
+        let merged = "a\nF1\nc\nd\nS2\n"; // F1 (line 2) + S2 (line 5)
+        let mut rx = env.bcast_tx.subscribe();
+        handle_studio_changed(
+            &env.state,
+            path.to_owned(),
+            studio2.to_owned(),
+            sha256_hex(studio2.as_bytes()),
+            None,
+            false,
+            &env.bcast_tx,
+        )
+        .await
+        .expect("studio edit");
+        let _ = drain(&mut rx).await;
+
+        // The AutoMerge must NOT have been written straight to disk + base
+        // (which is what strands the snapshot under the bug). Disk stays at
+        // the FS side; the merged content lives only in the refreshed snapshot
+        // until the user resolves.
+        {
+            let g = env.state.read().await;
+            assert!(
+                g.pending_conflicts.contains_key(path),
+                "conflict must remain pending; the AutoMerge is captured in the snapshot"
+            );
+            assert_eq!(
+                g.tree_base.get(path).map(|e| e.content.as_str()),
+                Some(base),
+                "tree_base must NOT be advanced to the auto-merged content while a conflict is open"
+            );
+        }
+        assert_eq!(
+            std::fs::read_to_string(root_of(&env).join(path)).expect("read disk"),
+            fs1,
+            "disk must stay frozen at the FS side until resolution"
+        );
+
+        // The user resolves. Under the bug the stale {base, studio1, fs1}
+        // snapshot rebuilds to studio1, discarding BOTH the merged FS change
+        // and the later Studio edit. With the fix, resolution yields the
+        // merged content.
+        resolve_taking_snapshot(&env, path).await;
+        assert_eq!(
+            std::fs::read_to_string(root_of(&env).join(path)).expect("read resolved"),
+            merged,
+            "the auto-merged content must survive the resolution, not be discarded for a stale side"
+        );
+    }
+
+    // ─── Guard preserved: an identical re-detection must not clobber the
+    //     in-progress resolution nor re-broadcast (commit 7ca88f4) ──────────
+
+    #[tokio::test]
+    async fn identical_reconflict_does_not_clobber_or_respam() {
+        let path = "src/Bar.luau";
+        let base = "a\nb\nc\nd\ne\n";
+        let studio = "a\nS\nc\nd\ne\n";
+        let fs = "a\nF\nc\nd\ne\n";
+        let env = make_env(&[(path, base)]).await;
+
+        form_conflict(&env, path, base, studio, fs).await;
+        let hunks_before = {
+            let g = env.state.read().await;
+            g.pending_conflicts.get(path).unwrap().conflict_hunks.len()
+        };
+
+        // Re-run reconcile with the trees unchanged (e.g. a bulk reconcile
+        // sweep touching an already-conflicted path). The snapshot must be
+        // left intact and nothing re-broadcast.
+        let mut rx = env.bcast_tx.subscribe();
+        reconcile_path(&env.state, path, &env.bcast_tx)
+            .await
+            .expect("re-reconcile");
+        let msgs = drain(&mut rx).await;
+        assert!(
+            !msgs
+                .iter()
+                .any(|m| matches!(m, ServerMsg::ConflictDetected { .. })),
+            "identical re-detection must not re-broadcast ConflictDetected; got {msgs:?}"
+        );
+
+        let g = env.state.read().await;
+        assert!(g.pending_conflicts.contains_key(path));
+        assert_eq!(
+            g.pending_conflicts.get(path).unwrap().conflict_hunks.len(),
+            hunks_before,
+            "the in-progress snapshot's hunks must be preserved verbatim"
+        );
+        assert_eq!(
+            g.tree_base.get(path).map(|e| e.content.as_str()),
+            Some(base),
+            "an identical re-reconcile must not advance tree_base"
+        );
     }
 }
 
