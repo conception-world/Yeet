@@ -716,7 +716,16 @@ async fn handle_fs_event(
                 tokio::time::sleep(FS_RENAME_PAIR_TTL).await;
                 let still_pending = {
                     let mut guard = state2.write().await;
-                    guard.fs_removed_pending.remove(&rel2).is_some()
+                    let was_pending = guard.fs_removed_pending.remove(&rel2).is_some();
+                    if was_pending {
+                        // B5: a real delete (no rename paired within the
+                        // window) — drop the orphaned attribute map too,
+                        // mirroring `delete_from_fs`. A paired rename instead
+                        // moves the attrs to the new path in the Touched branch
+                        // above, so this only fires when no pairing happened.
+                        guard.meta_attributes.remove(&rel2);
+                    }
+                    was_pending
                 };
                 if still_pending {
                     if let Err(e) = reconcile_path(&state2, &rel2, &bcast_tx2).await {
@@ -1893,6 +1902,10 @@ async fn delete_on_studio(
     let sha_before = guard.tree_studio.get(path).map(|e| e.sha256.clone());
     guard.tree_studio.remove(path);
     guard.tree_base.remove(path);
+    // B5: drop the orphaned per-path attribute map too, mirroring
+    // `delete_from_fs`. Left behind, it would later be re-attached to an
+    // unrelated instance that reused the path.
+    guard.meta_attributes.remove(path);
     persist_base(&guard)?;
     let project_root = guard.root.clone();
     let session_id = guard.session_id.clone();
@@ -2355,6 +2368,86 @@ fn fs_rename_with_retry(from: &Path, to: &Path) -> std::io::Result<()> {
     Err(last_err.unwrap())
 }
 
+/// Given the absolute path to a script file, returns the absolute path to its
+/// sibling `.meta.json` sidecar following the Rojo/Yeet convention:
+/// `Foo.luau` / `Foo.server.luau` / `Foo.client.luau` all pair with
+/// `Foo.meta.json`; an `init.luau` (etc.) pairs with `init.meta.json` in the
+/// same directory. Returns `None` when the path is not a `.lua`/`.luau` file
+/// or has no file name.
+fn meta_sidecar_abs(script_abs: &Path) -> Option<PathBuf> {
+    let file = script_abs.file_name()?.to_str()?;
+    let meta_file = if is_init_filename(file) {
+        "init.meta.json".to_owned()
+    } else {
+        let stem = file
+            .strip_suffix(".luau")
+            .or_else(|| file.strip_suffix(".lua"))?;
+        let base = stem
+            .strip_suffix(".server")
+            .or_else(|| stem.strip_suffix(".client"))
+            .unwrap_or(stem);
+        format!("{base}.meta.json")
+    };
+    Some(script_abs.with_file_name(meta_file))
+}
+
+/// Moves a script's `.meta.json` sidecar alongside a rename of the script
+/// itself (AUDITORIA-YEET.md M11). Renaming only the `.luau` orphaned the
+/// sidecar, so its attributes vanished on a clean checkout. No-op when the
+/// source script has no sidecar or both sides resolve to the same file. Uses
+/// the same OneDrive-aware retry as the main-file rename.
+fn move_meta_sidecar(old_abs: &Path, new_abs: &Path) -> Result<(), String> {
+    let (Some(old_meta), Some(new_meta)) =
+        (meta_sidecar_abs(old_abs), meta_sidecar_abs(new_abs))
+    else {
+        return Ok(());
+    };
+    if old_meta == new_meta || !old_meta.is_file() {
+        return Ok(());
+    }
+    if let Some(parent) = new_meta.parent() {
+        std::fs::create_dir_all(parent)
+            .map_err(|e| format!("mkdir -p {}: {e}", parent.display()))?;
+    }
+    fs_rename_with_retry(&old_meta, &new_meta)
+        .map_err(|e| format!("rename meta {} -> {}: {e}", old_meta.display(), new_meta.display()))
+}
+
+/// Recursively moves every entry under `from_dir` into `into_dir` at the same
+/// relative sub-path, then removes the now-empty `from_dir`. Used by the
+/// DirToDir rename guard when the destination directory already exists because
+/// a child `LeafToLeaf` frame was applied before the container `DirToDir`
+/// (AUDITORIA-YEET.md M10): a raw `fs::rename` onto an existing directory fails
+/// on Windows and would split the subtree on disk. Entries already present at
+/// the destination (moved by the earlier child frame) are left in place, and
+/// any leftover source duplicate is dropped so the old directory empties out.
+fn merge_dir_into(from_dir: &Path, into_dir: &Path) -> Result<(), String> {
+    std::fs::create_dir_all(into_dir)
+        .map_err(|e| format!("mkdir -p {}: {e}", into_dir.display()))?;
+    let entries = std::fs::read_dir(from_dir)
+        .map_err(|e| format!("read_dir {}: {e}", from_dir.display()))?;
+    for entry in entries {
+        let entry = entry.map_err(|e| format!("read_dir entry in {}: {e}", from_dir.display()))?;
+        let from = entry.path();
+        let to = into_dir.join(entry.file_name());
+        let ft = entry
+            .file_type()
+            .map_err(|e| format!("file_type {}: {e}", from.display()))?;
+        if ft.is_dir() {
+            merge_dir_into(&from, &to)?;
+        } else if to.exists() {
+            // Destination already has this file (moved by the earlier child
+            // frame); drop the redundant source so the dir can be removed.
+            let _ = std::fs::remove_file(&from);
+        } else {
+            fs_rename_with_retry(&from, &to)
+                .map_err(|e| format!("merge-move {} -> {}: {e}", from.display(), to.display()))?;
+        }
+    }
+    let _ = std::fs::remove_dir(from_dir); // best-effort; only removes if empty
+    Ok(())
+}
+
 /// Performs every disk mutation for `handle_studio_renamed` and returns
 /// a `String` error on the first failure. The async caller catches the
 /// `Err` and emits a `SyncError` over the WebSocket so the plugin dock
@@ -2391,6 +2484,9 @@ fn perform_rename_io(
                 atomic_write(new_abs, encoded.as_bytes())
                     .map_err(|e| io_step(&format!("write {}", new_abs.display()), e))?;
             }
+            // M11: carry the paired `.meta.json` sidecar to the new name so
+            // instance attributes survive the rename.
+            move_meta_sidecar(old_abs, new_abs)?;
         }
         RenameCase::DirToDir => {
             let old_dir = old_abs
@@ -2406,12 +2502,22 @@ fn perform_rename_io(
                     .map_err(|e| io_step(&format!("mkdir -p {}", parent.display()), e))?;
             }
             if old_dir.is_dir() {
-                fs_rename_with_retry(&old_dir, &new_dir).map_err(|e| {
-                    io_step(
-                        &format!("rename dir {} -> {}", old_dir.display(), new_dir.display()),
-                        e,
-                    )
-                })?;
+                if new_dir.exists() {
+                    // M10: a child `LeafToLeaf` frame was applied before this
+                    // container `DirToDir` and already created `new_dir`,
+                    // moving some children into it. A raw `fs::rename` onto an
+                    // existing directory fails on Windows and would split the
+                    // subtree (HandlerFailed); merge the remaining `old_dir`
+                    // contents into `new_dir` instead, then drop `old_dir`.
+                    merge_dir_into(&old_dir, &new_dir)?;
+                } else {
+                    fs_rename_with_retry(&old_dir, &new_dir).map_err(|e| {
+                        io_step(
+                            &format!("rename dir {} -> {}", old_dir.display(), new_dir.display()),
+                            e,
+                        )
+                    })?;
+                }
             } else {
                 std::fs::create_dir_all(&new_dir)
                     .map_err(|e| io_step(&format!("mkdir {}", new_dir.display()), e))?;
@@ -2426,7 +2532,8 @@ fn perform_rename_io(
                 os.push(".yeet-tmp");
                 PathBuf::from(os)
             };
-            if old_abs.is_file() {
+            let staged = old_abs.is_file();
+            if staged {
                 fs_rename_with_retry(old_abs, &tmp).map_err(|e| {
                     io_step(
                         &format!("stage {} -> {}", old_abs.display(), tmp.display()),
@@ -2435,31 +2542,50 @@ fn perform_rename_io(
                 })?;
             }
             if let Some(parent) = new_abs.parent() {
-                std::fs::create_dir_all(parent)
-                    .map_err(|e| io_step(&format!("mkdir -p {}", parent.display()), e))?;
+                if let Err(e) = std::fs::create_dir_all(parent) {
+                    // M12: roll the staged content back to `old_abs` so it is
+                    // never stranded as `<name>.yeet-tmp` (unclassified,
+                    // ignored by rescan) if this step fails.
+                    if staged {
+                        let _ = fs_rename_with_retry(&tmp, old_abs);
+                    }
+                    return Err(io_step(&format!("mkdir -p {}", parent.display()), e));
+                }
             }
             if tmp.is_file() {
-                fs_rename_with_retry(&tmp, new_abs).map_err(|e| {
-                    io_step(
+                if let Err(e) = fs_rename_with_retry(&tmp, new_abs) {
+                    // M12: the finalize rename failed with the content already
+                    // staged; roll it back to `old_abs` before returning so no
+                    // data is lost in `.yeet-tmp`.
+                    let _ = fs_rename_with_retry(&tmp, old_abs);
+                    return Err(io_step(
                         &format!("finalize {} -> {}", tmp.display(), new_abs.display()),
                         e,
-                    )
-                })?;
+                    ));
+                }
             } else {
                 let encoded = encode_for_disk(content, new_meta);
                 atomic_write(new_abs, encoded.as_bytes())
                     .map_err(|e| io_step(&format!("write {}", new_abs.display()), e))?;
             }
+            // M11: move the paired sidecar (`Foo.meta.json` → `Foo/init.meta.json`).
+            move_meta_sidecar(old_abs, new_abs)?;
         }
         RenameCase::Demote => {
             let old_dir = old_abs
                 .parent()
                 .ok_or_else(|| format!("init path {old_path_disp} has no parent dir"))?
                 .to_path_buf();
+            // M11: the paired `init.meta.json` sidecar does not count as a
+            // blocking extra child — it moves out with the demotion below.
+            let old_sidecar = meta_sidecar_abs(old_abs);
             let extra_children = match std::fs::read_dir(&old_dir) {
                 Ok(it) => it
                     .filter_map(|e| e.ok())
-                    .filter(|e| e.path() != *old_abs)
+                    .filter(|e| {
+                        let p = e.path();
+                        p != *old_abs && old_sidecar.as_deref() != Some(p.as_path())
+                    })
                     .count(),
                 Err(_) => 0,
             };
@@ -2485,6 +2611,11 @@ fn perform_rename_io(
                 atomic_write(new_abs, encoded.as_bytes())
                     .map_err(|e| io_step(&format!("write {}", new_abs.display()), e))?;
             }
+            // M11: move `init.meta.json` → `<Name>.meta.json` BEFORE dropping
+            // the directory, otherwise the sidecar is orphaned and
+            // `remove_dir` (which only removes an empty dir) would silently
+            // leave the folder behind.
+            move_meta_sidecar(old_abs, new_abs)?;
             if old_dir.is_dir() {
                 let _ = std::fs::remove_dir(&old_dir);
             }
@@ -2679,6 +2810,27 @@ async fn handle_studio_renamed(
     };
     let case = RenameCase::classify(&old_path, &new_path);
     let new_meta = guard.meta_for(&new_path);
+
+    // M10: a folder move in Studio arrives as one container `DirToDir` frame
+    // plus a redundant `LeafToLeaf` for every child. When the `DirToDir` was
+    // applied first it already moved the child on disk and re-keyed all three
+    // trees, so this per-child frame is a no-op. Detect the already-applied
+    // shape (source gone, destination present, trees point at the new path)
+    // and skip it — re-running the I/O would needlessly re-write the file, and
+    // the plugin that originated the move has already reparented the instance.
+    if matches!(case, RenameCase::LeafToLeaf)
+        && !old_abs.exists()
+        && new_abs.exists()
+        && guard.tree_fs.contains_key(&new_path)
+        && !guard.tree_fs.contains_key(&old_path)
+    {
+        debug!(
+            old = %old_path,
+            new = %new_path,
+            "handle_studio_renamed: child rename already applied by a folder move; skipping redundant frame"
+        );
+        return Ok(());
+    }
 
     // Run all I/O outside the lock-holding path. Errors come back as
     // human-readable strings; we surface them to the plugin so the user
@@ -6548,13 +6700,17 @@ mod fs_removed_pending_tests {
     //! Mirrors the `bulk_tests` harness style: tempdir-backed project,
     //! bootstrap, fire raw `FileEvent`s, inspect broadcasts + tree state.
 
-    use super::{handle_fs_event, FS_RENAME_PAIR_TTL};
+    use super::{
+        delete_on_studio, handle_fs_event, handle_studio_renamed, perform_rename_io, RenameCase,
+        FS_RENAME_PAIR_TTL,
+    };
+    use std::collections::HashMap;
     use std::sync::Arc;
     use std::time::Duration;
     use tokio::sync::{broadcast, RwLock};
     use yeet_daemon::project::Project;
-    use yeet_daemon::protocol::ServerMsg;
-    use yeet_daemon::state::{ProjectState, SharedState};
+    use yeet_daemon::protocol::{ScriptKind, ServerMsg};
+    use yeet_daemon::state::{sha256_hex, FileMeta, ProjectState, SharedState};
     use yeet_daemon::watcher::FileEvent;
 
     /// A test environment: temp project root, daemon state, broadcast bus.
@@ -7066,6 +7222,240 @@ mod fs_removed_pending_tests {
         assert_eq!(
             guard.tree_fs.get("src/A.luau").map(|e| e.content.as_str()),
             Some("return 2\n")
+        );
+    }
+
+    // ─── M10: folder move — DirToDir dest-exists guard + no split ────────
+
+    #[test]
+    fn dirtodir_rename_merges_when_destination_dir_already_exists() {
+        // A child LeafToLeaf frame was applied first and already created
+        // `Bar/` (moving Child there). The container DirToDir must merge the
+        // leftover `Foo/init.luau` into the existing `Bar/` instead of a raw
+        // rename that fails on Windows and splits the tree (M10).
+        let dir = tempfile::tempdir().expect("tempdir");
+        let root = dir.path();
+        std::fs::create_dir_all(root.join("Foo")).unwrap();
+        std::fs::write(root.join("Foo/init.luau"), "return {}\n").unwrap();
+        std::fs::create_dir_all(root.join("Bar")).unwrap();
+        std::fs::write(root.join("Bar/Child.luau"), "return 1\n").unwrap();
+
+        let res = perform_rename_io(
+            RenameCase::DirToDir,
+            &root.join("Foo/init.luau"),
+            &root.join("Bar/init.luau"),
+            FileMeta::default_for_new_file(),
+            "return {}\n",
+            "Foo/init.luau",
+            "Bar/init.luau",
+        );
+        assert!(res.is_ok(), "DirToDir onto an existing dir must merge, got {res:?}");
+        assert!(root.join("Bar/init.luau").exists(), "init merged into Bar");
+        assert!(root.join("Bar/Child.luau").exists(), "pre-moved child preserved");
+        assert!(!root.join("Foo").exists(), "old dir removed after merge");
+    }
+
+    #[tokio::test]
+    async fn folder_move_child_frame_before_container_does_not_split() {
+        // Studio moved `Foo/` → `Bar/`; frames can arrive child-first. The
+        // container DirToDir must NOT fail with HandlerFailed, and the subtree
+        // must not split across `Foo`/`Bar` on disk or in the trees (M10).
+        let env = make_env(&[
+            ("src/Foo/init.luau", "return {}\n"),
+            ("src/Foo/Child.luau", "return 1\n"),
+        ])
+        .await;
+        let mut rx = env.bcast_tx.subscribe();
+
+        let child = "return 1\n";
+        handle_studio_renamed(
+            &env.state,
+            "src/Foo/Child.luau".to_owned(),
+            "src/Bar/Child.luau".to_owned(),
+            ScriptKind::ModuleScript,
+            child.to_owned(),
+            sha256_hex(child.as_bytes()),
+            &env.bcast_tx,
+        )
+        .await
+        .expect("child rename");
+        let init = "return {}\n";
+        handle_studio_renamed(
+            &env.state,
+            "src/Foo/init.luau".to_owned(),
+            "src/Bar/init.luau".to_owned(),
+            ScriptKind::ModuleScript,
+            init.to_owned(),
+            sha256_hex(init.as_bytes()),
+            &env.bcast_tx,
+        )
+        .await
+        .expect("container rename");
+
+        let msgs = drain(&mut rx).await;
+        let container_error = msgs.iter().any(|m| {
+            matches!(m, ServerMsg::SyncError { path, .. } if path == "src/Bar/init.luau")
+        });
+        assert!(
+            !container_error,
+            "container DirToDir must not surface a SyncError; got {msgs:?}"
+        );
+
+        let root = root_of(&env);
+        assert!(root.join("src/Bar/init.luau").exists());
+        assert!(root.join("src/Bar/Child.luau").exists());
+        assert!(!root.join("src/Foo").exists(), "old folder gone from disk");
+
+        let guard = env.state.read().await;
+        assert!(guard.tree_fs.contains_key("src/Bar/init.luau"));
+        assert!(guard.tree_fs.contains_key("src/Bar/Child.luau"));
+        assert!(!guard.tree_fs.contains_key("src/Foo/init.luau"), "no split");
+        assert!(!guard.tree_fs.contains_key("src/Foo/Child.luau"), "no split");
+    }
+
+    // ─── M11: rename carries the `.meta.json` sidecar ────────────────────
+
+    #[test]
+    fn leaf_rename_moves_meta_sidecar() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let root = dir.path();
+        std::fs::create_dir_all(root.join("src")).unwrap();
+        std::fs::write(root.join("src/Foo.luau"), "return 1\n").unwrap();
+        std::fs::write(root.join("src/Foo.meta.json"), "{\"properties\":{}}").unwrap();
+
+        let res = perform_rename_io(
+            RenameCase::LeafToLeaf,
+            &root.join("src/Foo.luau"),
+            &root.join("src/Bar.luau"),
+            FileMeta::default_for_new_file(),
+            "return 1\n",
+            "src/Foo.luau",
+            "src/Bar.luau",
+        );
+        assert!(res.is_ok(), "{res:?}");
+        assert!(root.join("src/Bar.luau").exists());
+        assert!(
+            root.join("src/Bar.meta.json").exists(),
+            "sidecar must move with the script (M11)"
+        );
+        assert!(!root.join("src/Foo.meta.json").exists(), "old sidecar must be gone");
+    }
+
+    #[test]
+    fn demote_rename_moves_init_meta_sidecar_and_removes_dir() {
+        // A lone `init.meta.json` sibling must not block the demote (it moves
+        // out with the script) and must land as `<Name>.meta.json` (M11).
+        let dir = tempfile::tempdir().expect("tempdir");
+        let root = dir.path();
+        std::fs::create_dir_all(root.join("src/Foo")).unwrap();
+        std::fs::write(root.join("src/Foo/init.luau"), "return 1\n").unwrap();
+        std::fs::write(root.join("src/Foo/init.meta.json"), "{\"properties\":{}}").unwrap();
+
+        let res = perform_rename_io(
+            RenameCase::Demote,
+            &root.join("src/Foo/init.luau"),
+            &root.join("src/Foo.luau"),
+            FileMeta::default_for_new_file(),
+            "return 1\n",
+            "src/Foo/init.luau",
+            "src/Foo.luau",
+        );
+        assert!(
+            res.is_ok(),
+            "demote with only a sidecar sibling must succeed, got {res:?}"
+        );
+        assert!(root.join("src/Foo.luau").exists());
+        assert!(
+            root.join("src/Foo.meta.json").exists(),
+            "sidecar demoted alongside the script (M11)"
+        );
+        assert!(!root.join("src/Foo").exists(), "old dir removed");
+    }
+
+    // ─── M12: Promote rolls back staging on finalize failure ─────────────
+
+    #[test]
+    fn promote_rolls_back_staging_when_finalize_fails() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let root = dir.path();
+        std::fs::create_dir_all(root.join("src")).unwrap();
+        std::fs::write(root.join("src/Foo.luau"), "return 1\n").unwrap();
+        // Force the finalize rename to fail: make `src/Foo/init.luau` an
+        // existing NON-EMPTY directory so renaming the staged file onto it
+        // errors on every platform.
+        std::fs::create_dir_all(root.join("src/Foo/init.luau")).unwrap();
+        std::fs::write(root.join("src/Foo/init.luau/blocker"), "x").unwrap();
+
+        let res = perform_rename_io(
+            RenameCase::Promote,
+            &root.join("src/Foo.luau"),
+            &root.join("src/Foo/init.luau"),
+            FileMeta::default_for_new_file(),
+            "return 1\n",
+            "src/Foo.luau",
+            "src/Foo/init.luau",
+        );
+        assert!(res.is_err(), "finalize onto a non-empty dir must fail");
+        // M12: content must be recoverable at old_abs, never stranded in the
+        // unclassified `.yeet-tmp` staging file.
+        assert!(
+            root.join("src/Foo.luau").exists(),
+            "staged content must roll back to the old path"
+        );
+        assert!(
+            !root.join("src/Foo.luau.yeet-tmp").exists(),
+            "no stray .yeet-tmp left behind"
+        );
+        assert_eq!(
+            std::fs::read_to_string(root.join("src/Foo.luau")).unwrap(),
+            "return 1\n"
+        );
+    }
+
+    // ─── B5: meta_attributes cleared on delete ───────────────────────────
+
+    #[tokio::test]
+    async fn delete_on_studio_clears_meta_attributes() {
+        let env = make_env(&[("src/Foo.luau", "return 1\n")]).await;
+        {
+            let mut guard = env.state.write().await;
+            guard
+                .meta_attributes
+                .insert("src/Foo.luau".to_owned(), HashMap::new());
+        }
+        delete_on_studio(&env.state, "src/Foo.luau", &env.bcast_tx)
+            .await
+            .expect("delete_on_studio");
+        let guard = env.state.read().await;
+        assert!(
+            !guard.meta_attributes.contains_key("src/Foo.luau"),
+            "meta_attributes must be cleared on studio delete (B5)"
+        );
+    }
+
+    #[tokio::test]
+    async fn fs_removal_clears_meta_attributes_after_window() {
+        let env = make_env(&[("src/Foo.luau", "return 1\n")]).await;
+        {
+            let mut guard = env.state.write().await;
+            guard
+                .meta_attributes
+                .insert("src/Foo.luau".to_owned(), HashMap::new());
+        }
+        let root = root_of(&env);
+        std::fs::remove_file(root.join("src/Foo.luau")).expect("rm Foo");
+        handle_fs_event(
+            &env.state,
+            FileEvent::Removed(root.join("src/Foo.luau")),
+            &env.bcast_tx,
+        )
+        .await
+        .expect("handle removed");
+        wait_out_pairing_window().await;
+        let guard = env.state.read().await;
+        assert!(
+            !guard.meta_attributes.contains_key("src/Foo.luau"),
+            "meta_attributes must be cleared once the removal finalizes (B5)"
         );
     }
 }
