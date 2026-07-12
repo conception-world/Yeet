@@ -10,9 +10,13 @@
 -- Inheritance is handled at encode time via `inst:IsA(class)` — an entry for
 -- "BasePart.Anchored" applies to every subclass without us listing them.
 --
--- `Source` is intentionally absent: script bodies travel as file content via
--- the existing sync channel, and `syncback.rs` already drops `Source` from
--- the property map server-side.
+-- `Source` is intentionally absent from this whitelist: for incremental
+-- FS<->Studio sync, script bodies travel as file content via the existing
+-- `FileChanged`/`FileCreated` channel, not as a property. Reverse-bootstrap
+-- syncback has no such channel, though — `Walker.serialize` injects
+-- `properties.Source` directly for every `LuaSourceContainer` instead of
+-- routing it through this table (see Walker.luau `encodeSource`), and
+-- `syncback.rs` drops it again before persisting `.meta.json`.
 
 export type Tag =
 	"string" | "bool" | "number"
