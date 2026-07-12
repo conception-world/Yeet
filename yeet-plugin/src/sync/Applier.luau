@@ -209,6 +209,17 @@ type self = {
 	-- UI through the existing `BulkSyncPreview`/`BulkSyncConfirm` messages.
 	bootstrapPreviewMode: boolean,
 	onBootstrapSnapshot: BootstrapSnapshotHook?,
+	-- Cached `project_root` advertised by the daemon on the first
+	-- ProjectOpened. Compared on every later ProjectOpened so a daemon that
+	-- switched projects (restart pointed elsewhere, reused socket) can't
+	-- materialize the wrong tree into this place (M26). Persists across
+	-- re-bootstraps — deliberately NOT cleared by resetPerSessionState — so
+	-- the guard survives a daemon restart.
+	projectRoot: string?,
+	-- Fired when a later ProjectOpened's project_root disagrees with the
+	-- cached one; the Widget tears the connection down. Optional: absent in
+	-- minimal/test wirings, where the loud log line is the only signal.
+	onProjectRootMismatch: ((expected: string, got: string) -> ())?,
 	-- `DescendantAdded` listeners rooted on each `$path` mapping parent.
 	-- Kept so `reset()` can disconnect them alongside the rest of the
 	-- bootstrap-owned state.
@@ -244,6 +255,8 @@ function Applier.new(log: Log): Applier
 		onAuthRejected = nil :: ((any) -> ())?,
 		bootstrapPreviewMode = false,
 		onBootstrapSnapshot = nil :: BootstrapSnapshotHook?,
+		projectRoot = nil :: string?,
+		onProjectRootMismatch = nil :: ((expected: string, got: string) -> ())?,
 		liveConnections = {} :: { RBXScriptConnection },
 	}, Applier)
 end
@@ -254,6 +267,13 @@ end
 
 function Applier.setBootstrapSnapshotHook(self: Applier, hook: BootstrapSnapshotHook?)
 	self.onBootstrapSnapshot = hook
+end
+
+function Applier.setProjectRootMismatchHook(
+	self: Applier,
+	hook: ((expected: string, got: string) -> ())?
+)
+	self.onProjectRootMismatch = hook
 end
 
 function Applier.setTrackHooks(self: Applier, onTracked: TrackHook, onUntracked: UntrackHook)
@@ -590,6 +610,32 @@ local function applyProjectOpened(self: Applier, msg: any)
 					.. MIN_COMPATIBLE_DAEMON_VERSION
 					.. `. Update the daemon — frames may misalign and writes can be lost.`
 			)
+		end
+	end
+	-- REGRESSION(M26): guard against a daemon serving a DIFFERENT project than
+	-- the one this plugin first bootstrapped against (daemon restarted pointed
+	-- elsewhere, or a place connected to a reused socket). Materializing
+	-- project A's tree into place B's DataModel is silent cross-project
+	-- corruption. Cache project_root on the first ProjectOpened; on a later one
+	-- that differs, refuse to materialize and signal the Widget to disconnect.
+	-- The cache lives on the Applier (one per Reconnect session), so it spans
+	-- resume/re-bootstrap but resets on a fresh user-initiated connect.
+	local incomingRoot = msg.project_root
+	if typeof(incomingRoot) == "string" and incomingRoot ~= "" then
+		local cachedRoot = self.projectRoot
+		if cachedRoot == nil then
+			self.projectRoot = incomingRoot
+		elseif cachedRoot ~= incomingRoot then
+			self.log(
+				`!! project_root changed ({cachedRoot} -> {incomingRoot}); `
+					.. `refusing to materialize a different project into this place. `
+					.. `Disconnect and reconnect to the correct daemon.`
+			)
+			local hook = self.onProjectRootMismatch
+			if hook ~= nil then
+				hook(cachedRoot, incomingRoot)
+			end
+			return
 		end
 	end
 	local project: Project = msg.project

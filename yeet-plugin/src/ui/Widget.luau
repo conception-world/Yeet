@@ -147,6 +147,10 @@ type ApplierHandle = {
     self: ApplierHandle,
     hook: ((snapshot: { { path: string, kind: string, content: string, sha256: string } }) -> ())?
   ) -> (),
+  setProjectRootMismatchHook: (
+    self: ApplierHandle,
+    hook: ((expected: string, got: string) -> ())?
+  ) -> (),
   reset: (self: ApplierHandle) -> (),
 }
 type SourceWatcherHandle = {
@@ -1060,6 +1064,21 @@ function Widget._onConnectPressed(self: Widget)
   -- `ProjectOpened` (which skips auto-materialize and hands a snapshot back
   -- to this Widget for forwarding).
   applier:setBootstrapPreviewMode(true)
+  -- M26: refuse to materialize if the daemon starts advertising a different
+  -- project_root than the one we first bootstrapped against (cross-project
+  -- corruption guard). The Applier caches the root and fires this on a
+  -- mismatch; we surface it and tear the connection down.
+  applier:setProjectRootMismatchHook(function(expected: string, got: string)
+    self:_appendLog(
+      `!! daemon switched project_root ({expected} -> {got}); disconnecting to avoid cross-project corruption`
+    )
+    -- Defer the teardown: we're inside applier:dispatch, itself inside the
+    -- socket MessageReceived handler; tearing the connection down mid-stack
+    -- would disconnect the very signal we are running in.
+    task.defer(function()
+      self:_teardownConnection()
+    end)
+  end)
   -- Auth handlers. The daemon's auth gate is best-effort: it never
   -- bails the connection just because we lack a token. The only
   -- thing the plugin needs to do is grab a token whenever the daemon
