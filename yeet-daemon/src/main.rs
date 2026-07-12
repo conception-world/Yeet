@@ -33,8 +33,8 @@ use yeet_daemon::protocol::{
     SyncbackTemplate, classify, is_init_filename,
 };
 use yeet_daemon::state::{
-    FileMeta, FsRemovedPending, ProjectState, SharedState, encode_for_disk, is_meta_file,
-    normalize_from_disk, resolve_inside, sha256_hex,
+    FileMeta, FsRemovedPending, PendingApply, ProjectState, SharedState, encode_for_disk,
+    is_meta_file, normalize_from_disk, resolve_inside, sha256_hex,
 };
 use yeet_daemon::syncback::{self, SyncbackOptions, SyncbackSession, SyncbackSessions};
 use yeet_daemon::tree::{self, TreeEntry};
@@ -101,6 +101,18 @@ const WS_IDLE_TIMEOUT_SECS: u64 = 600;
 /// 30s gives a reasonable detection latency without burning a tokio task
 /// timer on a per-second tick.
 const WS_IDLE_CHECK_SECS: u64 = 30;
+/// A4 apply-ACK: how long a Studio-direction push (recorded in
+/// `pending_applies`) may wait for the plugin's `FileApplied` before the
+/// old-plugin timeout fallback advances `tree_base`/`tree_studio` anyway. A
+/// current plugin ACKs within a round-trip (milliseconds on loopback), so this
+/// only ever fires for a pre-A4 plugin that never learned to ACK, or a genuinely
+/// lost frame — in which case restoring the legacy "advance on broadcast"
+/// behaviour after a delay is safer than wedging the path forever.
+const APPLY_ACK_TIMEOUT_SECS: u64 = 8;
+/// How often `run_plugin_session` sweeps `pending_applies` for entries past
+/// `APPLY_ACK_TIMEOUT_SECS`. Kept short (relative to the idle check) so the
+/// fallback latency for an old plugin is bounded to a few seconds.
+const APPLY_SWEEP_CHECK_SECS: u64 = 2;
 /// Minimum plugin/extension `Hello { version }` value the daemon will accept.
 /// Compared via `semver::Version`, NOT lexicographically.
 ///
@@ -1266,12 +1278,31 @@ async fn write_to_fs(
         sha256: sha.clone(),
     };
     guard.tree_fs.insert(path.to_owned(), entry.clone());
-    guard.tree_base.insert(path.to_owned(), entry.clone());
     if broadcast_to_studio {
-        guard.tree_studio.insert(path.to_owned(), entry);
+        // A4/M14: AutoMerge (and conflict resolution, which shares this path)
+        // write the merged bytes to disk here — the fs side is confirmed — but
+        // Studio must still ACK before tree_base/tree_studio move. Record the
+        // studio push as pending instead of advancing the "confirmed by both
+        // sides" base optimistically; `handle_file_applied` advances it once the
+        // plugin reports success. tree_base is left untouched, so nothing to
+        // persist yet.
+        guard.pending_applies.insert(
+            path.to_owned(),
+            PendingApply {
+                sha256: sha.clone(),
+                entry: Some(entry),
+                since: std::time::Instant::now(),
+            },
+        );
+        guard.meta.entry(path.to_owned()).or_insert(meta);
+    } else {
+        // Pure FS apply: the merge chose to write Studio's side to disk, so
+        // Studio already holds this content and both sides now agree — advance
+        // base immediately (there is nothing to ACK on the Studio side).
+        guard.tree_base.insert(path.to_owned(), entry);
+        guard.meta.entry(path.to_owned()).or_insert(meta);
+        persist_base(&guard)?;
     }
-    guard.meta.entry(path.to_owned()).or_insert(meta);
-    persist_base(&guard)?;
     let root = guard.root.clone();
     let session_id = guard.session_id.clone();
     drop(guard);
@@ -1359,13 +1390,27 @@ async fn delete_from_fs(
     }
     let sha_before = guard.tree_fs.get(path).map(|e| e.sha256.clone());
     guard.tree_fs.remove(path);
-    guard.tree_base.remove(path);
     guard.meta.remove(path);
     guard.meta_attributes.remove(path);
     if broadcast_to_studio {
-        guard.tree_studio.remove(path);
+        // A4/M14: the disk delete is done (fs side confirmed) but Studio must
+        // ACK before tree_base/tree_studio drop the path. Record a pending
+        // delete rather than advancing base past an unconfirmed Studio removal.
+        // tree_base is untouched here, so no persist yet.
+        guard.pending_applies.insert(
+            path.to_owned(),
+            PendingApply {
+                sha256: String::new(),
+                entry: None,
+                since: std::time::Instant::now(),
+            },
+        );
+    } else {
+        // Pure FS delete: Studio has already dropped the instance, so base can
+        // drop the path now.
+        guard.tree_base.remove(path);
+        persist_base(&guard)?;
     }
-    persist_base(&guard)?;
     let project_root = guard.root.clone();
     let session_id = guard.session_id.clone();
     drop(guard);
@@ -1824,9 +1869,22 @@ async fn push_to_studio(
         sha256: sha.clone(),
     };
     let existed = guard.tree_studio.contains_key(path);
-    guard.tree_studio.insert(path.to_owned(), entry.clone());
-    guard.tree_base.insert(path.to_owned(), entry);
-    persist_base(&guard)?;
+    // A4/M14 apply-ACK: do NOT advance tree_studio/tree_base here. Record the
+    // push as a pending apply and let `handle_file_applied` move the trees once
+    // the plugin confirms it actually mutated the DataModel. Advancing
+    // tree_base ("confirmed by both sides") before that confirmation is the
+    // silent-loss cascade this finding fixes: if `withRecording` fails plugin
+    // side, Studio never receives the content while the daemon already believes
+    // it synced. `tree_fs` already holds `content` (that is why we are pushing),
+    // so the fs side needs no change.
+    guard.pending_applies.insert(
+        path.to_owned(),
+        PendingApply {
+            sha256: sha.clone(),
+            entry: Some(entry),
+            since: std::time::Instant::now(),
+        },
+    );
     let receivers = bcast_tx.receiver_count();
     let project_root = guard.root.clone();
     let session_id = guard.session_id.clone();
@@ -1900,13 +1958,24 @@ async fn delete_on_studio(
     }
     let mut guard = state.write().await;
     let sha_before = guard.tree_studio.get(path).map(|e| e.sha256.clone());
-    guard.tree_studio.remove(path);
-    guard.tree_base.remove(path);
-    // B5: drop the orphaned per-path attribute map too, mirroring
-    // `delete_from_fs`. Left behind, it would later be re-attached to an
-    // unrelated instance that reused the path.
+    // A4/M14 apply-ACK: defer the tree_studio/tree_base removal until the plugin
+    // confirms it dropped the instance (`FileApplied` carries the empty-string
+    // delete sentinel), or the old-plugin timeout fallback fires. Removing
+    // tree_base now would let the daemon believe Studio deleted the instance
+    // when `withRecording` actually failed and it still exists.
+    guard.pending_applies.insert(
+        path.to_owned(),
+        PendingApply {
+            sha256: String::new(),
+            entry: None,
+            since: std::time::Instant::now(),
+        },
+    );
+    // B5: drop the orphaned per-path attribute map now (mirrors
+    // `delete_from_fs`). This one piece is cleared eagerly — a stale attr map
+    // re-attached to an instance that later reused the path is worse than
+    // re-deriving it from the on-disk `.meta.json` on the rare NAK.
     guard.meta_attributes.remove(path);
-    persist_base(&guard)?;
     let project_root = guard.root.clone();
     let session_id = guard.session_id.clone();
     drop(guard);
@@ -1933,12 +2002,154 @@ async fn delete_on_studio(
     Ok(())
 }
 
+/// A4/M14 apply-ACK: the plugin confirmed it applied a Studio-direction push
+/// (`push_to_studio`, `delete_on_studio`, or the AutoMerge broadcast). This is
+/// the steady-state path that finally advances `tree_base`/`tree_studio` for
+/// that push — before it, the change lived only in `pending_applies`. The
+/// `sha256` must match the pending entry: a mismatch is a stale ACK for a push
+/// we have already superseded with a newer one, so advancing to it would clobber
+/// the newer intent. For a delete the plugin sends the empty string, which
+/// matches the empty-string sentinel recorded by `delete_on_studio`.
+async fn handle_file_applied(
+    state: &SharedState,
+    path: String,
+    sha256: String,
+) -> Result<()> {
+    let mut guard = state.write().await;
+    let Some(pending) = guard.pending_applies.get(&path) else {
+        // No pending apply: a redundant ACK (already advanced), an ACK that
+        // raced a superseding Studio event which cleared the pending, or a
+        // confused client. Harmless — ignore.
+        trace!(path = %path, "FileApplied with no pending apply; ignoring");
+        return Ok(());
+    };
+    if pending.sha256 != sha256 {
+        debug!(
+            path = %path,
+            expected = %pending.sha256,
+            got = %sha256,
+            "stale FileApplied ignored (sha mismatch): a newer push superseded this one"
+        );
+        return Ok(());
+    }
+    // Confirmed by both sides. Advance base + studio to the pending entry (or
+    // drop the path for a confirmed delete), then persist the base tree.
+    let entry = pending.entry.clone();
+    guard.pending_applies.remove(&path);
+    match entry {
+        Some(e) => {
+            guard.tree_studio.insert(path.clone(), e.clone());
+            guard.tree_base.insert(path.clone(), e);
+        }
+        None => {
+            guard.tree_studio.remove(&path);
+            guard.tree_base.remove(&path);
+        }
+    }
+    persist_base(&guard)?;
+    debug!(path = %path, "apply confirmed by plugin; tree_base advanced");
+    Ok(())
+}
+
+/// A4/M14 apply-NAK: the plugin could NOT apply a Studio-direction push
+/// (`TryBeginRecording` returned nil — user dragging a handle / another
+/// recording open — or the target instance could not be resolved). Drop the
+/// pending apply WITHOUT advancing `tree_base`, so the divergence stays real and
+/// the next reconcile re-detects it, and surface a `SyncError` so the failure is
+/// visible instead of silently swallowed (`swallow-1`). Because base stays put,
+/// a later user edit from Studio's still-old content raises a conflict rather
+/// than cascading into an overwrite of disk content that never reached Studio.
+async fn handle_file_apply_failed(
+    state: &SharedState,
+    path: String,
+    reason: String,
+    bcast_tx: &broadcast::Sender<Arc<ServerMsg>>,
+) -> Result<()> {
+    let had_pending = {
+        let mut guard = state.write().await;
+        guard.pending_applies.remove(&path).is_some()
+    };
+    if !had_pending {
+        trace!(path = %path, "FileApplyFailed with no pending apply; ignoring");
+        return Ok(());
+    }
+    warn!(
+        path = %path,
+        reason = %reason,
+        "plugin could not apply Studio change; leaving tree_base unadvanced so the divergence re-detects"
+    );
+    broadcast_server_msg(
+        state,
+        bcast_tx,
+        ServerMsg::SyncError {
+            kind: SyncErrorKind::HandlerFailed,
+            path,
+            reason: format!("Studio could not apply the change: {reason}"),
+        },
+    )
+    .await;
+    Ok(())
+}
+
+/// A4/M14 old-plugin timeout fallback. A current plugin ACKs a Studio-direction
+/// push within a round-trip, so `pending_applies` normally drains via
+/// `handle_file_applied`. But a pre-A4 plugin never sends `FileApplied`, and a
+/// frame can be lost — either would wedge the path forever (`tree_base` frozen,
+/// spurious conflicts on the next edit). So once an entry is older than
+/// `APPLY_ACK_TIMEOUT_SECS`, advance the trees anyway, restoring the legacy
+/// "advance on broadcast" behaviour for that path. A current plugin never
+/// reaches this branch; it is the documented escape hatch, not the happy path.
+async fn sweep_pending_applies(state: &SharedState) -> Result<()> {
+    let timeout = std::time::Duration::from_secs(APPLY_ACK_TIMEOUT_SECS);
+    let mut guard = state.write().await;
+    if guard.pending_applies.is_empty() {
+        return Ok(());
+    }
+    let now = std::time::Instant::now();
+    let expired: Vec<String> = guard
+        .pending_applies
+        .iter()
+        .filter(|(_, p)| now.duration_since(p.since) >= timeout)
+        .map(|(k, _)| k.clone())
+        .collect();
+    if expired.is_empty() {
+        return Ok(());
+    }
+    for path in &expired {
+        let Some(pending) = guard.pending_applies.remove(path) else {
+            continue;
+        };
+        match pending.entry {
+            Some(e) => {
+                guard.tree_studio.insert(path.clone(), e.clone());
+                guard.tree_base.insert(path.clone(), e);
+            }
+            None => {
+                guard.tree_studio.remove(path);
+                guard.tree_base.remove(path);
+            }
+        }
+        warn!(
+            path = %path,
+            timeout_secs = APPLY_ACK_TIMEOUT_SECS,
+            "apply-ACK timeout: advancing tree_base without confirmation (old plugin or lost FileApplied)"
+        );
+    }
+    persist_base(&guard)?;
+    Ok(())
+}
+
 async fn record_conflict(
     state: &SharedState,
     conflict: FileConflict,
     bcast_tx: &broadcast::Sender<Arc<ServerMsg>>,
 ) -> Result<()> {
     let mut guard = state.write().await;
+    // A4: a conflict is now authoritative over this path — drop any in-flight
+    // Studio-direction push. Otherwise a late `FileApplied` could advance
+    // tree_base to the pushed content while the user is resolving, corrupting
+    // the resolution snapshot.
+    guard.pending_applies.remove(&conflict.path);
     if guard.pending_conflicts.contains_key(&conflict.path) {
         // A conflict for this path is already waiting for the user to resolve
         // it in the UI. Overwriting it would corrupt the resolution: the user
@@ -2235,6 +2446,11 @@ async fn handle_studio_changed(
         content: content.clone(),
         sha256: actual_sha.clone(),
     };
+    // A4: a genuine Studio-side edit is authoritative about what Studio holds
+    // now, superseding any push we were still waiting to have confirmed. Drop
+    // the pending apply so a late `FileApplied` for the old push can't advance
+    // tree_base to content Studio no longer has.
+    guard.pending_applies.remove(&path);
     guard.tree_studio.insert(path.clone(), entry);
     // Bootstrap-diverge echoes use a 2-way compare (Studio vs IDE) instead
     // of the 3-way merge. The merge engine's "only one side changed
@@ -2297,6 +2513,9 @@ async fn handle_studio_deleted(
         warn!(path = %path, error = ?e, "rejecting client file_deleted: unsafe path");
         return Ok(());
     }
+    // A4: a Studio-side delete is authoritative — supersede any pending push we
+    // were still waiting to confirm for this path.
+    guard.pending_applies.remove(&path);
     if guard.tree_studio.remove(&path).is_none() {
         return Ok(());
     }
@@ -2868,6 +3087,13 @@ async fn handle_studio_renamed(
         sha256: actual_sha.clone(),
     };
 
+    // A4: renames are plugin-reported — both sides already moved in Studio — so
+    // the tree updates below advance tree_base directly (no ACK to wait on). But
+    // any push still pending for the old or new path is now moot; a late
+    // `FileApplied` for it must not resurrect a stale tree_base entry. Drop them.
+    guard.pending_applies.remove(&old_path);
+    guard.pending_applies.remove(&new_path);
+
     if matches!(case, RenameCase::DirToDir) {
         let old_dir_prefix = format!(
             "{}/",
@@ -2888,6 +3114,11 @@ async fn handle_studio_renamed(
         rekey_tree(&mut guard.tree_studio, &old_dir_prefix, &new_dir_prefix);
         rekey_meta(&mut guard.meta, &old_dir_prefix, &new_dir_prefix);
         rekey_meta_attributes(&mut guard.meta_attributes, &old_dir_prefix, &new_dir_prefix);
+        // A4: drop any pending push for a descendant of the moved directory —
+        // its old key no longer exists, so a late ACK would resurrect a phantom.
+        guard
+            .pending_applies
+            .retain(|k, _| !k.starts_with(&old_dir_prefix));
     } else {
         guard.tree_fs.remove(&old_path);
         guard.tree_base.remove(&old_path);
@@ -4311,6 +4542,13 @@ async fn run_plugin_session(
     // Skip missed ticks instead of bursting (a future async stall could
     // otherwise queue up multiple ticks back-to-back and kill the loop).
     idle_check.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    // A4/M14: sweep `pending_applies` for pushes that never got a `FileApplied`
+    // (old plugin / lost frame) and advance them past the timeout. Runs on its
+    // own short cadence so the fallback latency is a few seconds, not the 30s
+    // idle-check period.
+    let mut apply_sweep =
+        tokio::time::interval(std::time::Duration::from_secs(APPLY_SWEEP_CHECK_SECS));
+    apply_sweep.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     let mut last_activity = std::time::Instant::now();
     // Per-connection token bucket to bound how many inbound frames the
     // daemon's main loop has to parse per second. See RATE_LIMIT_*.
@@ -4412,6 +4650,15 @@ async fn run_plugin_session(
                         "closing idle plugin connection (no inbound frame inside timeout)"
                     );
                     break;
+                }
+            }
+            _ = apply_sweep.tick() => {
+                // A4/M14 old-plugin timeout fallback. A current plugin ACKs a
+                // Studio-direction push within a round-trip, so this normally
+                // finds nothing; it only fires for a pre-A4 plugin that never
+                // sends FileApplied, or a genuinely lost ACK.
+                if let Err(e) = sweep_pending_applies(&state).await {
+                    warn!(%peer, error = ?e, "sweep_pending_applies failed");
                 }
             }
         }
@@ -4982,6 +5229,8 @@ async fn dispatch_client_frame(
         ClientMsg::FileDeleted { .. } => "file_deleted",
         ClientMsg::NameCollision { .. } => "name_collision",
         ClientMsg::Hello { .. } => "hello",
+        ClientMsg::FileApplied { .. } => "file_applied",
+        ClientMsg::FileApplyFailed { .. } => "file_apply_failed",
         _ => "other",
     };
     info!(kind = msg_kind_label, "dispatch_client_frame");
@@ -5162,6 +5411,16 @@ async fn dispatch_client_frame(
             // can absorb the trickle.
             broadcast_server_msg(state, bcast_tx, ServerMsg::Pong { seq }).await;
             Ok(())
+        }
+        ClientMsg::FileApplied { path, sha256 } => {
+            // A4/M14 apply-ACK: the plugin confirmed applying a Studio-direction
+            // push. Advance tree_base/tree_studio now that both sides agree.
+            handle_file_applied(state, path, sha256).await
+        }
+        ClientMsg::FileApplyFailed { path, reason } => {
+            // A4/M14 apply-NAK: Studio could not apply. Drop the pending apply
+            // (base stays put) and surface the failure instead of swallowing it.
+            handle_file_apply_failed(state, path, reason, bcast_tx).await
         }
     }
 }
@@ -6249,7 +6508,8 @@ mod bulk_tests {
     //! of the `BulkSyncAction` match in `apply_bulk_resolution`.
 
     use super::{
-        apply_bulk_resolution, apply_bulk_resolutions, prune_all_empty_subdirs, BulkSyncResolution,
+        apply_bulk_resolution, apply_bulk_resolutions, handle_file_applied, prune_all_empty_subdirs,
+        BulkSyncResolution,
     };
     use std::sync::Arc;
     use std::time::Duration;
@@ -6339,6 +6599,18 @@ mod bulk_tests {
         );
     }
 
+    /// A4 apply-ACK helper: simulate the plugin confirming it applied a
+    /// Studio-direction push of `content` to `path`. A bulk push now only
+    /// advances `tree_base`/`tree_studio` once this arrives (before it the
+    /// change lives in `pending_applies`), so tests that assert the advanced
+    /// trees must drive the ACK the same way a live plugin would.
+    async fn ack(env: &Env, path: &str, content: &str) {
+        let sha = yeet_daemon::state::sha256_hex(content.as_bytes());
+        handle_file_applied(&env.state, path.to_owned(), sha)
+            .await
+            .expect("apply ack");
+    }
+
     // ─── KeepStudio: Studio content overwrites disk ──────────────────────
 
     #[tokio::test]
@@ -6395,9 +6667,28 @@ mod bulk_tests {
         let msgs = drain(&mut rx).await;
         let pushed = msgs.iter().any(|m| matches!(m, ServerMsg::FileChanged { path, content, .. } if path == "src/Foo.luau" && content == "disk_authoritative"));
         assert!(pushed, "expected FileChanged with disk content; got {msgs:?}");
+        // A4: the push is broadcast but tree_studio only advances once the
+        // plugin ACKs applying it. Before the ACK it sits in pending_applies.
+        {
+            let guard = env.state.read().await;
+            assert_eq!(
+                guard.tree_studio.get("src/Foo.luau").map(|e| e.content.as_str()),
+                Some("stale_studio"),
+                "tree_studio must NOT advance before the plugin confirms the apply"
+            );
+            assert!(
+                guard.pending_applies.contains_key("src/Foo.luau"),
+                "the unconfirmed push must be held in pending_applies"
+            );
+        }
+        ack(&env, "src/Foo.luau", "disk_authoritative").await;
         let guard = env.state.read().await;
         let entry = guard.tree_studio.get("src/Foo.luau").expect("studio entry");
         assert_eq!(entry.content, "disk_authoritative");
+        assert!(
+            !guard.pending_applies.contains_key("src/Foo.luau"),
+            "pending apply must clear once confirmed"
+        );
     }
 
     #[tokio::test]
@@ -6671,6 +6962,12 @@ mod bulk_tests {
             "Skip should not touch disk"
         );
 
+        // A4: the two Studio-direction pushes (PullToStudio, KeepIde) are
+        // broadcast but only advance tree_studio once the plugin confirms the
+        // apply. Drive the ACKs the way a live plugin would before asserting.
+        ack(&env, "src/IdeOnly.luau", "fresh_from_ide").await;
+        ack(&env, "src/SharedKeep.luau", "ide_keeps").await;
+
         let guard = env.state.read().await;
         assert_eq!(
             guard
@@ -6701,8 +6998,8 @@ mod fs_removed_pending_tests {
     //! bootstrap, fire raw `FileEvent`s, inspect broadcasts + tree state.
 
     use super::{
-        delete_on_studio, handle_fs_event, handle_studio_renamed, perform_rename_io, RenameCase,
-        FS_RENAME_PAIR_TTL,
+        delete_on_studio, handle_file_applied, handle_fs_event, handle_studio_renamed,
+        perform_rename_io, RenameCase, FS_RENAME_PAIR_TTL,
     };
     use std::collections::HashMap;
     use std::sync::Arc;
@@ -6712,6 +7009,20 @@ mod fs_removed_pending_tests {
     use yeet_daemon::protocol::{ScriptKind, ServerMsg};
     use yeet_daemon::state::{sha256_hex, FileMeta, ProjectState, SharedState};
     use yeet_daemon::watcher::FileEvent;
+
+    /// A4 apply-ACK helpers: after a Studio-direction push/delete, `tree_base`/
+    /// `tree_studio` only advance once the plugin confirms the apply. Tests that
+    /// assert the advanced trees drive the ACK the same way a live plugin would.
+    async fn ack(state: &SharedState, path: &str, content: &str) {
+        handle_file_applied(state, path.to_owned(), sha256_hex(content.as_bytes()))
+            .await
+            .expect("apply ack");
+    }
+    async fn ack_delete(state: &SharedState, path: &str) {
+        handle_file_applied(state, path.to_owned(), String::new())
+            .await
+            .expect("apply ack (delete)");
+    }
 
     /// A test environment: temp project root, daemon state, broadcast bus.
     /// Drop order matters — `_root` must outlive `state` (which holds paths
@@ -6830,6 +7141,22 @@ mod fs_removed_pending_tests {
             "expected FileDeleted for B too (lost under sha-keying); got {msgs:?}"
         );
 
+        // A4: the deletes are broadcast but tree_base/tree_studio only drop the
+        // paths once Studio confirms. Both are held in pending_applies until then.
+        {
+            let guard = env.state.read().await;
+            assert!(
+                guard.pending_applies.contains_key("src/A.luau"),
+                "A's delete must await confirmation in pending_applies"
+            );
+            assert!(
+                guard.pending_applies.contains_key("src/B.luau"),
+                "B's delete must await confirmation in pending_applies"
+            );
+        }
+        ack_delete(&env.state, "src/A.luau").await;
+        ack_delete(&env.state, "src/B.luau").await;
+
         let guard = env.state.read().await;
         assert!(
             !guard.tree_base.contains_key("src/A.luau"),
@@ -6901,6 +7228,10 @@ mod fs_removed_pending_tests {
             changed_b,
             "expected a normal FileChanged for B; got {msgs:?}"
         );
+
+        // A4: the FileChanged for B is broadcast but tree_studio advances only
+        // once Studio confirms applying it. Drive the ACK before asserting.
+        ack(&env.state, "src/B.luau", "local A = 1\nreturn A\n").await;
 
         let guard = env.state.read().await;
         assert_eq!(
@@ -7779,6 +8110,357 @@ mod pending_conflict_authority_tests {
             g.tree_base.get(path).map(|e| e.content.as_str()),
             Some(base),
             "an identical re-reconcile must not advance tree_base"
+        );
+    }
+}
+
+#[cfg(test)]
+mod apply_ack_tests {
+    //! Regression tests for AUDITORIA-YEET.md A4 (`swallow-1`) / M14 (`resil-2`):
+    //! the apply-ACK protocol. A Studio-direction push must NOT advance
+    //! `tree_base` ("confirmed by both sides") until the plugin confirms it
+    //! applied the change with a `FileApplied`. Before that the change lives in
+    //! `pending_applies`. A `FileApplyFailed` (or an old-plugin timeout) must not
+    //! silently advance base — that is exactly the cascade that overwrites disk
+    //! content which never reached Studio.
+    //!
+    //! Harness mirrors `pending_conflict_authority_tests`: tempdir project,
+    //! already-synced `tree_studio == tree_base == tree_fs`, drive the real
+    //! push/delete/ACK entry points, inspect trees + broadcasts.
+
+    use super::{
+        delete_on_studio, handle_file_applied, handle_file_apply_failed, handle_studio_changed,
+        push_to_studio, sweep_pending_applies, APPLY_ACK_TIMEOUT_SECS,
+    };
+    use std::sync::Arc;
+    use std::time::{Duration, Instant};
+    use tokio::sync::{broadcast, RwLock};
+    use yeet_daemon::project::Project;
+    use yeet_daemon::protocol::{ScriptKind, ServerMsg, SyncErrorKind};
+    use yeet_daemon::state::{sha256_hex, ProjectState, SharedState};
+
+    struct Env {
+        state: SharedState,
+        bcast_tx: broadcast::Sender<Arc<ServerMsg>>,
+        _root: tempfile::TempDir,
+    }
+
+    async fn make_env(disk_files: &[(&str, &str)]) -> Env {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let root = dir.path();
+        let project_json = r#"{
+            "name": "ApplyAckTest",
+            "tree": {
+                "$className": "DataModel",
+                "ServerScriptService": {
+                    "$className": "ServerScriptService",
+                    "$path": "src"
+                }
+            }
+        }"#;
+        std::fs::write(root.join("default.project.json"), project_json).expect("write project");
+        std::fs::create_dir(root.join("src")).expect("mkdir src");
+        for (rel, content) in disk_files {
+            let abs = root.join(rel);
+            if let Some(p) = abs.parent() {
+                std::fs::create_dir_all(p).expect("mkdir -p");
+            }
+            std::fs::write(&abs, content).expect("write file");
+        }
+        let project = Project::load(&root.join("default.project.json")).expect("load project");
+        let state_inner =
+            ProjectState::bootstrap(root, project, false, false).expect("bootstrap");
+        let state: SharedState = Arc::new(RwLock::new(state_inner));
+        {
+            // Already-synced: Studio agrees with disk/base.
+            let mut guard = state.write().await;
+            guard.tree_studio = guard.tree_fs.clone();
+        }
+        let (bcast_tx, _) = broadcast::channel(64);
+        Env {
+            state,
+            bcast_tx,
+            _root: dir,
+        }
+    }
+
+    async fn drain(rx: &mut broadcast::Receiver<Arc<ServerMsg>>) -> Vec<ServerMsg> {
+        let mut out = Vec::new();
+        loop {
+            match tokio::time::timeout(Duration::from_millis(20), rx.recv()).await {
+                Ok(Ok(m)) => out.push((*m).clone()),
+                _ => break,
+            }
+        }
+        out
+    }
+
+    async fn push(env: &Env, path: &str, content: &str) {
+        push_to_studio(
+            &env.state,
+            path,
+            content.to_owned(),
+            ScriptKind::ModuleScript,
+            &env.bcast_tx,
+        )
+        .await
+        .expect("push_to_studio");
+    }
+
+    async fn base_of(env: &Env, path: &str) -> Option<String> {
+        env.state
+            .read()
+            .await
+            .tree_base
+            .get(path)
+            .map(|e| e.content.clone())
+    }
+
+    async fn studio_of(env: &Env, path: &str) -> Option<String> {
+        env.state
+            .read()
+            .await
+            .tree_studio
+            .get(path)
+            .map(|e| e.content.clone())
+    }
+
+    // ─── Core A4: a push holds base+studio until the plugin ACKs ─────────
+
+    #[tokio::test]
+    async fn push_holds_base_and_studio_until_ack() {
+        let path = "src/Foo.luau";
+        let env = make_env(&[(path, "old")]).await;
+        push(&env, path, "new").await;
+
+        // Pre-ACK: neither base nor studio moved; the change is parked in
+        // pending_applies keyed by the pushed sha.
+        assert_eq!(base_of(&env, path).await.as_deref(), Some("old"));
+        assert_eq!(studio_of(&env, path).await.as_deref(), Some("old"));
+        {
+            let g = env.state.read().await;
+            let pending = g.pending_applies.get(path).expect("pending recorded");
+            assert_eq!(pending.sha256, sha256_hex(b"new"));
+        }
+
+        // ACK: both sides advance to the confirmed content, pending clears.
+        handle_file_applied(&env.state, path.to_owned(), sha256_hex(b"new"))
+            .await
+            .expect("ack");
+        assert_eq!(base_of(&env, path).await.as_deref(), Some("new"));
+        assert_eq!(studio_of(&env, path).await.as_deref(), Some("new"));
+        assert!(!env.state.read().await.pending_applies.contains_key(path));
+    }
+
+    #[tokio::test]
+    async fn apply_ack_advances_base_exactly_once() {
+        let path = "src/Foo.luau";
+        let env = make_env(&[(path, "old")]).await;
+        push(&env, path, "new").await;
+        handle_file_applied(&env.state, path.to_owned(), sha256_hex(b"new"))
+            .await
+            .expect("ack");
+        assert_eq!(base_of(&env, path).await.as_deref(), Some("new"));
+
+        // A duplicate/late ACK for the same push is a no-op: pending already
+        // cleared, so nothing is re-applied and base stays put.
+        handle_file_applied(&env.state, path.to_owned(), sha256_hex(b"new"))
+            .await
+            .expect("dup ack");
+        assert_eq!(base_of(&env, path).await.as_deref(), Some("new"));
+        assert!(!env.state.read().await.pending_applies.contains_key(path));
+    }
+
+    // ─── A4: a NAK must NOT advance base, and must surface the failure ────
+
+    #[tokio::test]
+    async fn apply_failed_leaves_base_unadvanced_and_surfaces_error() {
+        let path = "src/Foo.luau";
+        let env = make_env(&[(path, "old")]).await;
+        push(&env, path, "new").await;
+
+        let mut rx = env.bcast_tx.subscribe();
+        handle_file_apply_failed(
+            &env.state,
+            path.to_owned(),
+            "TryBeginRecording returned nil".to_owned(),
+            &env.bcast_tx,
+        )
+        .await
+        .expect("nak");
+
+        // Base stayed at the old content (no silent advance); the divergence is
+        // still real and will re-detect on the next reconcile.
+        assert_eq!(base_of(&env, path).await.as_deref(), Some("old"));
+        assert_eq!(studio_of(&env, path).await.as_deref(), Some("old"));
+        assert!(!env.state.read().await.pending_applies.contains_key(path));
+
+        // The failure is surfaced, not swallowed.
+        let msgs = drain(&mut rx).await;
+        let surfaced = msgs.iter().any(|m| {
+            matches!(m, ServerMsg::SyncError { kind: SyncErrorKind::HandlerFailed, path: p, .. }
+                if p == path)
+        });
+        assert!(surfaced, "NAK must broadcast a SyncError; got {msgs:?}");
+    }
+
+    // ─── A4: old-plugin timeout fallback advances base without an ACK ─────
+
+    #[tokio::test]
+    async fn timeout_fallback_advances_base_for_old_plugin() {
+        let path = "src/Foo.luau";
+        let env = make_env(&[(path, "old")]).await;
+        push(&env, path, "new").await;
+
+        // Age the pending entry past the ACK timeout to simulate a pre-A4
+        // plugin that applied the change but never learned to ACK.
+        {
+            let mut g = env.state.write().await;
+            let pending = g.pending_applies.get_mut(path).expect("pending");
+            pending.since = Instant::now()
+                .checked_sub(Duration::from_secs(APPLY_ACK_TIMEOUT_SECS + 5))
+                .expect("clock underflow");
+        }
+        sweep_pending_applies(&env.state).await.expect("sweep");
+
+        assert_eq!(base_of(&env, path).await.as_deref(), Some("new"));
+        assert_eq!(studio_of(&env, path).await.as_deref(), Some("new"));
+        assert!(!env.state.read().await.pending_applies.contains_key(path));
+    }
+
+    #[tokio::test]
+    async fn timeout_sweep_leaves_fresh_pending_alone() {
+        let path = "src/Foo.luau";
+        let env = make_env(&[(path, "old")]).await;
+        push(&env, path, "new").await;
+
+        // A just-recorded pending is well inside the timeout — the sweep must
+        // not touch it (that would defeat the whole point of waiting for ACK).
+        sweep_pending_applies(&env.state).await.expect("sweep");
+        assert_eq!(base_of(&env, path).await.as_deref(), Some("old"));
+        assert!(env.state.read().await.pending_applies.contains_key(path));
+    }
+
+    // ─── A4: a stale ACK for a superseded push is ignored ────────────────
+
+    #[tokio::test]
+    async fn stale_ack_for_superseded_push_is_ignored() {
+        let path = "src/Foo.luau";
+        let env = make_env(&[(path, "old")]).await;
+        push(&env, path, "v1").await;
+        push(&env, path, "v2").await; // supersedes v1; pending now tracks v2
+
+        // The plugin ACKs the OLD push. Its sha no longer matches the pending,
+        // so it must be ignored — advancing to v1 would clobber the v2 intent.
+        handle_file_applied(&env.state, path.to_owned(), sha256_hex(b"v1"))
+            .await
+            .expect("stale ack");
+        assert_eq!(base_of(&env, path).await.as_deref(), Some("old"));
+        {
+            let g = env.state.read().await;
+            assert_eq!(
+                g.pending_applies.get(path).expect("pending still v2").sha256,
+                sha256_hex(b"v2")
+            );
+        }
+
+        // The ACK that matches the current push advances base to v2.
+        handle_file_applied(&env.state, path.to_owned(), sha256_hex(b"v2"))
+            .await
+            .expect("current ack");
+        assert_eq!(base_of(&env, path).await.as_deref(), Some("v2"));
+    }
+
+    // ─── A4: delete is gated the same way ────────────────────────────────
+
+    #[tokio::test]
+    async fn delete_holds_base_until_ack() {
+        let path = "src/Foo.luau";
+        let env = make_env(&[(path, "old")]).await;
+        delete_on_studio(&env.state, path, &env.bcast_tx)
+            .await
+            .expect("delete_on_studio");
+
+        // Pre-ACK: base/studio still hold the file; the delete is pending with
+        // the empty-string sentinel.
+        assert_eq!(base_of(&env, path).await.as_deref(), Some("old"));
+        {
+            let g = env.state.read().await;
+            let pending = g.pending_applies.get(path).expect("pending delete");
+            assert_eq!(pending.sha256, "");
+            assert!(pending.entry.is_none());
+        }
+
+        // ACK (empty sha for a delete): both trees drop the path.
+        handle_file_applied(&env.state, path.to_owned(), String::new())
+            .await
+            .expect("ack delete");
+        let g = env.state.read().await;
+        assert!(!g.tree_base.contains_key(path));
+        assert!(!g.tree_studio.contains_key(path));
+        assert!(!g.pending_applies.contains_key(path));
+    }
+
+    // ─── A4 cascade: a Studio edit that lands before the push is confirmed
+    //     supersedes the pending, and a late ACK cannot resurrect it ──────
+
+    #[tokio::test]
+    async fn studio_edit_supersedes_pending_and_prevents_overwrite_cascade() {
+        let path = "src/Foo.luau";
+        let env = make_env(&[(path, "old")]).await;
+
+        // Disk changed to "disknew" (git pull / format-on-save); the reconcile
+        // pushes it to Studio. Model that: tree_fs=disknew, push disknew.
+        {
+            let mut g = env.state.write().await;
+            g.tree_fs.insert(
+                path.to_owned(),
+                yeet_daemon::tree::TreeEntry {
+                    kind: ScriptKind::ModuleScript,
+                    content: "disknew".to_owned(),
+                    sha256: sha256_hex(b"disknew"),
+                },
+            );
+        }
+        push(&env, path, "disknew").await; // pending{disknew}; base/studio still "old"
+
+        // Studio was busy and never applied it. The user then edits the still-old
+        // script in Studio → the plugin reports the real Studio content.
+        let mut rx = env.bcast_tx.subscribe();
+        handle_studio_changed(
+            &env.state,
+            path.to_owned(),
+            "useredit".to_owned(),
+            sha256_hex(b"useredit"),
+            None,
+            false,
+            &env.bcast_tx,
+        )
+        .await
+        .expect("studio edit");
+        let _ = drain(&mut rx).await;
+
+        // The genuine Studio event supersedes the pending push.
+        assert!(
+            !env.state.read().await.pending_applies.contains_key(path),
+            "a real Studio edit must clear the pending push"
+        );
+        // studio (old) vs fs (disknew) both diverge from base (old) differently →
+        // a conflict, NOT a silent overwrite of the disk content.
+        assert!(
+            env.state.read().await.pending_conflicts.contains_key(path),
+            "the overlapping edit must raise a conflict, not overwrite disk"
+        );
+
+        // A late, now-stale ACK for the original push must NOT advance base to
+        // "disknew" (which would be the swallow-1 cascade).
+        handle_file_applied(&env.state, path.to_owned(), sha256_hex(b"disknew"))
+            .await
+            .expect("late stale ack");
+        assert_eq!(
+            base_of(&env, path).await.as_deref(),
+            Some("old"),
+            "a stale ACK must never advance base behind a live conflict"
         );
     }
 }

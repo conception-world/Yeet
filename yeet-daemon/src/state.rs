@@ -32,6 +32,34 @@ pub struct FsRemovedPending {
     pub since: Instant,
 }
 
+/// A Studio-direction change the daemon has broadcast but the plugin has not
+/// yet confirmed applying (AUDITORIA-YEET.md A4 / M14 `resil-2`). Held in
+/// `ProjectState::pending_applies` between `push_to_studio`/`delete_on_studio`/
+/// the AutoMerge broadcast and the plugin's `FileApplied`. `tree_base` and
+/// `tree_studio` are NOT advanced while an entry is pending — only a matching
+/// `FileApplied` (or the old-plugin timeout fallback) advances them. This is
+/// what stops the daemon from believing Studio synced when `withRecording`
+/// silently failed, which used to cascade into overwriting disk content that
+/// never reached Studio.
+#[derive(Debug, Clone)]
+pub struct PendingApply {
+    /// The sha the plugin must echo in `FileApplied` for the confirmation to
+    /// count. Equals `entry.sha256` for a write; the empty string for a delete
+    /// (there is no content to hash). A `FileApplied` whose sha does not match
+    /// is a stale ACK for a superseded push and is ignored.
+    pub sha256: String,
+    /// The tree entry to install into `tree_base`/`tree_studio` once confirmed.
+    /// `None` means the pending op is a delete — confirmation removes the path
+    /// from both trees instead.
+    pub entry: Option<TreeEntry>,
+    /// When the change was first broadcast. Drives the old-plugin timeout
+    /// fallback: a plugin that never learned to send `FileApplied` would
+    /// otherwise stall the path forever, so after `APPLY_ACK_TIMEOUT_SECS` the
+    /// daemon advances the trees anyway (restoring the legacy behaviour) rather
+    /// than leaving Studio and disk wedged.
+    pub since: Instant,
+}
+
 /// How the file encoded line endings on disk. We canonicalize to LF internally;
 /// this is kept per-file so we can write back in the same flavor the file was
 /// originally in, rather than forcing one on the user.
@@ -165,6 +193,15 @@ pub struct ProjectState {
     /// Delete+Create — preserves Studio-side state (attributes, tags,
     /// non-script children) across IDE-side renames.
     pub fs_removed_pending: HashMap<String, FsRemovedPending>,
+    /// Studio-direction changes broadcast to the plugin but not yet confirmed
+    /// applied (AUDITORIA-YEET.md A4 / M14). Keyed by path. `tree_base`/
+    /// `tree_studio` for a path stay at their old value while an entry sits
+    /// here; the plugin's `FileApplied` (or the timeout fallback in
+    /// `sweep_pending_applies`) is what advances them. Cleared on a real
+    /// Studio-side event for the path (a genuine `FileChanged`/`FileDeleted`/
+    /// `FileRenamed` supersedes the optimistic push) and on `rotate_session_id`
+    /// (a fresh handshake re-syncs the whole tree, so in-flight pushes are moot).
+    pub pending_applies: HashMap<String, PendingApply>,
 }
 
 pub type SharedState = Arc<RwLock<ProjectState>>;
@@ -238,6 +275,7 @@ impl ProjectState {
             auth_token,
             pending_collisions: HashSet::new(),
             fs_removed_pending: HashMap::new(),
+            pending_applies: HashMap::new(),
         };
         state.rescan_fs()?;
         if let Some(persisted) = tree::load_base_tree(root)? {
@@ -288,6 +326,11 @@ impl ProjectState {
         let new_id = uuid::Uuid::new_v4().to_string();
         let old_id = std::mem::replace(&mut self.session_id, new_id.clone());
         self.pending_deltas.clear();
+        // A4: in-flight Studio-direction pushes belong to the old session. The
+        // next connection re-bootstraps the whole tree, so a lingering
+        // `pending_applies` entry (and its deferred `tree_base` advance) would
+        // be meaningless — drop them with the buffer.
+        self.pending_applies.clear();
         self.rotation_count = self.rotation_count.saturating_add(1);
         tracing::info!(
             old = %old_id,
