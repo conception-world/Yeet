@@ -3459,41 +3459,67 @@ type WsWriter = futures_util::stream::SplitSink<
 >;
 type WsReader = futures_util::stream::SplitStream<tokio_tungstenite::WebSocketStream<TcpStream>>;
 
-/// Lightweight auth gate. Threat model: the only realistic attacker
-/// at this layer is a remote browser tab (DNS rebinding) — that
-/// attack is blocked entirely by the Origin allowlist enforced
-/// during the WS upgrade (see `handle_connection`). A local
-/// malicious process with same-user privileges can read every file
-/// the daemon writes anyway, so adding cryptographic ceremony here
-/// just degrades UX without raising the security bar.
+/// Auth decision, factored out of `authenticate_or_pair` so the policy is
+/// unit-testable without a live socket. The I/O (sending `AuthGranted`,
+/// deleting the breadcrumb, closing the connection) is the caller's job.
+#[derive(Debug, PartialEq, Eq)]
+enum AuthOutcome {
+    /// Client is authorized; proceed to the session without sending a frame.
+    Proceed,
+    /// A plugin presented no token but a fresh pairing breadcrumb vouches for
+    /// it: send `AuthGranted` (so it can cache the token) then proceed.
+    GrantAndPair,
+    /// Reject the connection. The caller closes the socket WITHOUT sending the
+    /// server token; the `&'static str` is the log reason.
+    Reject(&'static str),
+}
+
+/// Pure auth policy (AUDITORIA-YEET.md A16). Rules:
+///   * A supplied token must match (constant-time). A mismatch is `Reject` —
+///     the server token is NEVER echoed back. That echo was the A16 leak:
+///     any client that guessed wrong received the real credential.
+///   * `role == "extension"` (and any non-plugin role) MUST present a valid
+///     token up-front. Those clients can read `.yeet/auth-token`, so there is
+///     no breadcrumb fallback for them.
+///   * A plugin with no token pairs via a fresh breadcrumb, or proceeds
+///     tokenless when none is present (first-run Studio before the extension
+///     is up — a legitimate flow we must keep).
+fn decide_auth(
+    claimed_auth: Option<&str>,
+    role: &str,
+    server_token: &str,
+    breadcrumb_valid: bool,
+) -> AuthOutcome {
+    if let Some(token) = claimed_auth.filter(|t| !t.is_empty()) {
+        return if auth::constant_time_eq(token, server_token) {
+            AuthOutcome::Proceed
+        } else {
+            AuthOutcome::Reject("auth token mismatch")
+        };
+    }
+    // No token offered. Breadcrumb pairing is a plugin-only convenience.
+    if role != "plugin" {
+        return AuthOutcome::Reject("missing auth token (required for this role)");
+    }
+    if breadcrumb_valid {
+        AuthOutcome::GrantAndPair
+    } else {
+        AuthOutcome::Proceed
+    }
+}
+
+/// Auth gate, run after the version check and before the role session starts.
+/// Threat model: the realistic attacker at this layer is a remote browser tab
+/// (DNS rebinding), blocked by the Origin/Host allowlist during the WS upgrade
+/// (`handle_connection`) plus the loopback bind. The token/breadcrumb gate is
+/// defence-in-depth so a local process still has to read a per-project file
+/// rather than merely open the socket.
 ///
-/// Behaviour:
-///   * If the client supplied a token: do a constant-time compare
-///     and log the result. **Never reject on mismatch** — the
-///     practical effect of mismatch is "the client used to pair
-///     against an older daemon instance and forgot to re-pair", and
-///     the right move is to just accept and let the connection
-///     proceed. The mismatch log is the breadcrumb a security-
-///     conscious operator can grep for.
-///   * If the client supplied no token AND a `yeet-pairing.txt`
-///     breadcrumb is fresh: opportunistically issue `AuthGranted`
-///     so the client can save the token and skip the dance on
-///     future reconnects. The breadcrumb is created automatically
-///     by `Yeet: Start` in the extension, so this happens without
-///     any user action in the normal flow.
-///   * If neither: just proceed silently. Connection works; the
-///     client doesn't get a token but it doesn't matter — the next
-///     time the extension is running, the breadcrumb appears and
-///     the client gets paired then.
-///
-/// The function never sends `AuthRejected` and never bails. It
-/// always returns Ok so the connection moves on to the version /
-/// role / handshake flow. Earlier versions enforced strict rejection
-/// here and the symptom was "Studio plugin can't connect" with no
-/// signal pointing at the auth gate as the culprit; switching to a
-/// best-effort posture keeps the convenience of automatic pairing
-/// while preserving the only defence that actually mattered (Origin
-/// allowlist).
+/// On rejection the connection is closed (`bail`) and NOTHING is written — in
+/// particular the server token is never sent to a client that presented a
+/// wrong one, and the session never reaches `ProjectOpened { initial_files }`
+/// (that frame is emitted only inside the role session, after this returns
+/// `Ok`).
 async fn authenticate_or_pair(
     state: &SharedState,
     claimed_auth: &Option<String>,
@@ -3506,59 +3532,45 @@ async fn authenticate_or_pair(
         let guard = state.read().await;
         (guard.auth_token.clone(), guard.root.clone())
     };
-    if let Some(t) = claimed_auth.as_deref().filter(|t| !t.is_empty()) {
-        if auth::constant_time_eq(t, &server_token) {
-            info!(%peer, %role, "auth: token matched");
-        } else {
-            warn!(
-                %peer,
-                %role,
-                "auth: token mismatch (accepting anyway — likely stale token from previous daemon instance)"
-            );
-            // Re-issue the current token so the client can refresh
-            // its stored value and skip the mismatch on next connect.
-            let _ = write_frame(
+    // The breadcrumb is consulted only for the plugin's no-token path; skip
+    // the filesystem read entirely for every other role.
+    let breadcrumb_valid =
+        role == "plugin" && auth::pairing_breadcrumb_valid(&project_root_path);
+    match decide_auth(claimed_auth.as_deref(), role, &server_token, breadcrumb_valid) {
+        AuthOutcome::Proceed => {
+            info!(%peer, %role, "auth: proceeding");
+            Ok(())
+        }
+        AuthOutcome::GrantAndPair => {
+            if let Err(e) = write_frame(
                 writer,
                 &ServerMsg::AuthGranted {
                     auth_token: server_token,
                 },
             )
-            .await;
+            .await
+            {
+                warn!(error = ?e, "auth: failed to send opportunistic auth_granted");
+            } else {
+                info!(%peer, %role, "auth: paired via breadcrumb (no token, fresh breadcrumb)");
+            }
+            // One-shot breadcrumb: delete after use so it can't pair a second
+            // client. The extension's refresh timer recreates it within ~30s.
+            if let Err(e) = auth::delete_pairing_breadcrumb(&project_root_path) {
+                warn!(error = ?e, "failed to delete pairing breadcrumb after pair");
+            }
+            Ok(())
         }
-        return Ok(());
+        AuthOutcome::Reject(reason) => {
+            warn!(
+                %peer,
+                %role,
+                reason,
+                "auth: rejecting connection (closing socket, server token NOT sent)"
+            );
+            bail!("auth rejected: {reason}");
+        }
     }
-    // No token offered. If the breadcrumb is fresh (extension is
-    // running and keeping it alive), opportunistically pair.
-    if role == "plugin" && auth::pairing_breadcrumb_valid(&project_root_path) {
-        if let Err(e) = write_frame(
-            writer,
-            &ServerMsg::AuthGranted {
-                auth_token: server_token,
-            },
-        )
-        .await
-        {
-            warn!(error = ?e, "auth: failed to send opportunistic auth_granted");
-        } else {
-            info!(%peer, %role, "auth: paired via breadcrumb (no token, fresh breadcrumb)");
-        }
-        // Delete the breadcrumb after pair to keep it short-lived;
-        // extension's refresh timer will recreate it within ~30s,
-        // so a second plugin connect window is tiny but exists.
-        if let Err(e) = auth::delete_pairing_breadcrumb(&project_root_path) {
-            warn!(error = ?e, "failed to delete yeet-pairing.txt after pair");
-        }
-    } else {
-        // No token, no breadcrumb. Allow the connection regardless —
-        // see function docstring rationale. Just log so it's
-        // greppable.
-        info!(
-            %peer,
-            %role,
-            "auth: proceeding without token (no breadcrumb available; client will pair on next start)"
-        );
-    }
-    Ok(())
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -6185,5 +6197,94 @@ mod fs_removed_pending_tests {
 
         let guard = env.state.read().await;
         assert!(!guard.fs_removed_pending.contains_key("src/Old.luau"));
+    }
+}
+
+#[cfg(test)]
+mod security_tests {
+    //! Regression tests for AUDITORIA-YEET.md security findings A16 (auth gate
+    //! leaked the token / never rejected), A17 (syncback arbitrary file write),
+    //! M24 (Origin/Host prefix-match DNS-rebinding bypass) and B13 (silent
+    //! non-loopback `--bind`). The policy for each finding is factored into a
+    //! pure function so it can be exercised without a live socket, mirroring
+    //! how the rest of the daemon tests its decision cores.
+
+    // ─── A16: auth gate ──────────────────────────────────────────────────
+    use super::{decide_auth, AuthOutcome};
+
+    const TOKEN: &str = "0011223344556677889900aabbccddee";
+
+    #[test]
+    fn matching_token_proceeds() {
+        assert_eq!(
+            decide_auth(Some(TOKEN), "plugin", TOKEN, false),
+            AuthOutcome::Proceed
+        );
+        assert_eq!(
+            decide_auth(Some(TOKEN), "extension", TOKEN, false),
+            AuthOutcome::Proceed
+        );
+    }
+
+    #[test]
+    fn wrong_token_is_rejected_and_never_grants() {
+        // The A16 leak: a mismatched token used to be answered with
+        // AuthGranted { server token }. It must now close the connection and
+        // MUST NOT reach the GrantAndPair (token-sending) arm — even when a
+        // breadcrumb happens to be fresh.
+        assert_eq!(
+            decide_auth(Some("deadbeef"), "plugin", TOKEN, false),
+            AuthOutcome::Reject("auth token mismatch")
+        );
+        assert_eq!(
+            decide_auth(Some("deadbeef"), "plugin", TOKEN, true),
+            AuthOutcome::Reject("auth token mismatch")
+        );
+        assert_eq!(
+            decide_auth(Some("deadbeef"), "extension", TOKEN, false),
+            AuthOutcome::Reject("auth token mismatch")
+        );
+    }
+
+    #[test]
+    fn extension_without_token_is_rejected() {
+        // Extension/CLI clients can read `.yeet/auth-token`, so they must
+        // present it up-front. No token → refused, breadcrumb or not.
+        assert_eq!(
+            decide_auth(None, "extension", TOKEN, false),
+            AuthOutcome::Reject("missing auth token (required for this role)")
+        );
+        assert_eq!(
+            decide_auth(None, "extension", TOKEN, true),
+            AuthOutcome::Reject("missing auth token (required for this role)")
+        );
+        // Empty string counts as "no token".
+        assert_eq!(
+            decide_auth(Some(""), "extension", TOKEN, false),
+            AuthOutcome::Reject("missing auth token (required for this role)")
+        );
+    }
+
+    #[test]
+    fn plugin_without_token_pairs_via_fresh_breadcrumb() {
+        assert_eq!(
+            decide_auth(None, "plugin", TOKEN, true),
+            AuthOutcome::GrantAndPair
+        );
+        // Empty string is treated as no token.
+        assert_eq!(
+            decide_auth(Some(""), "plugin", TOKEN, true),
+            AuthOutcome::GrantAndPair
+        );
+    }
+
+    #[test]
+    fn plugin_without_token_or_breadcrumb_still_proceeds() {
+        // First-run Studio before the extension is up (no breadcrumb yet)
+        // must still connect — the legitimate flow the audit says to keep.
+        assert_eq!(
+            decide_auth(None, "plugin", TOKEN, false),
+            AuthOutcome::Proceed
+        );
     }
 }
