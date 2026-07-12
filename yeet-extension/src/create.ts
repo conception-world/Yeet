@@ -98,6 +98,7 @@ export async function createProject(output: vscode.OutputChannel): Promise<void>
 		output.appendLine(`[yeet:create] scaffolded ${rel}`);
 	}
 
+	writeInitialSourcemap(folder, project, output);
 	writeGitignore(folder, output);
 
 	if (skipped.length > 0) {
@@ -246,6 +247,65 @@ function applyPath(tree: TreeNode, segments: string[], relDir: string): void {
 		node = next;
 	}
 	node["$path"] = relDir;
+}
+
+/// One node of a Rojo-format `sourcemap.json`. luau-lsp reads this to resolve
+/// `game.ServerScriptService.Foo`, `require(Packages.X)`, and Wally package
+/// types; without it a freshly-scaffolded project has no type resolution at all.
+interface SourcemapNode {
+	name: string;
+	className: string;
+	filePaths: string[];
+	children: SourcemapNode[];
+}
+
+/// Emits an initial `sourcemap.json` at the project root mirroring the scaffold
+/// (the KNOWN_SERVICES → `src/<Service>` mounts). It carries only the empty
+/// service nodes so the LSP has a valid DataModel root immediately after
+/// `Yeet: Create`; the daemon regenerates it with per-file detail as soon as
+/// `Yeet: Start` scans the tree. Deriving it from the same `tree` we just wrote
+/// keeps the two files structurally in sync.
+function writeInitialSourcemap(
+	folder: string,
+	project: ProjectJson,
+	output: vscode.OutputChannel,
+): void {
+	const rootClass =
+		typeof project.tree.$className === "string" ? project.tree.$className : "DataModel";
+	const sourcemap: SourcemapNode = {
+		name: project.name,
+		className: rootClass,
+		filePaths: [],
+		children: treeToSourcemapChildren(project.tree),
+	};
+	const file = path.join(folder, "sourcemap.json");
+	fs.writeFileSync(file, `${JSON.stringify(sourcemap, null, 2)}\n`, "utf8");
+	output.appendLine("[yeet:create] wrote sourcemap.json");
+}
+
+/// Recursively converts a `default.project.json` tree's instance children into
+/// sourcemap nodes. `$`-prefixed keys (`$className`, `$path`, ...) are metadata,
+/// not instances, so they're skipped. A node's className comes from its
+/// `$className` when set, else the instance name itself — services' ClassName
+/// equals their name, so this is correct for the scaffold's KNOWN_SERVICES.
+function treeToSourcemapChildren(node: TreeNode): SourcemapNode[] {
+	const children: SourcemapNode[] = [];
+	for (const [key, value] of Object.entries(node)) {
+		if (key.startsWith("$")) {
+			continue;
+		}
+		if (typeof value !== "object" || value === null) {
+			continue;
+		}
+		const className = typeof value.$className === "string" ? value.$className : key;
+		children.push({
+			name: key,
+			className,
+			filePaths: [],
+			children: treeToSourcemapChildren(value),
+		});
+	}
+	return children;
 }
 
 function writeGitignore(folder: string, output: vscode.OutputChannel): void {
