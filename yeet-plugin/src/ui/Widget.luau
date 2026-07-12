@@ -587,7 +587,7 @@ type WidgetSettings = {
 function Widget.new(plugin: Plugin, initialSettings: WidgetSettings?): Widget
   local info = DockWidgetPluginGuiInfo.new(Enum.InitialDockState.Right, false, false, 320, 480, 280, 360)
   local gui = plugin:CreateDockWidgetPluginGui(WIDGET_ID, info)
-  gui.Title = "Yeet v0.4.1"
+  gui.Title = "Yeet v0.5.0"
   gui.Name = WIDGET_ID
 
   local resolver = ConflictResolver.new(plugin) :: any
