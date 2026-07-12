@@ -64,11 +64,14 @@ export type Untracked = {
 	studio_content: string,
 }
 
+-- `untracked` is deliberately NOT part of the build result: it is discovered
+-- read-only via `TreeBuilder.findUntracked`, which the caller runs OUTSIDE the
+-- ChangeHistoryService recording so its yields don't hold the recording open
+-- across frames (M9).
 export type BuildResult = {
 	fileToInstance: { [string]: Instance },
 	mappings: Mappings,
 	divergent: { Divergent },
-	untracked: { Untracked },
 }
 
 local function classFor(kind: ScriptKind): string
@@ -388,25 +391,45 @@ end
 -- These are "created in Studio while the daemon was off" scripts; without
 -- reporting them the bulk sync preview only sees disk-side files and the
 -- user's new `SystemTest` (or whatever) stays invisible.
-local function findUntracked(
+--
+-- Read-only. The bootstrap caller runs this OUTSIDE its ChangeHistoryService
+-- recording (M9) so the yields below never hold a recording open across
+-- frames. Yields every YIELD_EVERY descendants — the same cadence as
+-- `discover` — so a place with thousands of instances doesn't freeze the main
+-- thread while the daemon is being bootstrapped.
+function TreeBuilder.findUntracked(
 	mappings: Mappings,
 	fileToInstance: { [string]: Instance }
 ): { Untracked }
 	local out: { Untracked } = {}
+	local YIELD_EVERY = 200
+	local processed = 0
 	for mapPath, parent in pairs(mappings) do
 		for _, desc in parent:GetDescendants() do
+			processed += 1
+			if processed % YIELD_EVERY == 0 then
+				task.wait()
+			end
 			if not desc:IsA("LuaSourceContainer") then
 				continue
 			end
-			-- Chain from parent's direct child down to `desc`.
+			-- Chain from parent's direct child down to `desc`: append leaf→root
+			-- then reverse in place (was O(depth^2) via insert-at-1; A11).
 			local chain: { string } = {}
 			local cursor: Instance? = desc
 			while cursor ~= nil and cursor ~= parent do
-				table.insert(chain, 1, cursor.Name)
+				table.insert(chain, cursor.Name)
 				cursor = cursor.Parent
 			end
 			if cursor ~= parent or #chain == 0 then
 				continue
+			end
+			local left = 1
+			local right = #chain
+			while left < right do
+				chain[left], chain[right] = chain[right], chain[left]
+				left += 1
+				right -= 1
 			end
 			local leafName, kind, promote = fileNameFor(desc)
 			if promote then
@@ -475,12 +498,10 @@ function TreeBuilder.build(project: Project, snapshots: { FileSnapshot }): Build
 			end
 		end
 	end
-	local untracked = findUntracked(mappings, fileToInstance)
 	return {
 		fileToInstance = fileToInstance,
 		mappings = mappings,
 		divergent = divergent,
-		untracked = untracked,
 	}
 end
 

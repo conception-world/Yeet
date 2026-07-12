@@ -217,6 +217,14 @@ type self = {
 	-- Kept so `reset()` can disconnect them alongside the rest of the
 	-- bootstrap-owned state.
 	liveConnections: { RBXScriptConnection },
+	-- True only while `applyFileCreated` is materializing a daemon-driven
+	-- create. The live `DescendantAdded` watcher checks it and skips, so the
+	-- create we were told to make does NOT bounce a `file_created` back to the
+	-- daemon (M9 — amplifies badly during an IDE→Studio bulk sync).
+	-- `registerTracked` already seatEchoes to suppress this, but the signal
+	-- fires synchronously mid-materialize, BEFORE `fileToInstance[path]` is
+	-- set, so the intended dedup (`existing == desc`) was bypassed.
+	applyingDaemonCreate: boolean,
 }
 
 export type Applier = typeof(setmetatable({} :: self, Applier))
@@ -249,6 +257,7 @@ function Applier.new(log: Log): Applier
 		bootstrapPreviewMode = false,
 		onBootstrapSnapshot = nil :: BootstrapSnapshotHook?,
 		liveConnections = {} :: { RBXScriptConnection },
+		applyingDaemonCreate = false,
 	}, Applier)
 end
 
@@ -651,12 +660,18 @@ local function applyProjectOpened(self: Applier, msg: any)
 		self.mappings = result.mappings
 		self.bootstrapped = true
 		divergent = result.divergent
-		untracked = result.untracked
 	end)
 	if not ok then
 		self.log(`bootstrap failed: {err}`)
 		return
 	end
+	-- M9: discover Studio-only scripts OUTSIDE the recording. It is read-only
+	-- (no DataModel mutation to roll back) and yields periodically, so running
+	-- it here avoids holding a ChangeHistoryService recording open across
+	-- frames on a large place. `self.fileToInstance`/`self.mappings` are
+	-- already the just-materialized maps, so the result is identical to the
+	-- old in-recording call.
+	untracked = TreeBuilder.findUntracked(self.mappings, self.fileToInstance)
 	-- Register tracking outside the recording: SourceWatcher connects signals
 	-- but does not mutate Source, so there is nothing to roll back.
 	for _, file in initialFiles do
@@ -716,6 +731,14 @@ local function applyFileCreated(self: Applier, msg: any)
 		sha256 = msg.sha256,
 	}
 	local created: Instance? = nil
+	-- Mute the live watcher while WE create the instance: materializeFile
+	-- parents it synchronously, firing `DescendantAdded` before fileToInstance
+	-- is set, so without this the watcher would echo a `file_created` for the
+	-- very file the daemon just told us to create (M9 — amplifies across a
+	-- bulk IDE→Studio sync). Save/restore so a nested apply (applyFileRenamed
+	-- degrading to a create) stays correct.
+	local prevApplying = self.applyingDaemonCreate
+	self.applyingDaemonCreate = true
 	local ok, err = withRecording("YeetFileCreated", function()
 		created = TreeBuilder.materializeFile(snap, self.mappings)
 		if created ~= nil then
@@ -723,6 +746,7 @@ local function applyFileCreated(self: Applier, msg: any)
 			self.instanceToPath[created] = snap.path
 		end
 	end)
+	self.applyingDaemonCreate = prevApplying
 	if not ok then
 		self.log(`create failed {snap.path}: {err}`)
 		return
@@ -1274,6 +1298,13 @@ function Applier.startLiveWatcher(self: Applier)
 		-- events schedules a single demotion scan instead of one each (A11).
 		local demotionScan: ScanState = { pending = false }
 		local addedConn = mapParent.DescendantAdded:Connect(function(desc: Instance)
+			if self.applyingDaemonCreate then
+				-- M9: this DescendantAdded is the Applier itself materializing a
+				-- daemon-driven create. applyFileCreated does the tracking and
+				-- seatEcho; reacting here would bounce a `file_created` (and any
+				-- promotion) straight back to the daemon.
+				return
+			end
 			-- Promotion: a non-script child landing under a tracked script
 			-- moves the script's path from leaf to container. Run this
 			-- BEFORE handling `desc` as a new script, so the rename frame
