@@ -538,11 +538,52 @@ async function startDaemonInner(): Promise<void> {
 	// (RUST_LOG=trace) doesn't spam the warning toast.
 	let daemonVersionChecked = false;
 
+	// Sniffs the daemon's startup version banner from a single stdout
+	// line and surfaces a non-modal warning if it doesn't match what
+	// this extension was built against. `line` must already have ANSI
+	// escapes stripped by the caller (see the stdout handler below) —
+	// `tracing` emits them whenever it detects a TTY-like stream, and
+	// RUST_LOG_STYLE=always forces them even over a pipe, which
+	// otherwise hides the quoted version inside
+	// `yeet-daemon starting version="x.y.z"` from this regex. Latched
+	// via `daemonVersionChecked` so a noisy daemon (RUST_LOG=trace)
+	// doesn't spam the warning toast.
+	function checkDaemonVersion(line: string): void {
+		if (daemonVersionChecked) {
+			return;
+		}
+		const versionMatch = line.match(/yeet-daemon starting.*version="([^"]+)"/);
+		if (versionMatch === null) {
+			return;
+		}
+		daemonVersionChecked = true;
+		const actual = versionMatch[1];
+		if (actual === undefined) {
+			return;
+		}
+		if (actual !== EXPECTED_DAEMON_VERSION) {
+			output?.appendLine(
+				`[yeet] daemon version mismatch: extension expects ${EXPECTED_DAEMON_VERSION}, daemon reports ${actual}`,
+			);
+			void vscode.window.showWarningMessage(
+				`Yeet daemon version mismatch: extension v${EXPECTED_DAEMON_VERSION}, daemon v${actual}. `
+					+ `Sync may misbehave on protocol-level changes. `
+					+ `Rebuild the daemon (cargo build --release) or clear `
+					+ `the yeet.daemonPath setting to use the bundled binary.`,
+			);
+		} else {
+			output?.appendLine(`[yeet] daemon version ${actual} matches extension`);
+		}
+	}
+
 	// Scrape stdout for the daemon's `yeet-auth-token: <hex>` line so
-	// we don't have to read `<root>/.yeet/auth-token` ourselves. The
-	// daemon emits this exactly once during bootstrap; subsequent
-	// stdout content is normal log output. We also copy everything to
-	// the output channel so the user sees it.
+	// we don't have to read `<root>/.yeet/auth-token` ourselves, and for
+	// the startup version banner (see `checkDaemonVersion`). Both live
+	// on stdout: `tracing`'s default formatter writes there, and only
+	// genuine `warn!`/`error!` records go to stderr. The daemon emits
+	// the token line exactly once during bootstrap; subsequent stdout
+	// content is normal log output. We also copy everything to the
+	// output channel so the user sees it.
 	let stdoutCarry = "";
 	child.stdout?.on("data", (chunk: Buffer) => {
 		const text = chunk.toString("utf8");
@@ -554,7 +595,11 @@ async function startDaemonInner(): Promise<void> {
 		}
 		const lines = stdoutCarry.slice(0, newlineIdx).split("\n");
 		stdoutCarry = stdoutCarry.slice(newlineIdx + 1);
-		for (const line of lines) {
+		for (const rawLine of lines) {
+			// Strip ANSI color escapes before matching either regex
+			// below — see `checkDaemonVersion` for why they'd otherwise
+			// hide the version banner from its match.
+			const line = rawLine.replace(/\x1b\[[0-9;]*m/g, "");
 			const match = line.match(/^yeet-auth-token:\s*([0-9a-fA-F]+)\s*$/);
 			if (match !== null) {
 				const token = match[1];
@@ -571,6 +616,7 @@ async function startDaemonInner(): Promise<void> {
 					}
 				}
 			}
+			checkDaemonVersion(line);
 		}
 	});
 	child.stderr?.on("data", (chunk: Buffer) => {
@@ -586,36 +632,6 @@ async function startDaemonInner(): Promise<void> {
 			stderrBuf.push(line);
 			if (stderrBuf.length > 20) {
 				stderrBuf.shift();
-			}
-			// Sniff the daemon's startup version banner exactly once and
-			// surface a non-modal warning if it doesn't match what this
-			// extension was built against. Tolerates ANSI color escapes
-			// (tracing emits them on TTYs; pipes typically suppress them
-			// but RUST_LOG_STYLE=always overrides). The regex matches the
-			// quoted version inside `yeet-daemon starting version="x.y.z"`.
-			if (!daemonVersionChecked) {
-				const versionMatch = line.match(
-					/yeet-daemon starting.*version="([^"]+)"/,
-				);
-				if (versionMatch !== null) {
-					daemonVersionChecked = true;
-					const actual = versionMatch[1];
-					if (actual !== undefined && actual !== EXPECTED_DAEMON_VERSION) {
-						output?.appendLine(
-							`[yeet] daemon version mismatch: extension expects ${EXPECTED_DAEMON_VERSION}, daemon reports ${actual}`,
-						);
-						void vscode.window.showWarningMessage(
-							`Yeet daemon version mismatch: extension v${EXPECTED_DAEMON_VERSION}, daemon v${actual}. `
-								+ `Sync may misbehave on protocol-level changes. `
-								+ `Rebuild the daemon (cargo build --release) or clear `
-								+ `the yeet.daemonPath setting to use the bundled binary.`,
-						);
-					} else if (actual === EXPECTED_DAEMON_VERSION) {
-						output?.appendLine(
-							`[yeet] daemon version ${actual} matches extension`,
-						);
-					}
-				}
 			}
 		}
 	});
