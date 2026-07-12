@@ -21,7 +21,11 @@ local DEBOUNCE_SECONDS = 0.2
 
 export type ScriptKind = "module_script" | "script" | "local_script"
 
-export type EditHandler = (path: string, content: string, hash: string) -> ()
+-- Returns true when the edit was actually forwarded (or buffered for a later
+-- flush), false when it was dropped/suppressed. The watcher gates its
+-- "-> file_changed" log on the result so a failed send isn't logged as sent
+-- (B10).
+export type EditHandler = (path: string, content: string, hash: string) -> boolean
 export type DeleteHandler = (path: string) -> ()
 export type RenameHandler = (
 	oldPath: string,
@@ -323,9 +327,11 @@ function SourceWatcher.track(self: SourceWatcher, path: string, instance: Instan
 			if not self.isEcho(finalPath, latestHash) then
 				-- Common path: the current Source is a genuine (non-echo) user
 				-- state — send it. Correctly reflects an undo/redo the user made
-				-- during the debounce window.
-				self.log(`-> file_changed {finalPath}`)
-				self.onEdit(finalPath, latest, latestHash)
+				-- during the debounce window. B10: log only after the send
+				-- actually succeeds (or is buffered).
+				if self.onEdit(finalPath, latest, latestHash) then
+					self.log(`-> file_changed {finalPath}`)
+				end
 				return
 			end
 			-- REGRESSION(A3): the current Source matches a recent Applier write
@@ -335,8 +341,9 @@ function SourceWatcher.track(self: SourceWatcher, path: string, instance: Instan
 			if capturedContent ~= nil and capturedHash ~= nil
 				and not self.isEcho(finalPath, capturedHash)
 			then
-				self.log(`-> file_changed {finalPath} (recovered pre-clobber edit)`)
-				self.onEdit(finalPath, capturedContent, capturedHash)
+				if self.onEdit(finalPath, capturedContent, capturedHash) then
+					self.log(`-> file_changed {finalPath} (recovered pre-clobber edit)`)
+				end
 			end
 		end)
 	end)

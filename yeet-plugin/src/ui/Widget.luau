@@ -26,7 +26,7 @@ local ScrollList = require(script.Parent.components.ScrollList)
 
 type Payload = { [string]: any }
 type ConnectionHandle = {
-  send: (self: ConnectionHandle, payload: Payload) -> (),
+  send: (self: ConnectionHandle, payload: Payload) -> boolean,
   close: (self: ConnectionHandle) -> (),
 }
 type FileResolution = {
@@ -910,28 +910,40 @@ function Widget._onConnectPressed(self: Widget)
     resolvePath = function(instance)
       return applier:resolvePath(instance)
     end,
-    onEdit = function(path, content, hash)
-      applier:recordSelfEdit(path, hash)
+    onEdit = function(path, content, hash): boolean
       if self.paused then
-        -- Pause swallows outgoing edits. The recordSelfEdit above still
-        -- runs so isEcho keeps the local mirror consistent if a stale
-        -- daemon broadcast arrives mid-pause.
-        return
+        -- Pause swallows outgoing edits, but still record the self-edit so
+        -- isEcho keeps the local mirror consistent if a stale daemon
+        -- broadcast arrives mid-pause. Report false so the watcher skips its
+        -- "-> file_changed" log (nothing went on the wire).
+        applier:recordSelfEdit(path, hash)
+        return false
       end
       local current = self.connection
-      if current ~= nil then
-        current:send({
-          type = "file_changed",
-          path = path,
-          content = content,
-          sha256 = hash,
-        })
-      else
+      if current == nil then
         -- B11: mirror the other hooks — a fully torn-down connection (nil
         -- Handle) should not swallow the edit silently. (A transient
         -- disconnect keeps the Handle non-nil and is buffered by Reconnect.)
         self:_appendLog(`edit ignored (disconnected): {path}`)
+        return false
       end
+      local sent = current:send({
+        type = "file_changed",
+        path = path,
+        content = content,
+        sha256 = hash,
+      })
+      if sent then
+        -- B10: seat the echo only after a successful (or buffered) send, so a
+        -- frame that never left keeps recentlyApplied honest.
+        applier:recordSelfEdit(path, hash)
+      else
+        -- B10: the socket looked usable but the frame did not go out. Surface
+        -- a distinct warning instead of only the generic "error:" line, which
+        -- left the status dot green and the "-> file_changed" log misleading.
+        self:_appendLog(`!! file_changed send FAILED (still connected?): {path}`)
+      end
+      return sent
     end,
     onDelete = function(path)
       applier:forgetLocalDelete(path)

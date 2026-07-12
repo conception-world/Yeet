@@ -16,7 +16,7 @@ local Connection = require(script.Parent.Connection)
 export type Payload = { [string]: any }
 
 type ConnectionHandle = {
-	send: (self: ConnectionHandle, payload: Payload) -> (),
+	send: (self: ConnectionHandle, payload: Payload) -> boolean,
 	close: (self: ConnectionHandle) -> (),
 }
 
@@ -53,7 +53,10 @@ export type Handlers = {
 }
 
 export type Handle = {
-	send: (self: Handle, payload: Payload) -> (),
+	-- Returns true when the frame reached the socket or was buffered for a
+	-- later flush (A6); false when it was dropped. Callers gate "sent"
+	-- bookkeeping/logging on this (B10).
+	send: (self: Handle, payload: Payload) -> boolean,
 	close: (self: Handle) -> (),
 	getSessionId: (self: Handle) -> string?,
 }
@@ -310,11 +313,10 @@ function Reconnect.run(url: string, handlers: Handlers): Handle
 
 	local handle: Handle
 	handle = {
-		send = function(_self: Handle, payload: Payload)
+		send = function(_self: Handle, payload: Payload): boolean
 			local conn = currentConn
 			if conn ~= nil then
-				conn:send(payload)
-				return
+				return conn:send(payload)
 			end
 			-- Socket is down (transient close during backoff). Buffer the
 			-- plugin→daemon sync mutations so an edit made in the gap isn't
@@ -328,9 +330,11 @@ function Reconnect.run(url: string, handlers: Handlers): Handle
 				or kind == "file_renamed"
 			if not userClosed and isMutation then
 				enqueueOutgoing(payload)
-				return
+				-- Buffered → deferred success (flushed on the next open).
+				return true
 			end
 			handlers.onError("send while disconnected")
+			return false
 		end,
 		close = function(_self: Handle)
 			userClosed = true
