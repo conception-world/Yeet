@@ -242,6 +242,19 @@ pub fn materialize(session: SyncbackSession, total_seq: u32) -> Result<SyncbackS
     tree::save_base_tree(&session.opts.target_path, &ctx.tree_base)
         .context("persist initial base tree")?;
 
+    // Emit a Rojo `sourcemap.json` for the freshly materialized project (M1) so
+    // luau-lsp resolves the DataModel tree the moment the reverse-bootstrap
+    // window opens in the IDE. `ctx.tree_base` is keyed by the same `src/<Service>`
+    // paths the project's `$path` mounts declare, so the generator maps them
+    // directly. Best-effort: a sourcemap failure must not fail the syncback.
+    if let Err(e) =
+        crate::sourcemap::write_sourcemap(&session.opts.target_path, &project, &ctx.tree_base)
+    {
+        ctx.stats
+            .warnings
+            .push(format!("could not write sourcemap.json: {e:#}"));
+    }
+
     Ok(ctx.stats)
 }
 

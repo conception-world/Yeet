@@ -32,6 +32,7 @@ use yeet_daemon::protocol::{
     SerializedInstance, ServerMsg, StudioFileSnapshot, SyncErrorKind, SyncbackMode,
     SyncbackTemplate, classify, is_init_filename,
 };
+use yeet_daemon::sourcemap;
 use yeet_daemon::state::{
     FileMeta, FsRemovedPending, PendingApply, ProjectState, SharedState, encode_for_disk,
     is_meta_file, normalize_from_disk, resolve_inside, sha256_hex,
@@ -152,6 +153,12 @@ const BUILD_STAMP: &str = "rename-surface-errors-1";
 /// lands inside the window even on slower platforms.
 const FS_RENAME_PAIR_TTL: Duration = Duration::from_millis(250);
 
+/// Debounce window for coalescing a burst of structural tree changes (bulk
+/// sync, a `git checkout` storm, a folder rename fanning out per-child events)
+/// into a single `sourcemap.json` rewrite (M1). Long enough to swallow a burst,
+/// short enough that the LSP sees a fresh map within a fraction of a second.
+const SOURCEMAP_DEBOUNCE: Duration = Duration::from_millis(300);
+
 struct CliArgs {
     project_root: PathBuf,
     debug_echo: bool,
@@ -232,8 +239,27 @@ async fn main() -> Result<()> {
     let (fs_tx, fs_rx) = mpsc::channel::<FileEvent>(EVENT_CHANNEL_CAPACITY);
     let _watcher = watcher::spawn(&args.project_root, fs_tx)?;
 
-    let state_inner =
+    let mut state_inner =
         ProjectState::bootstrap(&args.project_root, project, args.debug_echo, args.dry_run)?;
+    // Emit an initial `sourcemap.json` from the freshly-scanned tree (M1
+    // `setup-1`/`wally-4`) so luau-lsp can resolve `game.<Service>.<Script>`,
+    // `require(Packages.X)`, and Wally types the moment the project opens —
+    // before this Yeet never generated one and type resolution was dead on a
+    // fresh setup. Best-effort: a failure here must not block the daemon.
+    if let Err(e) = sourcemap::write_sourcemap(
+        &state_inner.root,
+        &state_inner.project,
+        &state_inner.tree_fs,
+    ) {
+        warn!(error = ?e, "failed to write initial sourcemap.json");
+    }
+    // Wire the background writer: structural tree changes nudge `sourcemap_tx`;
+    // the writer debounces and regenerates the map. Seed its baseline signature
+    // from the tree we just wrote so the first structural change (not a stray
+    // content edit) is what triggers the next rewrite.
+    let sourcemap_sig = sourcemap::structure_signature(&state_inner.tree_fs);
+    let (sourcemap_tx, sourcemap_rx) = mpsc::unbounded_channel::<()>();
+    state_inner.sourcemap_tx = Some(sourcemap_tx);
     if args.dry_run {
         warn!(
             "DRY-RUN MODE: every disk write, disk delete, push to Studio and delete on \
@@ -285,6 +311,7 @@ async fn main() -> Result<()> {
     let (bcast_tx, _) = broadcast::channel::<Arc<ServerMsg>>(BROADCAST_CAPACITY);
 
     tokio::spawn(event_pump(state.clone(), fs_rx, bcast_tx.clone()));
+    tokio::spawn(sourcemap_writer(state.clone(), sourcemap_rx, sourcemap_sig));
 
     // Give the watcher's 100ms debounce + event_pump a moment to drain any
     // events that fired during the scan/sweep window above. Without this,
@@ -425,6 +452,37 @@ async fn event_pump(
     while let Some(event) = fs_rx.recv().await {
         if let Err(e) = handle_fs_event(&state, event, &bcast_tx).await {
             warn!(error = ?e, "fs event handling failed");
+        }
+    }
+}
+
+/// Background writer for `<root>/sourcemap.json` (M1). Wakes on a structural
+/// tree change signalled via `ProjectState::mark_sourcemap_dirty`, debounces a
+/// burst into one write, and regenerates the map only when the tree's *shape*
+/// (its `structure_signature`) actually changed since the last write — so a run
+/// of content-only marks, or a bulk op whose net structure is unchanged, never
+/// rewrites the file. The JSON is built under a read lock, then written to disk
+/// after the lock is released so the fsync never blocks reconciles.
+async fn sourcemap_writer(
+    state: SharedState,
+    mut rx: mpsc::UnboundedReceiver<()>,
+    mut last_sig: u64,
+) {
+    while rx.recv().await.is_some() {
+        tokio::time::sleep(SOURCEMAP_DEBOUNCE).await;
+        // Drain everything that piled up during the debounce window.
+        while rx.try_recv().is_ok() {}
+        let guard = state.read().await;
+        let sig = sourcemap::structure_signature(&guard.tree_fs);
+        if sig == last_sig {
+            continue;
+        }
+        last_sig = sig;
+        let root = guard.root.clone();
+        let value = sourcemap::build_sourcemap(&guard.project, &guard.tree_fs);
+        drop(guard);
+        if let Err(e) = sourcemap::write_value(&root, &value) {
+            warn!(error = ?e, "failed to write sourcemap.json");
         }
     }
 }
@@ -1306,6 +1364,11 @@ async fn write_to_fs(
         guard.meta.entry(path.to_owned()).or_insert(meta);
         persist_base(&guard)?;
     }
+    // A create (new path) or delete reshapes the tree; a plain content
+    // overwrite does not. We mark unconditionally and let the writer's
+    // signature guard drop the no-op — this is the chokepoint for the silent
+    // Studio→disk create path, which never broadcasts a `FileCreated` (M1).
+    guard.mark_sourcemap_dirty();
     let root = guard.root.clone();
     let session_id = guard.session_id.clone();
     drop(guard);
@@ -1416,6 +1479,10 @@ async fn delete_from_fs(
         guard.tree_base.remove(path);
         persist_base(&guard)?;
     }
+    // A delete removes a path from the tree — a structural change the sourcemap
+    // must reflect. Covers the silent Studio→disk delete path, which broadcasts
+    // no `FileDeleted` (M1).
+    guard.mark_sourcemap_dirty();
     let project_root = guard.root.clone();
     let session_id = guard.session_id.clone();
     drop(guard);
@@ -5933,6 +6000,18 @@ async fn broadcast_server_msg(
 ) {
     let arc = Arc::new(msg);
     let mut guard = state.write().await;
+    // A create / delete / rename changes the shape of the tree, so the
+    // sourcemap needs regenerating (M1). A `FileChanged` is content-only and is
+    // deliberately excluded. This is the single chokepoint for every
+    // broadcast-driven structural change (FS-side and Studio-side renames); the
+    // silent Studio→disk create/delete paths mark from `write_to_fs`/
+    // `delete_from_fs` since they never broadcast.
+    if matches!(
+        *arc,
+        ServerMsg::FileCreated { .. } | ServerMsg::FileDeleted { .. } | ServerMsg::FileRenamed { .. }
+    ) {
+        guard.mark_sourcemap_dirty();
+    }
     guard.record_delta((*arc).clone());
     // If no receivers exist (no clients connected), broadcast returns an
     // error — ignore it, the buffered copy is what counts for resume.

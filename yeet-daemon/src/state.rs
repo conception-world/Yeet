@@ -224,6 +224,13 @@ pub struct ProjectState {
     /// packages, in which case `relative`/`fs_rel_for` are exact identities and
     /// every path behaves exactly as before A10.
     pub package_remaps: Vec<PackageRemap>,
+    /// Nudges the background `sourcemap.json` writer (M1 `setup-1`/`wally-4`)
+    /// after a *structural* tree change — a path added, removed, or renamed.
+    /// `None` until `main` wires the writer task in (unit tests and syncback
+    /// construct state without it, so `mark_sourcemap_dirty` is a no-op there).
+    /// The writer debounces and only rewrites when the tree's shape actually
+    /// changed, so a content-only edit never touches the file.
+    pub sourcemap_tx: Option<mpsc::UnboundedSender<()>>,
 }
 
 pub type SharedState = Arc<RwLock<ProjectState>>;
@@ -299,6 +306,7 @@ impl ProjectState {
             fs_removed_pending: HashMap::new(),
             pending_applies: HashMap::new(),
             package_remaps: Vec::new(),
+            sourcemap_tx: None,
         };
         state.rescan_fs()?;
         if let Some(persisted) = tree::load_base_tree(root)? {
@@ -685,6 +693,18 @@ impl ProjectState {
                 .to_ascii_lowercase();
             rel_lower == dir_lower || rel_lower.starts_with(&format!("{dir_lower}/"))
         })
+    }
+
+    /// Signals the background writer that the tracked file set changed shape
+    /// (M1). Cheap and best-effort: a full/closed channel just means a rewrite
+    /// is already scheduled or the daemon is shutting down. Callers already
+    /// holding the write lock invoke this for free; a content-only edit must
+    /// NOT call it — the writer's signature guard would skip the rewrite anyway,
+    /// but keeping the trigger structural avoids waking it needlessly.
+    pub fn mark_sourcemap_dirty(&self) {
+        if let Some(tx) = &self.sourcemap_tx {
+            let _ = tx.send(());
+        }
     }
 
     /// Convenience accessor: meta for `path`, or a sensible default if the
