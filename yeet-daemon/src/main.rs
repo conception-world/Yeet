@@ -4676,6 +4676,88 @@ async fn handle_pick_folder_prompt(
 }
 
 #[allow(clippy::too_many_arguments)]
+/// Resolves the current user's home directory (`%USERPROFILE%` on Windows,
+/// `$HOME` elsewhere). Returns `None` when the variable is unset or empty, in
+/// which case a syncback is refused rather than allowed to write anywhere.
+fn user_home_dir() -> Option<PathBuf> {
+    let var = if cfg!(windows) { "USERPROFILE" } else { "HOME" };
+    std::env::var_os(var)
+        .map(PathBuf::from)
+        .filter(|p| !p.as_os_str().is_empty())
+}
+
+/// Confines a syncback `target_path` to the user's home directory
+/// (AUDITORIA-YEET.md A17 — arbitrary file write). The legitimate
+/// reverse-bootstrap targets a user-chosen NEW folder, so we cannot require
+/// it inside the served project root — but we can require it under `home`,
+/// reject `..` traversal, and canonicalize the nearest EXISTING ancestor so a
+/// symlinked ancestor cannot escape home. Returns a human-readable reason on
+/// rejection.
+fn validate_syncback_target(target: &Path, home: &Path) -> Result<(), String> {
+    if !target.is_absolute() {
+        return Err(format!("target_path must be absolute: {}", target.display()));
+    }
+    if target
+        .components()
+        .any(|c| matches!(c, std::path::Component::ParentDir))
+    {
+        return Err(format!(
+            "target_path must not contain '..' components: {}",
+            target.display()
+        ));
+    }
+    let canonical_home = home
+        .canonicalize()
+        .map_err(|e| format!("cannot resolve home directory {}: {e}", home.display()))?;
+    // Walk up to the nearest existing ancestor (the target leaf is typically
+    // new). Canonicalizing it resolves any symlink in the existing portion, so
+    // a `home/link -> C:\elsewhere` ancestor is caught here rather than
+    // silently followed at write time.
+    let mut cursor: &Path = target;
+    let existing = loop {
+        if cursor.exists() {
+            break cursor;
+        }
+        match cursor.parent() {
+            Some(parent) => cursor = parent,
+            None => {
+                return Err(format!(
+                    "target_path has no existing ancestor: {}",
+                    target.display()
+                ));
+            }
+        }
+    };
+    let canonical_existing = existing
+        .canonicalize()
+        .map_err(|e| format!("cannot resolve {}: {e}", existing.display()))?;
+    if !canonical_existing.starts_with(&canonical_home) {
+        return Err(format!(
+            "target_path {} resolves outside the home directory ({}); refusing arbitrary file write",
+            target.display(),
+            home.display()
+        ));
+    }
+    Ok(())
+}
+
+/// Refuses to overwrite a non-empty target directory unless the message
+/// carries explicit overwrite intent (`MergeExisting { overwrite: true }`). A
+/// missing / empty / new directory always passes.
+fn syncback_overwrite_ok(target: &Path, mode: SyncbackMode) -> Result<(), String> {
+    let non_empty = std::fs::read_dir(target)
+        .map(|mut entries| entries.next().is_some())
+        .unwrap_or(false);
+    if non_empty && !matches!(mode, SyncbackMode::MergeExisting { overwrite: true }) {
+        return Err(format!(
+            "target_path {} is a non-empty directory; refusing to overwrite without \
+             explicit merge-overwrite intent",
+            target.display()
+        ));
+    }
+    Ok(())
+}
+
 async fn handle_syncback_begin(
     state: &SharedState,
     sessions: &Arc<Mutex<SyncbackSessions>>,
@@ -4689,15 +4771,45 @@ async fn handle_syncback_begin(
     bcast_tx: &broadcast::Sender<Arc<ServerMsg>>,
 ) -> Result<()> {
     let target = PathBuf::from(&target_path);
-    if !target.is_absolute() {
+    // A17: the target comes straight off the wire. Confine it to the user's
+    // home dir, reject `..` traversal, and refuse to clobber a non-empty
+    // directory without explicit overwrite intent, before any write happens.
+    let Some(home) = user_home_dir() else {
         send_syncback_error(
             state,
             bcast_tx,
             request_id,
-            format!("target_path must be absolute: {target_path}"),
+            "daemon cannot determine the user home directory; refusing syncback".to_owned(),
         )
         .await;
         return Ok(());
+    };
+    if let Err(reason) = validate_syncback_target(&target, &home) {
+        send_syncback_error(state, bcast_tx, request_id.clone(), reason).await;
+        return Ok(());
+    }
+    if let Err(reason) = syncback_overwrite_ok(&target, mode) {
+        send_syncback_error(state, bcast_tx, request_id.clone(), reason).await;
+        return Ok(());
+    }
+    // Durable record of every accepted destination: reverse-bootstrap is the
+    // one path that writes outside the served project on the client's say-so.
+    {
+        let guard = state.read().await;
+        let session_id = guard.session_id.clone();
+        let target_str = target.display().to_string();
+        audit::record(
+            &guard.root,
+            &audit::Entry {
+                ts: audit::now_rfc3339(),
+                kind: audit::Kind::FsWrite,
+                path: &target_str,
+                sha_before: None,
+                sha_after: None,
+                session_id: &session_id,
+                note: Some("syncback target accepted"),
+            },
+        );
     }
     let opts = SyncbackOptions {
         target_path: target,
@@ -6286,5 +6398,76 @@ mod security_tests {
             decide_auth(None, "plugin", TOKEN, false),
             AuthOutcome::Proceed
         );
+    }
+
+    // ─── A17: syncback target confinement ────────────────────────────────
+    use super::{syncback_overwrite_ok, validate_syncback_target};
+    use yeet_daemon::protocol::SyncbackMode;
+
+    #[test]
+    fn syncback_accepts_new_folder_under_home() {
+        let home = tempfile::tempdir().expect("home");
+        // Brand-new leaf directly under home (the reverse-bootstrap case).
+        let target = home.path().join("MyNewGame");
+        assert!(validate_syncback_target(&target, home.path()).is_ok());
+        // Nested new folder whose nearest existing ancestor is still home.
+        std::fs::create_dir(home.path().join("Projects")).expect("mkdir");
+        let nested = home.path().join("Projects").join("Deep").join("Game");
+        assert!(validate_syncback_target(&nested, home.path()).is_ok());
+    }
+
+    #[test]
+    fn syncback_rejects_target_outside_home() {
+        let home = tempfile::tempdir().expect("home");
+        let elsewhere = tempfile::tempdir().expect("elsewhere");
+        let target = elsewhere.path().join("victim");
+        let err = validate_syncback_target(&target, home.path())
+            .expect_err("target outside home must be rejected");
+        assert!(err.contains("outside the home directory"), "got: {err}");
+    }
+
+    #[test]
+    fn syncback_rejects_parent_dir_traversal() {
+        let home = tempfile::tempdir().expect("home");
+        // Absolute path that escapes home via `..` — canonicalize can't
+        // resolve it past the non-existent leaf, so it's refused outright.
+        let target = home.path().join("..").join("escaped");
+        let err = validate_syncback_target(&target, home.path())
+            .expect_err("`..` traversal must be rejected");
+        assert!(err.contains("must not contain '..'"), "got: {err}");
+    }
+
+    #[test]
+    fn syncback_rejects_relative_target() {
+        let home = tempfile::tempdir().expect("home");
+        let target = std::path::Path::new("relative/evil");
+        let err = validate_syncback_target(target, home.path())
+            .expect_err("relative target must be rejected");
+        assert!(err.contains("must be absolute"), "got: {err}");
+    }
+
+    #[test]
+    fn syncback_overwrite_blocks_nonempty_dir_without_intent() {
+        let dir = tempfile::tempdir().expect("dir");
+        std::fs::write(dir.path().join("keep.luau"), "return {}").expect("seed");
+        // No explicit overwrite intent → refused.
+        assert!(syncback_overwrite_ok(dir.path(), SyncbackMode::NewProject).is_err());
+        assert!(
+            syncback_overwrite_ok(dir.path(), SyncbackMode::MergeExisting { overwrite: false })
+                .is_err()
+        );
+        // Explicit intent → allowed.
+        assert!(
+            syncback_overwrite_ok(dir.path(), SyncbackMode::MergeExisting { overwrite: true })
+                .is_ok()
+        );
+    }
+
+    #[test]
+    fn syncback_overwrite_allows_empty_or_missing_dir() {
+        let empty = tempfile::tempdir().expect("empty");
+        assert!(syncback_overwrite_ok(empty.path(), SyncbackMode::NewProject).is_ok());
+        let missing = empty.path().join("does-not-exist-yet");
+        assert!(syncback_overwrite_ok(&missing, SyncbackMode::NewProject).is_ok());
     }
 }
