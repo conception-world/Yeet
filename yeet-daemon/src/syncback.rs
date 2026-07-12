@@ -14,8 +14,10 @@
 //! - Scripts with children become `Name/init.luau` + children as siblings.
 //! - Services (top-level children of the `DataModel`) are mapped through
 //!   `default.project.json`; their own directory sits at `src/<ServiceName>/`.
-//! - Name collisions between siblings are deterministically disambiguated by
-//!   appending `_1`, `_2`, ... and recorded in `stats.warnings`.
+//! - Name collisions between siblings — including collisions that differ
+//!   only by case, since NTFS/OneDrive are case-insensitive — are
+//!   deterministically disambiguated by appending `_1`, `_2`, ... and
+//!   recorded in `stats.warnings`.
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::path::{Path, PathBuf};
@@ -338,11 +340,12 @@ fn write_instance(
         let name = disambiguate(&sanitized_base, used_names);
         if name != inst.name {
             ctx.stats.warnings.push(format!(
-                "renamed {}/{} -> {}/{} (illegal or duplicate name)",
+                "renamed {}/{} -> {}/{} (illegal or case-insensitive duplicate name)",
                 parent_rel, inst.name, parent_rel, name
             ));
         }
-        used_names.insert(name.clone());
+        // Folded, not literal: keeps later siblings colliding case-insensitively too.
+        used_names.insert(name.to_lowercase());
         write_binary_instance(&name, parent_dir, parent_rel, inst, ctx)?;
         return Ok(());
     }
@@ -359,11 +362,12 @@ fn write_instance(
     let name = disambiguate(&sanitized_base, used_names);
     if name != inst.name {
         ctx.stats.warnings.push(format!(
-            "renamed {}/{} -> {}/{} (illegal or duplicate name)",
+            "renamed {}/{} -> {}/{} (illegal or case-insensitive duplicate name)",
             parent_rel, inst.name, parent_rel, name
         ));
     }
-    used_names.insert(name.clone());
+    // Folded, not literal: keeps later siblings colliding case-insensitively too.
+    used_names.insert(name.to_lowercase());
 
     match (script_kind, child_ids.is_empty()) {
         (Some(kind), true) => {
@@ -520,13 +524,23 @@ fn sanitize_name(raw: &str) -> String {
     result
 }
 
+/// Picks a name that doesn't collide with anything in `used`. Collisions are
+/// detected case-INsensitively (via `to_lowercase`) because the destination
+/// filesystem (NTFS/OneDrive) is case-insensitive: two siblings differing
+/// only by case would otherwise round-trip to the same physical file and the
+/// second `atomic_write` would silently clobber the first (C1 in the audit).
+///
+/// Contract: `used` must already hold the FOLDED (lowercased) form of every
+/// name chosen so far — callers are responsible for feeding it that way (see
+/// `write_instance`). The returned candidate always preserves `base`'s
+/// original casing; only a numeric suffix is ever appended.
 fn disambiguate(base: &str, used: &BTreeSet<String>) -> String {
-    if !used.contains(base) {
+    if !used.contains(&base.to_lowercase()) {
         return base.to_owned();
     }
     for i in 1..u32::MAX {
         let candidate = format!("{base}_{i}");
-        if !used.contains(&candidate) {
+        if !used.contains(&candidate.to_lowercase()) {
             return candidate;
         }
     }
@@ -737,6 +751,26 @@ mod tests {
         }
     }
 
+    fn script_inst(id: u64, parent: Option<u64>, name: &str, source: &str) -> SerializedInstance {
+        let mut i = inst(id, parent, "ModuleScript", name);
+        i.properties.insert(
+            "Source".to_owned(),
+            SerializedProperty::String(source.to_owned()),
+        );
+        i
+    }
+
+    fn test_opts(target_path: PathBuf) -> SyncbackOptions {
+        SyncbackOptions {
+            target_path,
+            mode: SyncbackMode::NewProject,
+            include_non_script: true,
+            include_binary: false,
+            template: SyncbackTemplate::Minimal,
+            project_name: None,
+        }
+    }
+
     #[test]
     fn sanitize_handles_forbidden_chars() {
         assert_eq!(sanitize_name("foo/bar"), "foo_bar");
@@ -750,10 +784,35 @@ mod tests {
 
     #[test]
     fn disambiguate_suffixes() {
-        let mut used: BTreeSet<String> = ["Foo".to_owned(), "Foo_1".to_owned()].into();
+        // `used` holds the folded form per the function's contract (callers
+        // fold before inserting — see `write_instance`).
+        let mut used: BTreeSet<String> = ["foo".to_owned(), "foo_1".to_owned()].into();
         assert_eq!(disambiguate("Foo", &used), "Foo_2");
-        used.insert("Bar".to_owned());
+        used.insert("bar".to_owned());
         assert_eq!(disambiguate("Bar", &used), "Bar_1");
+    }
+
+    #[test]
+    fn disambiguate_is_case_insensitive() {
+        let mut used: BTreeSet<String> = BTreeSet::new();
+        let first = disambiguate("Foo", &used);
+        assert_eq!(first, "Foo", "first occurrence keeps its original casing");
+        used.insert(first.to_lowercase());
+
+        // A sibling whose name differs only by case must still be pushed to
+        // a suffixed form — this is the C1 invariant: two distinct instances
+        // under the same parent must never fold to the same physical path.
+        let second = disambiguate("foo", &used);
+        assert_eq!(second, "foo_1");
+        assert_ne!(
+            first.to_lowercase(),
+            second.to_lowercase(),
+            "folded forms must differ or NTFS/OneDrive would collapse them into one file"
+        );
+        used.insert(second.to_lowercase());
+
+        let third = disambiguate("FOO", &used);
+        assert_eq!(third, "FOO_2");
     }
 
     #[test]
@@ -787,5 +846,163 @@ mod tests {
             SerializedProperty::Enum("RunContext.Server".to_owned()),
         );
         assert_eq!(script_kind_of(&script), Some(ScriptKind::Script));
+    }
+
+    // ─── C1: case-insensitive sibling collisions (path-1) ─────────────────
+
+    #[test]
+    fn write_children_disambiguates_case_insensitive_leaf_siblings() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let opts = test_opts(dir.path().to_path_buf());
+
+        let mut instances = HashMap::new();
+        instances.insert(1, script_inst(1, Some(0), "Foo", "return 1\n"));
+        instances.insert(2, script_inst(2, Some(0), "foo", "return 2\n"));
+        let mut children = HashMap::new();
+        children.insert(0u64, vec![1u64, 2u64]);
+
+        let mut ctx = WriteContext {
+            opts: &opts,
+            instances: &instances,
+            children: &children,
+            stats: SyncbackStats::default(),
+            tree_base: Tree::new(),
+        };
+        write_children(0, dir.path(), "src", &mut ctx).expect("write_children");
+
+        // The two siblings must land on physically distinct files: their
+        // folded (case-insensitive) forms must differ, or NTFS/OneDrive
+        // would silently collapse them into one — the C1 data-loss bug.
+        let mut names: Vec<String> = std::fs::read_dir(dir.path())
+            .expect("read_dir")
+            .map(|e| e.expect("dir entry").file_name().to_string_lossy().into_owned())
+            .collect();
+        names.sort();
+        assert_eq!(names, vec!["Foo.luau".to_owned(), "foo_1.luau".to_owned()]);
+
+        let mut folded: Vec<String> = names.iter().map(|n| n.to_lowercase()).collect();
+        folded.sort();
+        folded.dedup();
+        assert_eq!(
+            folded.len(),
+            names.len(),
+            "folded filenames must be pairwise distinct"
+        );
+
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join("Foo.luau")).unwrap(),
+            "return 1\n"
+        );
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join("foo_1.luau")).unwrap(),
+            "return 2\n"
+        );
+
+        assert!(
+            ctx.stats
+                .warnings
+                .iter()
+                .any(|w| w.contains("src/foo -> src/foo_1")),
+            "expected a warning recording the case-collision rename, got: {:?}",
+            ctx.stats.warnings
+        );
+    }
+
+    #[test]
+    fn write_children_disambiguates_case_insensitive_folder_siblings() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let opts = test_opts(dir.path().to_path_buf());
+
+        let mut instances = HashMap::new();
+        instances.insert(1, inst(1, Some(0), "Folder", "Config"));
+        instances.insert(3, inst(3, Some(0), "Folder", "config"));
+        instances.insert(2, script_inst(2, Some(1), "SettingsA", "return \"a\"\n"));
+        instances.insert(4, script_inst(4, Some(3), "SettingsB", "return \"b\"\n"));
+
+        let mut children = HashMap::new();
+        children.insert(0u64, vec![1u64, 3u64]);
+        children.insert(1u64, vec![2u64]);
+        children.insert(3u64, vec![4u64]);
+
+        let mut ctx = WriteContext {
+            opts: &opts,
+            instances: &instances,
+            children: &children,
+            stats: SyncbackStats::default(),
+            tree_base: Tree::new(),
+        };
+        write_children(0, dir.path(), "src", &mut ctx).expect("write_children");
+
+        // Distinct directories — not the same folder receiving both children.
+        // Assert via read_dir (case-preserved entry names) rather than
+        // `join("config").exists()`: on a case-insensitive filesystem
+        // (NTFS/OneDrive — the target platform) "config" resolves to the
+        // existing "Config", which would make that check spuriously succeed
+        // and hide the very collision this test guards against.
+        let mut dirs: Vec<String> = std::fs::read_dir(dir.path())
+            .expect("read_dir")
+            .map(|e| e.expect("dir entry").file_name().to_string_lossy().into_owned())
+            .filter(|n| dir.path().join(n).is_dir())
+            .collect();
+        dirs.sort();
+        assert_eq!(dirs, vec!["Config".to_owned(), "config_1".to_owned()]);
+
+        // Both subtrees survive untouched.
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join("Config/SettingsA.luau")).unwrap(),
+            "return \"a\"\n"
+        );
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join("config_1/SettingsB.luau")).unwrap(),
+            "return \"b\"\n"
+        );
+
+        // The renamed folder keeps its original Studio name recoverable via
+        // init.meta.json, same as any other disambiguated instance.
+        let meta: serde_json::Value = serde_json::from_str(
+            &std::fs::read_to_string(dir.path().join("config_1/init.meta.json")).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(meta["name"], "config");
+
+        assert!(
+            ctx.stats
+                .warnings
+                .iter()
+                .any(|w| w.contains("src/config -> src/config_1")),
+            "expected a warning recording the case-collision rename, got: {:?}",
+            ctx.stats.warnings
+        );
+    }
+
+    #[test]
+    fn write_children_leaves_non_colliding_siblings_untouched() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let opts = test_opts(dir.path().to_path_buf());
+
+        let mut instances = HashMap::new();
+        instances.insert(1, script_inst(1, Some(0), "Foo", "return 1\n"));
+        instances.insert(2, script_inst(2, Some(0), "Bar", "return 2\n"));
+        let mut children = HashMap::new();
+        children.insert(0u64, vec![1u64, 2u64]);
+
+        let mut ctx = WriteContext {
+            opts: &opts,
+            instances: &instances,
+            children: &children,
+            stats: SyncbackStats::default(),
+            tree_base: Tree::new(),
+        };
+        write_children(0, dir.path(), "src", &mut ctx).expect("write_children");
+
+        // Regression: distinct (non-colliding, even when folded) names must
+        // come out exactly as before — untouched and silent.
+        assert!(dir.path().join("Foo.luau").exists());
+        assert!(dir.path().join("Bar.luau").exists());
+        assert!(
+            ctx.stats.warnings.is_empty(),
+            "non-colliding names must not trigger any warning, got: {:?}",
+            ctx.stats.warnings
+        );
     }
 }
