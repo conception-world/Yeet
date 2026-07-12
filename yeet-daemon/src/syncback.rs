@@ -147,6 +147,19 @@ pub fn materialize(session: SyncbackSession, total_seq: u32) -> Result<SyncbackS
         format!("prepare target {}", session.opts.target_path.display())
     })?;
 
+    // Snapshot what the previous materialization tracked so obsolete files can
+    // be reconciled after the fresh walk (M2 / setup-2). Only overwrite-merge
+    // reconciles: a `NewProject` starts clean and a first-ever overwrite has no
+    // stored base tree yet, so both collapse to an empty (no-op) baseline.
+    let prev_base = match session.opts.mode {
+        SyncbackMode::MergeExisting { overwrite: true } => {
+            tree::load_base_tree(&session.opts.target_path)
+                .context("load previous base tree for overwrite reconcile")?
+                .unwrap_or_default()
+        }
+        _ => Tree::new(),
+    };
+
     let forest = build_forest(&session.instances)?;
     let root = forest.root;
     let mut ctx = WriteContext {
@@ -155,6 +168,7 @@ pub fn materialize(session: SyncbackSession, total_seq: u32) -> Result<SyncbackS
         children: &forest.children,
         stats: SyncbackStats::default(),
         tree_base: Tree::new(),
+        written_paths: BTreeSet::new(),
     };
     ctx.stats.warnings = session.warnings;
 
@@ -212,6 +226,19 @@ pub fn materialize(session: SyncbackSession, total_seq: u32) -> Result<SyncbackS
         .with_context(|| format!("write {}", project_path.display()))?;
     ctx.stats.total_bytes += project_bytes.len() as u64;
 
+    // Reconcile before persisting the new base tree: drop files the previous
+    // materialization tracked that this run no longer produces, so a re-yeet
+    // can't resurrect a Studio-side deletion or leave both shapes of a
+    // reshaped script on disk (M2 / setup-2).
+    reconcile_overwrite(
+        &session.opts.target_path,
+        &prev_base,
+        &ctx.tree_base,
+        &ctx.written_paths,
+        &mut ctx.stats,
+    )
+    .context("reconcile obsolete files after overwrite merge")?;
+
     tree::save_base_tree(&session.opts.target_path, &ctx.tree_base)
         .context("persist initial base tree")?;
 
@@ -247,6 +274,127 @@ fn prepare_target(opts: &SyncbackOptions) -> Result<()> {
         }
     }
     Ok(())
+}
+
+// ─── Overwrite reconciliation (M2 / setup-2) ──────────────────────────────
+
+/// After an overwrite-merge, removes files the *previous* materialization
+/// tracked (`prev_base`) that this run did not reproduce (`new_base`). Without
+/// this a second yeet resurrects scripts the user deleted in Studio — they
+/// linger on disk as orphans with no base-tree entry — and can leave both
+/// shapes of a reshaped script on disk (`Foo/init.luau` next to a fresh
+/// `Foo.luau`).
+///
+/// Scope is deliberately narrow: only the `src/` mount this materializer owns,
+/// and never a package-manager landing (M7). Removed files are relocated under
+/// `.yeet/backup/<rel>` rather than unlinked so a mistaken overwrite stays
+/// recoverable; directories emptied by the moves are pruned.
+fn reconcile_overwrite(
+    target_path: &Path,
+    prev_base: &Tree,
+    new_base: &Tree,
+    written: &BTreeSet<String>,
+    stats: &mut SyncbackStats,
+) -> Result<()> {
+    for rel in prev_base.keys() {
+        if new_base.contains_key(rel) || !is_reconcilable(rel) {
+            continue;
+        }
+        let abs = target_path.join(rel);
+        if move_to_backup(target_path, rel)? {
+            stats
+                .warnings
+                .push(format!("removed obsolete {rel} (backed up under .yeet/backup)"));
+        }
+        // The stale script's paired `.meta.json` is orphaned too — unless this
+        // run wrote that exact path for a different instance (e.g. a folder now
+        // occupying the removed script's directory), which we must not clobber.
+        if let Some(meta_rel) = meta_sibling_for(rel)
+            && !written.contains(&meta_rel)
+        {
+            move_to_backup(target_path, &meta_rel)?;
+        }
+        if let Some(parent) = abs.parent() {
+            prune_empty_dirs(target_path, parent);
+        }
+    }
+    Ok(())
+}
+
+/// True when `rel` names a path this materializer may reconcile: it must live
+/// under the `src/` mount materialize writes, and no path segment may be a
+/// package-manager landing (owned by Wally/pesde — never touch them, M7).
+fn is_reconcilable(rel: &str) -> bool {
+    rel.starts_with("src/") && !rel.split('/').any(is_package_manager_dir)
+}
+
+/// Moves `<target>/<rel>` under `<target>/.yeet/backup/<rel>`, preserving the
+/// relative layout. Returns `Ok(false)` when there was nothing to move. A stale
+/// backup already at the destination is replaced. Uses `extended_path` so deep
+/// OneDrive trees don't trip MAX_PATH (M23).
+fn move_to_backup(target_path: &Path, rel: &str) -> Result<bool> {
+    let src = target_path.join(rel);
+    if !extended_path(&src).exists() {
+        return Ok(false);
+    }
+    let dest = target_path.join(".yeet").join("backup").join(rel);
+    if let Some(parent) = dest.parent() {
+        std::fs::create_dir_all(extended_path(parent))
+            .with_context(|| format!("mkdir {}", parent.display()))?;
+    }
+    if extended_path(&dest).exists() {
+        std::fs::remove_file(extended_path(&dest))
+            .with_context(|| format!("clear stale backup {}", dest.display()))?;
+    }
+    std::fs::rename(extended_path(&src), extended_path(&dest))
+        .with_context(|| format!("back up {} -> {}", src.display(), dest.display()))?;
+    Ok(true)
+}
+
+/// Given a project-relative script path, returns the sibling `.meta.json` path
+/// that `write_instance` would have emitted beside it. Init-form scripts
+/// (`.../init.luau`) pair with `.../init.meta.json`; leaf scripts pair with
+/// `.../<Name>.meta.json`, with any `.server`/`.client` sub-extension stripped.
+/// Returns `None` for a path that isn't a `.luau` file.
+fn meta_sibling_for(script_rel: &str) -> Option<String> {
+    let (dir, file) = match script_rel.rsplit_once('/') {
+        Some((d, f)) => (Some(d), f),
+        None => (None, script_rel),
+    };
+    let meta_file = if crate::protocol::is_init_filename(file) {
+        "init.meta.json".to_owned()
+    } else {
+        let stem = file.strip_suffix(".luau")?;
+        let base = stem
+            .strip_suffix(".server")
+            .or_else(|| stem.strip_suffix(".client"))
+            .unwrap_or(stem);
+        format!("{base}.meta.json")
+    };
+    Some(match dir {
+        Some(d) => format!("{d}/{meta_file}"),
+        None => meta_file,
+    })
+}
+
+/// Removes empty directories from `start` upward toward `target_path`
+/// (exclusive), stopping at the first non-empty directory. Best-effort: any I/O
+/// hiccup ends the walk silently, since a leftover empty directory is harmless.
+fn prune_empty_dirs(target_path: &Path, start: &Path) {
+    let mut cur = start.to_path_buf();
+    while cur.starts_with(target_path) && cur.as_path() != target_path {
+        let empty = match std::fs::read_dir(extended_path(&cur)) {
+            Ok(mut rd) => rd.next().is_none(),
+            Err(_) => break,
+        };
+        if !empty || std::fs::remove_dir(extended_path(&cur)).is_err() {
+            break;
+        }
+        let Some(parent) = cur.parent().map(Path::to_path_buf) else {
+            break;
+        };
+        cur = parent;
+    }
 }
 
 #[derive(Debug)]
@@ -304,6 +452,11 @@ struct WriteContext<'a> {
     children: &'a HashMap<u64, Vec<u64>>,
     stats: SyncbackStats,
     tree_base: Tree,
+    /// Project-relative, forward-slashed paths this run has actually written.
+    /// Consulted during overwrite reconciliation so a freshly-written meta file
+    /// (e.g. a folder now occupying a removed script's directory) is never
+    /// mistaken for the removed script's orphaned sidecar and clobbered.
+    written_paths: BTreeSet<String>,
 }
 
 fn write_children(
@@ -485,6 +638,12 @@ fn write_meta_file(
     atomic_write(path, &body).with_context(|| format!("write {}", path.display()))?;
     ctx.stats.meta_files_written += 1;
     ctx.stats.total_bytes += body.len() as u64;
+    // Record the project-relative path so overwrite reconciliation can tell an
+    // orphaned sidecar apart from one this run just wrote (see M2 reconcile).
+    if let Ok(rel) = path.strip_prefix(&ctx.opts.target_path) {
+        ctx.written_paths
+            .insert(rel.to_string_lossy().replace('\\', "/"));
+    }
     Ok(())
 }
 
@@ -974,6 +1133,7 @@ mod tests {
             children: &children,
             stats: SyncbackStats::default(),
             tree_base: Tree::new(),
+            written_paths: BTreeSet::new(),
         };
         write_children(0, dir.path(), "src", &mut ctx).expect("write_children");
 
@@ -1037,6 +1197,7 @@ mod tests {
             children: &children,
             stats: SyncbackStats::default(),
             tree_base: Tree::new(),
+            written_paths: BTreeSet::new(),
         };
         write_children(0, dir.path(), "src", &mut ctx).expect("write_children");
 
@@ -1099,6 +1260,7 @@ mod tests {
             children: &children,
             stats: SyncbackStats::default(),
             tree_base: Tree::new(),
+            written_paths: BTreeSet::new(),
         };
         write_children(0, dir.path(), "src", &mut ctx).expect("write_children");
 
@@ -1194,6 +1356,7 @@ mod tests {
             children: &children,
             stats: SyncbackStats::default(),
             tree_base: Tree::new(),
+            written_paths: BTreeSet::new(),
         };
         write_children(0, dir.path(), "src", &mut ctx).expect("write_children");
 
@@ -1245,6 +1408,7 @@ mod tests {
             children: &children,
             stats: SyncbackStats::default(),
             tree_base: Tree::new(),
+            written_paths: BTreeSet::new(),
         };
         write_children(0, dir.path(), "src", &mut ctx).expect("write_children");
 
@@ -1277,6 +1441,7 @@ mod tests {
             children: &children,
             stats: SyncbackStats::default(),
             tree_base: Tree::new(),
+            written_paths: BTreeSet::new(),
         };
         write_children(0, dir.path(), "src", &mut ctx).expect("write_children");
 
@@ -1320,6 +1485,7 @@ mod tests {
             children: &children,
             stats: SyncbackStats::default(),
             tree_base: Tree::new(),
+            written_paths: BTreeSet::new(),
         };
         write_children(0, dir.path(), "src", &mut ctx).expect("write_children");
 
@@ -1357,6 +1523,7 @@ mod tests {
             children: &children,
             stats: SyncbackStats::default(),
             tree_base: Tree::new(),
+            written_paths: BTreeSet::new(),
         };
         write_children(0, dir.path(), "src", &mut ctx).expect("write_children");
 
@@ -1437,9 +1604,165 @@ mod tests {
             children: &children,
             stats: SyncbackStats::default(),
             tree_base: Tree::new(),
+            written_paths: BTreeSet::new(),
         };
         write_children(0, dir.path(), "src", &mut ctx)
             .expect("deep write must not fail on MAX_PATH");
         assert_eq!(ctx.stats.scripts_written, 1);
+    }
+
+    // ─── M2: overwrite-merge cleans obsolete / reshaped files (setup-2) ────
+
+    fn materialize_overwrite(
+        target: &Path,
+        request_id: &str,
+        instances: Vec<SerializedInstance>,
+    ) -> SyncbackStats {
+        let opts = SyncbackOptions {
+            target_path: target.to_path_buf(),
+            mode: SyncbackMode::MergeExisting { overwrite: true },
+            include_non_script: true,
+            include_binary: false,
+            template: SyncbackTemplate::Minimal,
+            project_name: Some("m2".to_owned()),
+        };
+        let mut session = SyncbackSession::new(request_id.to_owned(), opts);
+        session.ingest_chunk(0, instances).expect("ingest chunk");
+        materialize(session, 1).expect("materialize")
+    }
+
+    /// Project-relative, forward-slashed paths of every `.luau` file under
+    /// `dir`. Used to assert base tree and disk agree in both directions.
+    fn collect_luau_files(dir: &Path, root: &Path) -> Vec<String> {
+        let mut out = Vec::new();
+        let Ok(rd) = std::fs::read_dir(dir) else {
+            return out;
+        };
+        for entry in rd.flatten() {
+            let path = entry.path();
+            if path.is_dir() {
+                out.extend(collect_luau_files(&path, root));
+            } else if path.extension().and_then(|s| s.to_str()) == Some("luau")
+                && let Ok(rel) = path.strip_prefix(root)
+            {
+                out.push(rel.to_string_lossy().replace('\\', "/"));
+            }
+        }
+        out
+    }
+
+    #[test]
+    fn meta_sibling_matches_written_form() {
+        assert_eq!(
+            meta_sibling_for("src/RS/Foo/init.luau").as_deref(),
+            Some("src/RS/Foo/init.meta.json")
+        );
+        assert_eq!(
+            meta_sibling_for("src/RS/Foo/init.server.luau").as_deref(),
+            Some("src/RS/Foo/init.meta.json")
+        );
+        assert_eq!(
+            meta_sibling_for("src/RS/Bar.luau").as_deref(),
+            Some("src/RS/Bar.meta.json")
+        );
+        assert_eq!(
+            meta_sibling_for("src/RS/Bar.client.luau").as_deref(),
+            Some("src/RS/Bar.meta.json")
+        );
+        assert_eq!(meta_sibling_for("src/RS/notes.txt"), None);
+    }
+
+    #[test]
+    fn is_reconcilable_scopes_to_src_and_skips_package_dirs() {
+        assert!(is_reconcilable("src/ServerScriptService/Foo.luau"));
+        // Other mounts materialize doesn't own must be left alone.
+        assert!(!is_reconcilable("shared/Foo.luau"));
+        // Package-manager landings are owned elsewhere (M7).
+        assert!(!is_reconcilable("src/Packages/Foo.luau"));
+        assert!(!is_reconcilable("src/ReplicatedStorage/_Index/Pkg/init.luau"));
+    }
+
+    /// A second overwrite-merge with a reduced tree must clean up after the
+    /// first: a script deleted in Studio must not resurrect, and a script that
+    /// changed shape (`Foo/init.luau` -> `Foo.luau`) must not leave both forms
+    /// on disk. The persisted base tree must agree with disk in both
+    /// directions.
+    #[test]
+    fn merge_overwrite_removes_obsolete_and_reshaped_scripts() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let target = dir.path().to_path_buf();
+
+        // Run 1: `Shape` has a child, so it materializes as `Shape/init.luau`
+        // plus `Shape/Child.luau`.
+        materialize_overwrite(
+            &target,
+            "run-1",
+            vec![
+                inst(1, None, "DataModel", "game"),
+                inst(2, Some(1), "ServerScriptService", "ServerScriptService"),
+                script_inst(3, Some(2), "Keep", "return 'keep v1'\n"),
+                script_inst(4, Some(2), "Gone", "return 'gone'\n"),
+                script_inst(5, Some(2), "Shape", "return 'shape v1'\n"),
+                script_inst(6, Some(5), "Child", "return 'child'\n"),
+            ],
+        );
+
+        let keep = target.join("src/ServerScriptService/Keep.luau");
+        let gone = target.join("src/ServerScriptService/Gone.luau");
+        let shape_init = target.join("src/ServerScriptService/Shape/init.luau");
+        let shape_child = target.join("src/ServerScriptService/Shape/Child.luau");
+        let shape_leaf = target.join("src/ServerScriptService/Shape.luau");
+        assert!(keep.exists(), "run 1 should write Keep.luau");
+        assert!(gone.exists(), "run 1 should write Gone.luau");
+        assert!(shape_init.exists(), "run 1 should write Shape/init.luau");
+        assert!(shape_child.exists(), "run 1 should write Shape/Child.luau");
+
+        // Run 2: `Gone` was deleted in Studio; `Shape` lost its child, so it
+        // flips to a single-file leaf `Shape.luau`.
+        materialize_overwrite(
+            &target,
+            "run-2",
+            vec![
+                inst(1, None, "DataModel", "game"),
+                inst(2, Some(1), "ServerScriptService", "ServerScriptService"),
+                script_inst(3, Some(2), "Keep", "return 'keep v2'\n"),
+                script_inst(5, Some(2), "Shape", "return 'shape v2'\n"),
+            ],
+        );
+
+        // The deleted script must not survive the second overwrite.
+        assert!(!gone.exists(), "deleted script resurrected on 2nd overwrite");
+        // Shape flipped to a leaf; the two forms must not coexist.
+        assert!(shape_leaf.exists(), "reshaped script missing as leaf file");
+        assert!(!shape_init.exists(), "stale Foo/init.luau form left on disk");
+        assert!(!shape_child.exists(), "obsolete child script left on disk");
+        assert!(keep.exists(), "kept script must remain");
+
+        let base = tree::load_base_tree(&target)
+            .expect("load base tree")
+            .expect("base tree present");
+        // base subset of disk: nothing tracked that isn't materialized.
+        for rel in base.keys() {
+            assert!(
+                target.join(rel).exists(),
+                "base tree references a path absent from disk: {rel}"
+            );
+        }
+        // disk subset of base: no orphan script the base tree forgot.
+        for rel in collect_luau_files(&target.join("src"), &target) {
+            assert!(
+                base.contains_key(&rel),
+                "orphan script left on disk after overwrite: {rel}"
+            );
+        }
+        assert_eq!(base.len(), 2, "only Keep + Shape should remain tracked");
+
+        // Obsolete files are recoverable under .yeet/backup, not hard-deleted.
+        assert!(
+            target
+                .join(".yeet/backup/src/ServerScriptService/Gone.luau")
+                .exists(),
+            "removed file should be backed up under .yeet/backup"
+        );
     }
 }
