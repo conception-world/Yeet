@@ -461,14 +461,29 @@ local function registerTracked(self: Applier, path: string, inst: Instance, hash
 	end
 end
 
-local function applyProjectOpenedForPreview(self: Applier, project: Project)
-	-- Wipe per-session state the same way the apply path does — the preview
-	-- will drive fresh materializations as the user confirms resolutions.
+-- Wipes the per-session bookkeeping shared by the bootstrap entry points
+-- (preview + legacy re-bootstrap) and by `reset()`. Extracted so those paths
+-- can't drift: M13 was exactly that drift — the preview path forgot
+-- `instanceToPath`/`pendingCollisions`, leaking references to destroyed
+-- Instances across re-bootstraps. Does NOT touch `liveConnections`,
+-- `bootstrapped`, or the buffered preview frames — callers own those.
+local function resetPerSessionState(self: Applier)
 	self.recentlyApplied = {}
 	self.recentlyAppliedCount = 0
 	self.fileToInstance = {}
+	self.instanceToPath = {}
+	self.pendingCollisions = {}
 	self.mappings = {}
 	self.appliedAttributes = {}
+end
+
+local function applyProjectOpenedForPreview(self: Applier, project: Project)
+	-- Wipe per-session state the same way the apply path does — the preview
+	-- will drive fresh materializations as the user confirms resolutions.
+	-- REGRESSION(M13): the wipe MUST include instanceToPath/pendingCollisions
+	-- (the legacy re-bootstrap path already cleared them); routing both paths
+	-- through resetPerSessionState keeps them from diverging again.
+	resetPerSessionState(self)
 
 	local result = TreeBuilder.discover(project)
 	self.mappings = result.mappings
@@ -593,13 +608,7 @@ local function applyProjectOpened(self: Applier, msg: any)
 	-- pass is a no-op for instances that already existed; wiping our own
 	-- bookkeeping first just keeps `recentlyApplied` honest.
 	if self.bootstrapped then
-		self.recentlyApplied = {}
-		self.recentlyAppliedCount = 0
-		self.fileToInstance = {}
-		self.instanceToPath = {}
-		self.pendingCollisions = {}
-		self.mappings = {}
-		self.appliedAttributes = {}
+		resetPerSessionState(self)
 	end
 	local divergent: { { path: string, kind: ScriptKind, studio_content: string } } = {}
 	local untracked: { { path: string, kind: ScriptKind, studio_content: string } } = {}
@@ -1264,14 +1273,8 @@ function Applier.reset(self: Applier)
 		conn:Disconnect()
 	end
 	table.clear(self.liveConnections)
-	self.fileToInstance = {}
-	self.instanceToPath = {}
-	self.pendingCollisions = {}
-	self.mappings = {}
+	resetPerSessionState(self)
 	self.bootstrapped = false
-	self.recentlyApplied = {}
-	self.recentlyAppliedCount = 0
-	self.appliedAttributes = {}
 	-- Drop any unprocessed bulk_sync_preview frames from the previous
 	-- session — they reference a request_id the daemon already retired.
 	self.bufferedBulkSyncPreviews = {}
