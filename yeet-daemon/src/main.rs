@@ -318,12 +318,40 @@ fn init_tracing() {
     tracing_subscriber::fmt().with_env_filter(filter).init();
 }
 
+/// Refuses a non-loopback `--bind` unless `--allow-remote` was passed, and
+/// emits a prominent warning when a remote bind is allowed (AUDITORIA-YEET.md
+/// B13). Loopback binds (the default) always pass silently. Split out from
+/// `parse_args` so the policy is unit-testable without touching argv.
+fn validate_bind_addr(bind: Option<&str>, allow_remote: bool) -> Result<()> {
+    let Some(addr) = bind else {
+        return Ok(());
+    };
+    if is_loopback_bind_addr(addr) {
+        return Ok(());
+    }
+    if !allow_remote {
+        bail!(
+            "--bind {addr} is not a loopback address. Binding to a non-loopback \
+             interface exposes your project's source code to the network — anyone who \
+             can reach this port could read and write it. Re-run with --allow-remote to \
+             confirm you intend this."
+        );
+    }
+    warn!(
+        bind = %addr,
+        "SECURITY: binding to a non-loopback address (--allow-remote). The daemon is \
+         reachable from the network; only do this on a trusted network."
+    );
+    Ok(())
+}
+
 fn parse_args() -> Result<CliArgs> {
     let mut positional: Option<String> = None;
     let mut debug_echo = false;
     let mut bind: Option<String> = None;
     let mut reset_base_tree = false;
     let mut dry_run = false;
+    let mut allow_remote = false;
     let mut iter = std::env::args().skip(1);
     while let Some(arg) = iter.next() {
         if arg == "--debug-echo" {
@@ -332,6 +360,8 @@ fn parse_args() -> Result<CliArgs> {
             reset_base_tree = true;
         } else if arg == "--dry-run" {
             dry_run = true;
+        } else if arg == "--allow-remote" {
+            allow_remote = true;
         } else if arg == "--bind" {
             bind = Some(
                 iter.next()
@@ -347,6 +377,9 @@ fn parse_args() -> Result<CliArgs> {
             bail!("unexpected extra argument: {arg}");
         }
     }
+    // A non-loopback bind must be opted into explicitly — the default stays
+    // loopback and unaffected.
+    validate_bind_addr(bind.as_deref(), allow_remote)?;
 
     let dir = match positional {
         Some(s) => PathBuf::from(s),
@@ -6615,5 +6648,29 @@ mod security_tests {
         assert!(is_loopback_bind_addr("[::1]:0"));
         assert!(!is_loopback_bind_addr("0.0.0.0:34872"));
         assert!(!is_loopback_bind_addr("192.168.1.5:34872"));
+    }
+
+    // ─── B13: --bind requires --allow-remote for non-loopback ────────────
+    use super::validate_bind_addr;
+
+    #[test]
+    fn bind_default_and_loopback_pass_without_flag() {
+        // No override → default 127.0.0.1 behaviour, unchanged.
+        assert!(validate_bind_addr(None, false).is_ok());
+        assert!(validate_bind_addr(Some("127.0.0.1:34872"), false).is_ok());
+        assert!(validate_bind_addr(Some("127.0.0.1:0"), false).is_ok());
+        assert!(validate_bind_addr(Some("[::1]:0"), false).is_ok());
+    }
+
+    #[test]
+    fn bind_non_loopback_refused_without_allow_remote() {
+        assert!(validate_bind_addr(Some("0.0.0.0:34872"), false).is_err());
+        assert!(validate_bind_addr(Some("192.168.1.5:34872"), false).is_err());
+    }
+
+    #[test]
+    fn bind_non_loopback_allowed_with_flag() {
+        assert!(validate_bind_addr(Some("0.0.0.0:34872"), true).is_ok());
+        assert!(validate_bind_addr(Some("192.168.1.5:34872"), true).is_ok());
     }
 }
