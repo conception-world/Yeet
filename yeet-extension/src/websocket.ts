@@ -53,12 +53,23 @@ export interface YeetControlChannel {
 	on(event: "error", listener: (message: string) => void): this;
 }
 
-// Extension's own wire-protocol version. Daemon parses with semver and
-// requires `>= MIN_COMPATIBLE_PLUGIN_VERSION` (currently "0.3.0"). When
-// breaking the wire, bump this in lockstep with the daemon's constant
-// AND the plugin's `Widget.luau` literal so the three components agree
-// on the wire shape.
-const CLIENT_VERSION = "0.3.0";
+// Ambient identifier textually substituted at bundle time by esbuild's
+// `define` (see esbuild.js) with the JSON-stringified `version` field
+// from package.json. `tsc --noEmit` only needs the type — the value is
+// never read outside the esbuild-produced bundle, which is the only
+// way this extension ships or runs.
+declare const __YEET_CLIENT_VERSION__: string;
+
+// Extension's own wire-protocol version, derived from package.json at
+// build time so it can't drift from the extension's release version the
+// way a second hand-maintained literal did (this used to be a hardcoded
+// "0.3.0" long after package.json had moved on to "0.4.1"). Daemon
+// parses with semver and requires `>= MIN_COMPATIBLE_PLUGIN_VERSION`
+// (currently "0.2.0" in yeet-daemon/src/main.rs). When breaking the
+// wire, bump package.json's version and the plugin's `Widget.luau`
+// literal in lockstep with the daemon's constant so all three
+// components agree on the wire shape.
+const CLIENT_VERSION = __YEET_CLIENT_VERSION__;
 const ROLE = "extension";
 const INITIAL_BACKOFF_MS = 1_000;
 const MAX_BACKOFF_MS = 60_000;
