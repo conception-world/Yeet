@@ -55,7 +55,10 @@ export async function createProject(output: vscode.OutputChannel): Promise<void>
 	const projectFile = path.join(folder, "default.project.json");
 	if (fs.existsSync(projectFile)) {
 		const choice = await vscode.window.showWarningMessage(
-			"default.project.json already exists in this folder. Overwrite?",
+			"default.project.json already exists in this folder. Overwriting replaces the " +
+				"entire tree with the yeet.createTemplate scaffold — any custom mounts (Packages, " +
+				"extra services, hand-edited $path entries, etc.) not in that template will be lost. " +
+				"The current file will be backed up as default.project.json.bak first.",
 			{ modal: true },
 			"Overwrite",
 			"Cancel",
@@ -64,6 +67,7 @@ export async function createProject(output: vscode.OutputChannel): Promise<void>
 			output.appendLine("[yeet:create] cancelled (project already exists)");
 			return;
 		}
+		backupExistingProjectFile(projectFile, output);
 	}
 
 	const cfg = vscode.workspace.getConfiguration("yeet");
@@ -109,6 +113,25 @@ export async function createProject(output: vscode.OutputChannel): Promise<void>
 	void vscode.window.showInformationMessage(
 		`Yeet project scaffolded in ${path.basename(folder)}. Run Yeet: Start to begin sync.`,
 	);
+}
+
+/// Preserves the pre-overwrite `default.project.json` as a sibling `.bak`
+/// file so a user who confirmed the overwrite modal without fully reading it
+/// can still recover custom mounts (Packages, extra services) by hand. Best
+/// effort: a failed backup is logged but does not block the overwrite, since
+/// the user already confirmed the modal's warning about data loss.
+function backupExistingProjectFile(
+	projectFile: string,
+	output: vscode.OutputChannel,
+): void {
+	const backupFile = `${projectFile}.bak`;
+	try {
+		fs.copyFileSync(projectFile, backupFile);
+		output.appendLine(`[yeet:create] backed up existing project file to ${backupFile}`);
+	} catch (err) {
+		const message = err instanceof Error ? err.message : String(err);
+		output.appendLine(`[yeet:create] failed to back up ${projectFile}: ${message}`);
+	}
 }
 
 async function pickWorkspaceFolder(
@@ -227,10 +250,29 @@ function applyPath(tree: TreeNode, segments: string[], relDir: string): void {
 
 function writeGitignore(folder: string, output: vscode.OutputChannel): void {
 	const file = path.join(folder, ".gitignore");
-	const lines = [".yeet/", "build/", "*.rbxm", "*.rbxl", "*.rbxlx"];
+	// Wally (the de-facto Roblox package manager) installs packages into
+	// these directories; they're regenerated from wally.toml/package.json
+	// and shouldn't be committed, same as any other lockfile-driven
+	// dependency directory.
+	const lines = [
+		".yeet/",
+		"build/",
+		"*.rbxm",
+		"*.rbxl",
+		"*.rbxlx",
+		"Packages/",
+		"ServerPackages/",
+		"DevPackages/",
+		"node_modules/",
+	];
 	if (fs.existsSync(file)) {
 		const existing = fs.readFileSync(file, "utf8");
-		const missing = lines.filter((l) => !existing.includes(l));
+		// Exact line match, not substring — `existing.includes(l)` would
+		// treat a negated pattern like `!build/` as covering `build/`
+		// (it contains the substring), silently skipping the entry we
+		// actually need.
+		const existingLines = new Set(existing.split(/\r?\n/).map((s) => s.trim()));
+		const missing = lines.filter((l) => !existingLines.has(l));
 		if (missing.length === 0) {
 			return;
 		}
