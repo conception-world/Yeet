@@ -26,7 +26,7 @@ local ScrollList = require(script.Parent.components.ScrollList)
 
 type Payload = { [string]: any }
 type ConnectionHandle = {
-  send: (self: ConnectionHandle, payload: Payload) -> (),
+  send: (self: ConnectionHandle, payload: Payload) -> boolean,
   close: (self: ConnectionHandle) -> (),
 }
 type FileResolution = {
@@ -147,11 +147,20 @@ type ApplierHandle = {
     self: ApplierHandle,
     hook: ((snapshot: { { path: string, kind: string, content: string, sha256: string } }) -> ())?
   ) -> (),
+  setProjectRootMismatchHook: (
+    self: ApplierHandle,
+    hook: ((expected: string, got: string) -> ())?
+  ) -> (),
+  setPendingEditProbe: (
+    self: ApplierHandle,
+    probe: ((path: string) -> (string?, string?))?
+  ) -> (),
   reset: (self: ApplierHandle) -> (),
 }
 type SourceWatcherHandle = {
   track: (self: SourceWatcherHandle, path: string, instance: Instance) -> (),
   untrack: (self: SourceWatcherHandle, path: string) -> (),
+  peekPending: (self: SourceWatcherHandle, path: string) -> (string?, string?),
   destroy: (self: SourceWatcherHandle) -> (),
 }
 
@@ -901,23 +910,40 @@ function Widget._onConnectPressed(self: Widget)
     resolvePath = function(instance)
       return applier:resolvePath(instance)
     end,
-    onEdit = function(path, content, hash)
-      applier:recordSelfEdit(path, hash)
+    onEdit = function(path, content, hash): boolean
       if self.paused then
-        -- Pause swallows outgoing edits. The recordSelfEdit above still
-        -- runs so isEcho keeps the local mirror consistent if a stale
-        -- daemon broadcast arrives mid-pause.
-        return
+        -- Pause swallows outgoing edits, but still record the self-edit so
+        -- isEcho keeps the local mirror consistent if a stale daemon
+        -- broadcast arrives mid-pause. Report false so the watcher skips its
+        -- "-> file_changed" log (nothing went on the wire).
+        applier:recordSelfEdit(path, hash)
+        return false
       end
       local current = self.connection
-      if current ~= nil then
-        current:send({
-          type = "file_changed",
-          path = path,
-          content = content,
-          sha256 = hash,
-        })
+      if current == nil then
+        -- B11: mirror the other hooks — a fully torn-down connection (nil
+        -- Handle) should not swallow the edit silently. (A transient
+        -- disconnect keeps the Handle non-nil and is buffered by Reconnect.)
+        self:_appendLog(`edit ignored (disconnected): {path}`)
+        return false
       end
+      local sent = current:send({
+        type = "file_changed",
+        path = path,
+        content = content,
+        sha256 = hash,
+      })
+      if sent then
+        -- B10: seat the echo only after a successful (or buffered) send, so a
+        -- frame that never left keeps recentlyApplied honest.
+        applier:recordSelfEdit(path, hash)
+      else
+        -- B10: the socket looked usable but the frame did not go out. Surface
+        -- a distinct warning instead of only the generic "error:" line, which
+        -- left the status dot green and the "-> file_changed" log misleading.
+        self:_appendLog(`!! file_changed send FAILED (still connected?): {path}`)
+      end
+      return sent
     end,
     onDelete = function(path)
       applier:forgetLocalDelete(path)
@@ -930,6 +956,10 @@ function Widget._onConnectPressed(self: Widget)
           type = "file_deleted",
           path = path,
         })
+      else
+        -- B11: symmetric with onEdit — surface the dropped delete instead of
+        -- swallowing it.
+        self:_appendLog(`delete ignored (disconnected): {path}`)
       end
     end,
     onRename = function(oldPath, newPath, kind, content, hash)
@@ -973,6 +1003,11 @@ function Widget._onConnectPressed(self: Widget)
     sourceWatcher:track(path, instance)
   end, function(path)
     sourceWatcher:untrack(path)
+  end)
+  -- A3: let the Applier consult the watcher for a pending, not-yet-sent
+  -- Studio edit before it overwrites Source with daemon content.
+  applier:setPendingEditProbe(function(path: string)
+    return sourceWatcher:peekPending(path)
   end)
   applier:setConflictDispatcher(function(conflicts)
     self.resolver:enqueue(conflicts)
@@ -1060,6 +1095,21 @@ function Widget._onConnectPressed(self: Widget)
   -- `ProjectOpened` (which skips auto-materialize and hands a snapshot back
   -- to this Widget for forwarding).
   applier:setBootstrapPreviewMode(true)
+  -- M26: refuse to materialize if the daemon starts advertising a different
+  -- project_root than the one we first bootstrapped against (cross-project
+  -- corruption guard). The Applier caches the root and fires this on a
+  -- mismatch; we surface it and tear the connection down.
+  applier:setProjectRootMismatchHook(function(expected: string, got: string)
+    self:_appendLog(
+      `!! daemon switched project_root ({expected} -> {got}); disconnecting to avoid cross-project corruption`
+    )
+    -- Defer the teardown: we're inside applier:dispatch, itself inside the
+    -- socket MessageReceived handler; tearing the connection down mid-stack
+    -- would disconnect the very signal we are running in.
+    task.defer(function()
+      self:_teardownConnection()
+    end)
+  end)
   -- Auth handlers. The daemon issues a token via `auth_granted` when the
   -- extension's pairing breadcrumb is fresh; we cache it and replay it in
   -- `Hello.auth_token` on future reconnects. The daemon regenerates its token
@@ -1068,6 +1118,7 @@ function Widget._onConnectPressed(self: Widget)
   -- that was a credential leak). On rejection we MUST clear the cached token so
   -- the automatic reconnect re-pairs tokenless via a fresh breadcrumb; keeping
   -- the stale token would loop reject→reconnect→reject forever.
+
   applier:setAuthGrantedHandler(function(payload: any)
     local token = tostring(payload.auth_token or "")
     if token == "" then
@@ -1304,6 +1355,9 @@ function Widget._onConnectPressed(self: Widget)
     end,
     onResumed = function(_sessionId: string, replayed: number)
       self:_appendLog(`resumed: {replayed} buffered frame(s)`)
+    end,
+    onOutgoingFlush = function(count: number)
+      self:_appendLog(`flushed {count} buffered edit(s) after reconnect`)
     end,
     onClose = function()
       self:_appendLog("socket closed")

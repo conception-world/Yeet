@@ -16,7 +16,7 @@ local Connection = require(script.Parent.Connection)
 export type Payload = { [string]: any }
 
 type ConnectionHandle = {
-	send: (self: ConnectionHandle, payload: Payload) -> (),
+	send: (self: ConnectionHandle, payload: Payload) -> boolean,
 	close: (self: ConnectionHandle) -> (),
 }
 
@@ -37,6 +37,10 @@ export type Handlers = {
 	-- Fires when the daemon sends `Resumed`; distinct from the cold-bootstrap
 	-- `ProjectOpened`. The widget uses this to suppress TreeBuilder rebuilds.
 	onResumed: ((sessionId: string, replayed: number) -> ())?,
+	-- Fires after buffered plugin→daemon frames are flushed on (re)open, with
+	-- the number flushed. Optional; the Widget logs a resync line so the user
+	-- sees that edits made during the outage were re-sent (A6).
+	onOutgoingFlush: ((count: number) -> ())?,
 	-- Called on each (re)open to produce the hello payload. The caller owns
 	-- the shape (e.g. `version`, `studio_snapshot`); we just inject
 	-- `session_id` when one has been captured.
@@ -49,7 +53,10 @@ export type Handlers = {
 }
 
 export type Handle = {
-	send: (self: Handle, payload: Payload) -> (),
+	-- Returns true when the frame reached the socket or was buffered for a
+	-- later flush (A6); false when it was dropped. Callers gate "sent"
+	-- bookkeeping/logging on this (B10).
+	send: (self: Handle, payload: Payload) -> boolean,
 	close: (self: Handle) -> (),
 	getSessionId: (self: Handle) -> string?,
 }
@@ -81,6 +88,82 @@ function Reconnect.run(url: string, handlers: Handlers): Handle
 	local heartbeatGen = 0
 	local lastPongAt = 0
 	local pingSeq: number = 0
+
+	-- A6: outgoing buffer. Plugin→daemon frames have no resilience buffer
+	-- (unlike the daemon's pending_deltas), so an edit made while the socket
+	-- is transiently down (during backoff) used to be silently dropped. We
+	-- queue the sync mutations here and flush them on the next open (resume or
+	-- fresh handshake), so the daemon reconciles the plugin→daemon direction.
+	local OUTGOING_BUFFER_CAP = 4096
+	local outgoingBuffer: { Payload } = {}
+	-- path -> index into outgoingBuffer of that path's most recent frame. Lets
+	-- us collapse consecutive file_changed for the same path (keep latest)
+	-- without disturbing causal order across different paths or op types: a
+	-- create/delete/rename recorded between two changes breaks the collapse.
+	local outgoingLastIdx: { [string]: number } = {}
+	local outgoingOverflowWarned = false
+
+	local function enqueueOutgoing(payload: Payload)
+		local kind = payload["type"]
+		local path = payload["path"]
+		if kind == "file_changed" and typeof(path) == "string" then
+			local idx = outgoingLastIdx[path]
+			if idx ~= nil then
+				local prev = outgoingBuffer[idx]
+				if prev ~= nil and prev["type"] == "file_changed" then
+					-- Same path, previous op also a plain change, nothing else
+					-- touched this path since → keep only the latest content.
+					outgoingBuffer[idx] = payload
+					return
+				end
+			end
+		end
+		table.insert(outgoingBuffer, payload)
+		local newIdx = #outgoingBuffer
+		if typeof(path) == "string" then
+			outgoingLastIdx[path] = newIdx
+		end
+		if kind == "file_renamed" then
+			local oldPath = payload["old_path"]
+			local newPath = payload["new_path"]
+			if typeof(oldPath) == "string" then
+				outgoingLastIdx[oldPath] = newIdx
+			end
+			if typeof(newPath) == "string" then
+				outgoingLastIdx[newPath] = newIdx
+			end
+		end
+		if #outgoingBuffer > OUTGOING_BUFFER_CAP then
+			-- Bound memory across a long outage: drop the oldest frame and
+			-- clear the index map so later enqueues simply append (correctness
+			-- holds; we only lose the O(1) collapse for the overflow tail).
+			table.remove(outgoingBuffer, 1)
+			table.clear(outgoingLastIdx)
+			if not outgoingOverflowWarned then
+				outgoingOverflowWarned = true
+				handlers.onError(
+					`outgoing buffer exceeded {OUTGOING_BUFFER_CAP} frames; dropping oldest edits`
+				)
+			end
+		end
+	end
+
+	local function flushOutgoing(conn: ConnectionHandle)
+		if #outgoingBuffer == 0 then
+			return
+		end
+		local pending = outgoingBuffer
+		outgoingBuffer = {}
+		table.clear(outgoingLastIdx)
+		outgoingOverflowWarned = false
+		for _, payload in pending do
+			conn:send(payload)
+		end
+		local notify = handlers.onOutgoingFlush
+		if notify ~= nil then
+			notify(#pending)
+		end
+	end
 
 	local tryConnect: () -> ()
 
@@ -116,6 +199,11 @@ function Reconnect.run(url: string, handlers: Handlers): Handle
 				end
 				local payload = handlers.buildHelloPayload(sessionId)
 				current:send(payload)
+				-- A6: flush edits buffered while the socket was down, right
+				-- after the Hello so they ride the same (resumed or fresh)
+				-- session. `current` is the raw Connection handle, so this
+				-- bypasses Handle.send's re-buffering.
+				flushOutgoing(current)
 				-- Arm the heartbeat for this connection. Bumping the gen
 				-- invalidates any previous-connection timer task that
 				-- might still be sleeping. Seed lastPongAt to "now" so
@@ -225,18 +313,37 @@ function Reconnect.run(url: string, handlers: Handlers): Handle
 
 	local handle: Handle
 	handle = {
-		send = function(_self: Handle, payload: Payload)
+		send = function(_self: Handle, payload: Payload): boolean
 			local conn = currentConn
 			if conn ~= nil then
-				conn:send(payload)
-			else
-				handlers.onError("send while disconnected")
+				return conn:send(payload)
 			end
+			-- Socket is down (transient close during backoff). Buffer the
+			-- plugin→daemon sync mutations so an edit made in the gap isn't
+			-- dropped (A6); the flush happens on the next open. Non-mutation
+			-- frames are request-scoped or regenerated on open, so they keep
+			-- the report-and-drop behavior.
+			local kind = payload["type"]
+			local isMutation = kind == "file_changed"
+				or kind == "file_created"
+				or kind == "file_deleted"
+				or kind == "file_renamed"
+			if not userClosed and isMutation then
+				enqueueOutgoing(payload)
+				-- Buffered → deferred success (flushed on the next open).
+				return true
+			end
+			handlers.onError("send while disconnected")
+			return false
 		end,
 		close = function(_self: Handle)
 			userClosed = true
 			local conn = currentConn
 			currentConn = nil
+			-- Drop buffered edits: the session is over and they would never
+			-- flush (scheduleReconnect/tryConnect are gated on userClosed).
+			outgoingBuffer = {}
+			table.clear(outgoingLastIdx)
 			if conn ~= nil then
 				conn:close()
 			end

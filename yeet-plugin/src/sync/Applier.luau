@@ -213,6 +213,22 @@ type self = {
 	-- UI through the existing `BulkSyncPreview`/`BulkSyncConfirm` messages.
 	bootstrapPreviewMode: boolean,
 	onBootstrapSnapshot: BootstrapSnapshotHook?,
+	-- Cached `project_root` advertised by the daemon on the first
+	-- ProjectOpened. Compared on every later ProjectOpened so a daemon that
+	-- switched projects (restart pointed elsewhere, reused socket) can't
+	-- materialize the wrong tree into this place (M26). Persists across
+	-- re-bootstraps — deliberately NOT cleared by resetPerSessionState — so
+	-- the guard survives a daemon restart.
+	projectRoot: string?,
+	-- Fired when a later ProjectOpened's project_root disagrees with the
+	-- cached one; the Widget tears the connection down. Optional: absent in
+	-- minimal/test wirings, where the loud log line is the only signal.
+	onProjectRootMismatch: ((expected: string, got: string) -> ())?,
+	-- Injected by the Widget: queries the SourceWatcher for a pending,
+	-- not-yet-sent Studio edit at `path`, returning (content, hash) or nil.
+	-- applyFileChanged consults it so a daemon FileChanged doesn't silently
+	-- clobber an in-flight user edit (A3).
+	pendingEditProbe: ((path: string) -> (string?, string?))?,
 	-- `DescendantAdded` listeners rooted on each `$path` mapping parent.
 	-- Kept so `reset()` can disconnect them alongside the rest of the
 	-- bootstrap-owned state.
@@ -256,6 +272,9 @@ function Applier.new(log: Log): Applier
 		onAuthRejected = nil :: ((any) -> ())?,
 		bootstrapPreviewMode = false,
 		onBootstrapSnapshot = nil :: BootstrapSnapshotHook?,
+		projectRoot = nil :: string?,
+		onProjectRootMismatch = nil :: ((expected: string, got: string) -> ())?,
+		pendingEditProbe = nil :: ((path: string) -> (string?, string?))?,
 		liveConnections = {} :: { RBXScriptConnection },
 		applyingDaemonCreate = false,
 	}, Applier)
@@ -267,6 +286,20 @@ end
 
 function Applier.setBootstrapSnapshotHook(self: Applier, hook: BootstrapSnapshotHook?)
 	self.onBootstrapSnapshot = hook
+end
+
+function Applier.setProjectRootMismatchHook(
+	self: Applier,
+	hook: ((expected: string, got: string) -> ())?
+)
+	self.onProjectRootMismatch = hook
+end
+
+function Applier.setPendingEditProbe(
+	self: Applier,
+	probe: ((path: string) -> (string?, string?))?
+)
+	self.pendingEditProbe = probe
 end
 
 function Applier.setTrackHooks(self: Applier, onTracked: TrackHook, onUntracked: UntrackHook)
@@ -512,14 +545,29 @@ local function registerTracked(self: Applier, path: string, inst: Instance, hash
 	end
 end
 
-local function applyProjectOpenedForPreview(self: Applier, project: Project)
-	-- Wipe per-session state the same way the apply path does — the preview
-	-- will drive fresh materializations as the user confirms resolutions.
+-- Wipes the per-session bookkeeping shared by the bootstrap entry points
+-- (preview + legacy re-bootstrap) and by `reset()`. Extracted so those paths
+-- can't drift: M13 was exactly that drift — the preview path forgot
+-- `instanceToPath`/`pendingCollisions`, leaking references to destroyed
+-- Instances across re-bootstraps. Does NOT touch `liveConnections`,
+-- `bootstrapped`, or the buffered preview frames — callers own those.
+local function resetPerSessionState(self: Applier)
 	self.recentlyApplied = {}
 	self.recentlyAppliedCount = 0
 	self.fileToInstance = {}
+	self.instanceToPath = {}
+	self.pendingCollisions = {}
 	self.mappings = {}
 	self.appliedAttributes = {}
+end
+
+local function applyProjectOpenedForPreview(self: Applier, project: Project)
+	-- Wipe per-session state the same way the apply path does — the preview
+	-- will drive fresh materializations as the user confirms resolutions.
+	-- REGRESSION(M13): the wipe MUST include instanceToPath/pendingCollisions
+	-- (the legacy re-bootstrap path already cleared them); routing both paths
+	-- through resetPerSessionState keeps them from diverging again.
+	resetPerSessionState(self)
 
 	local result = TreeBuilder.discover(project)
 	self.mappings = result.mappings
@@ -628,6 +676,32 @@ local function applyProjectOpened(self: Applier, msg: any)
 			)
 		end
 	end
+	-- REGRESSION(M26): guard against a daemon serving a DIFFERENT project than
+	-- the one this plugin first bootstrapped against (daemon restarted pointed
+	-- elsewhere, or a place connected to a reused socket). Materializing
+	-- project A's tree into place B's DataModel is silent cross-project
+	-- corruption. Cache project_root on the first ProjectOpened; on a later one
+	-- that differs, refuse to materialize and signal the Widget to disconnect.
+	-- The cache lives on the Applier (one per Reconnect session), so it spans
+	-- resume/re-bootstrap but resets on a fresh user-initiated connect.
+	local incomingRoot = msg.project_root
+	if typeof(incomingRoot) == "string" and incomingRoot ~= "" then
+		local cachedRoot = self.projectRoot
+		if cachedRoot == nil then
+			self.projectRoot = incomingRoot
+		elseif cachedRoot ~= incomingRoot then
+			self.log(
+				`!! project_root changed ({cachedRoot} -> {incomingRoot}); `
+					.. `refusing to materialize a different project into this place. `
+					.. `Disconnect and reconnect to the correct daemon.`
+			)
+			local hook = self.onProjectRootMismatch
+			if hook ~= nil then
+				hook(cachedRoot, incomingRoot)
+			end
+			return
+		end
+	end
 	local project: Project = msg.project
 	local initialFiles: { FileSnapshot } = msg.initial_files
 	if self.bootstrapPreviewMode then
@@ -644,13 +718,7 @@ local function applyProjectOpened(self: Applier, msg: any)
 	-- pass is a no-op for instances that already existed; wiping our own
 	-- bookkeeping first just keeps `recentlyApplied` honest.
 	if self.bootstrapped then
-		self.recentlyApplied = {}
-		self.recentlyAppliedCount = 0
-		self.fileToInstance = {}
-		self.instanceToPath = {}
-		self.pendingCollisions = {}
-		self.mappings = {}
-		self.appliedAttributes = {}
+		resetPerSessionState(self)
 	end
 	local divergent: { { path: string, kind: ScriptKind, studio_content: string } } = {}
 	local untracked: { { path: string, kind: ScriptKind, studio_content: string } } = {}
@@ -791,6 +859,22 @@ local function applyFileChanged(self: Applier, msg: any)
 	end
 	local content: string = msg.content
 	local hash: string = msg.sha256
+	-- REGRESSION(A3): before overwriting Source, check for a local,
+	-- not-yet-sent Studio edit. If one exists and differs from the daemon's
+	-- content, overwriting would silently clobber the user's edit (a lost
+	-- update with no conflict dialog). Skip the write and let the
+	-- SourceWatcher's captured edit flow to the daemon, which then surfaces
+	-- the divergence as a conflict. An equal-hash pending is the same content,
+	-- so we fall through and apply (a harmless no-op that keeps the echo
+	-- bookkeeping seeded).
+	local probe = self.pendingEditProbe
+	if probe ~= nil then
+		local _, pendingHash = probe(msg.path)
+		if pendingHash ~= nil and pendingHash ~= hash then
+			self.log(`~ {msg.path} (local edit pending; not overwriting — daemon will reconcile)`)
+			return
+		end
+	end
 	-- Seat the hash BEFORE the assignment: `GetPropertyChangedSignal` fires
 	-- synchronously during the write, and the watcher will read
 	-- `recentlyApplied` inside that callback.
@@ -829,6 +913,67 @@ local function applyFileDeleted(self: Applier, msg: any)
 	else
 		self.log(`delete failed {msg.path}: {err}`)
 	end
+end
+
+-- Directory portion of a project-relative path (everything before the last
+-- `/`; "" when there is no slash). Used only as the cheap gate deciding
+-- whether a rename changed the containing directory — the precise target
+-- parent is resolved by `resolveRenameContainer`.
+local function dirPortion(path: string): string
+	return path:match("^(.*)/[^/]*$") or ""
+end
+
+-- Resolves the Instance that should PARENT a script living at `path`,
+-- creating intermediate Folders as needed. Mirrors materializeFile's
+-- container walk (which TreeBuilder doesn't export): pick the longest
+-- `$path`-prefix mapping, then walk the directory components, dropping the
+-- trailing component(s) that identify the file itself — 1 for a leaf, 2 for
+-- an `init.[ext]` promotion (dir-name + init file). Returns nil when `path`
+-- is outside every mapping or the shape can't be represented (e.g. an
+-- `init.luau` directly at a mount point, which has no parent directory).
+local function resolveRenameContainer(self: Applier, path: string): Instance?
+	local bestKey: string? = nil
+	local bestParent: Instance? = nil
+	local bestLen = -1
+	for mapPath, parent in pairs(self.mappings) do
+		local isExact = path == mapPath
+		local isDescendant = string.sub(path, 1, #mapPath + 1) == (mapPath .. "/")
+		if (isExact or isDescendant) and #mapPath > bestLen then
+			bestKey = mapPath
+			bestParent = parent
+			bestLen = #mapPath
+		end
+	end
+	if bestKey == nil or bestParent == nil then
+		return nil
+	end
+	local relPath = if path == bestKey then "" else string.sub(path, #bestKey + 2)
+	local parts: { string } = {}
+	for part in string.gmatch(relPath, "[^/]+") do
+		table.insert(parts, part)
+	end
+	if #parts == 0 then
+		return nil
+	end
+	local dropTail = if TreeBuilder.isInitFilename(path) then 2 else 1
+	local containerParts = #parts - dropTail
+	if containerParts < 0 then
+		return nil
+	end
+	local container: Instance = bestParent
+	for i = 1, containerParts do
+		local childName = parts[i]
+		local existing = container:FindFirstChild(childName)
+		if existing ~= nil then
+			container = existing
+		else
+			local fresh = Instance.new("Folder")
+			fresh.Name = childName
+			fresh.Parent = container
+			container = fresh
+		end
+	end
+	return container
 end
 
 -- Applies a daemon-originated rename (echo from another client, or the
@@ -877,9 +1022,31 @@ local function applyFileRenamed(self: Applier, msg: any)
 	end
 	seatEcho(self, newPath, hash, #content)
 	local newName = TreeBuilder.basenameFor(newPath)
+	local oldDir = dirPortion(oldPath)
+	local newDir = dirPortion(newPath)
 	local ok, err = withRecording("YeetFileRenamed", function()
 		if newName ~= "" and (inst :: any).Name ~= newName then
 			(inst :: any).Name = newName
+		end
+		-- REGRESSION(A8): a move between directories (even with an unchanged
+		-- basename) must re-parent the instance, not merely touch Name/Source.
+		-- Without this the instance stays under the OLD container while
+		-- disk/tree point at the new one, and a later FileChanged writes into
+		-- the mis-parented node. Gate on the directory portion so pure
+		-- in-place renames skip the (folder-creating) container walk.
+		if oldDir ~= newDir then
+			local target = resolveRenameContainer(self, newPath)
+			if target == nil then
+				self.log(`rename: no container resolved for {newPath}; parent left unchanged`)
+			elseif target == inst or target:IsDescendantOf(inst) then
+				-- Degenerate: newPath's directory chain resolves through the
+				-- instance being moved (e.g. Foo.luau -> Foo/Bar.luau).
+				-- Re-parenting into itself/its subtree would throw; leave the
+				-- parent and let the next reconcile settle the shape.
+				self.log(`rename: {newPath} container is the moved instance; parent left unchanged`)
+			elseif inst.Parent ~= target then
+				(inst :: any).Parent = target
+			end
 		end
 		local currentSource = (inst :: LuaSourceContainer).Source
 		if currentSource ~= content then
@@ -1390,14 +1557,8 @@ function Applier.reset(self: Applier)
 		conn:Disconnect()
 	end
 	table.clear(self.liveConnections)
-	self.fileToInstance = {}
-	self.instanceToPath = {}
-	self.pendingCollisions = {}
-	self.mappings = {}
+	resetPerSessionState(self)
 	self.bootstrapped = false
-	self.recentlyApplied = {}
-	self.recentlyAppliedCount = 0
-	self.appliedAttributes = {}
 	-- Drop any unprocessed bulk_sync_preview frames from the previous
 	-- session — they reference a request_id the daemon already retired.
 	self.bufferedBulkSyncPreviews = {}
