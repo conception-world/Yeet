@@ -250,7 +250,21 @@ function applyPath(tree: TreeNode, segments: string[], relDir: string): void {
 
 function writeGitignore(folder: string, output: vscode.OutputChannel): void {
 	const file = path.join(folder, ".gitignore");
-	const lines = [".yeet/", "build/", "*.rbxm", "*.rbxl", "*.rbxlx"];
+	// Wally (the de-facto Roblox package manager) installs packages into
+	// these directories; they're regenerated from wally.toml/package.json
+	// and shouldn't be committed, same as any other lockfile-driven
+	// dependency directory.
+	const lines = [
+		".yeet/",
+		"build/",
+		"*.rbxm",
+		"*.rbxl",
+		"*.rbxlx",
+		"Packages/",
+		"ServerPackages/",
+		"DevPackages/",
+		"node_modules/",
+	];
 	if (fs.existsSync(file)) {
 		const existing = fs.readFileSync(file, "utf8");
 		// Exact line match, not substring — `existing.includes(l)` would
