@@ -330,6 +330,19 @@ fn write_instance(
 ) -> Result<()> {
     let inst = &ctx.instances[&id];
 
+    // M7 (wally-6): never materialize a package-manager landing. These trees
+    // are generated and owned by Wally/pesde and get corrupted if syncback
+    // rewrites them (`.lua`→`.luau`, deformed structure); the package manager
+    // regenerates them via its own install step. Skip by name, mirroring the
+    // daemon's SWEEP_SKIP_DIR_NAMES.
+    if is_package_manager_dir(&sanitize_name(&inst.name)) {
+        ctx.stats.warnings.push(format!(
+            "skipped package-manager tree {}/{} during syncback (owned by the package manager, not written by Yeet)",
+            parent_rel, inst.name
+        ));
+        return Ok(());
+    }
+
     // Binary payloads carry their own subtree and aren't gated by
     // `include_non_script` — the plugin only emits them when the user has
     // explicitly opted in via `include_binary`. We still honor the daemon-side
@@ -516,6 +529,28 @@ const WINDOWS_RESERVED: &[&str] = &[
     "CON", "PRN", "AUX", "NUL", "COM1", "COM2", "COM3", "COM4", "COM5", "COM6", "COM7", "COM8",
     "COM9", "LPT1", "LPT2", "LPT3", "LPT4", "LPT5", "LPT6", "LPT7", "LPT8", "LPT9",
 ];
+
+/// Package-manager landing directory names that syncback must never
+/// materialize (M7 / wally-6). These trees are generated and owned by the
+/// package manager (Wally / pesde) and get corrupted if the reverse-bootstrap
+/// rewrites them (`.lua`→`.luau`, deformed structure, lost nested project
+/// files). Mirrors `SWEEP_SKIP_DIR_NAMES` in `main.rs`, kept in sync by hand
+/// because that const lives in the binary crate root and isn't reachable from
+/// this library module.
+const PACKAGE_MANAGER_DIR_NAMES: &[&str] = &[
+    "Packages",
+    "_Index",
+    "roblox_packages",
+    ".pesde",
+    "node_modules",
+    ".yeet",
+];
+
+/// True when `name` (already sanitized) is a package-manager landing that
+/// syncback must skip. See `PACKAGE_MANAGER_DIR_NAMES`.
+fn is_package_manager_dir(name: &str) -> bool {
+    PACKAGE_MANAGER_DIR_NAMES.contains(&name)
+}
 
 fn sanitize_name(raw: &str) -> String {
     let mut out = String::with_capacity(raw.len());
@@ -1259,5 +1294,51 @@ mod tests {
         );
         assert_eq!(ctx.stats.scripts_written, 1);
         assert!(ctx.stats.warnings.is_empty());
+    }
+
+    // ─── M7: skip package-manager landings during syncback (wally-6) ──────
+
+    #[test]
+    fn write_children_skips_package_manager_dirs() {
+        // A `Packages` landing (and its `_Index`) is owned by the package
+        // manager; syncback must not rewrite it. Skipped by name, mirroring
+        // the daemon's SWEEP_SKIP_DIR_NAMES.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let opts = test_opts(dir.path().to_path_buf());
+        let mut instances = HashMap::new();
+        instances.insert(1, inst(1, Some(0), "Folder", "Packages"));
+        instances.insert(2, inst(2, Some(1), "Folder", "_Index"));
+        instances.insert(3, script_inst(3, Some(2), "SomePkg", "return 'pkg'\n"));
+        instances.insert(4, script_inst(4, Some(0), "MyModule", "return 'mine'\n"));
+        let mut children = HashMap::new();
+        children.insert(0u64, vec![1u64, 4u64]);
+        children.insert(1u64, vec![2u64]);
+        children.insert(2u64, vec![3u64]);
+
+        let mut ctx = WriteContext {
+            opts: &opts,
+            instances: &instances,
+            children: &children,
+            stats: SyncbackStats::default(),
+            tree_base: Tree::new(),
+        };
+        write_children(0, dir.path(), "src", &mut ctx).expect("write_children");
+
+        assert!(
+            !dir.path().join("Packages").exists(),
+            "the Packages landing must be skipped entirely"
+        );
+        assert!(
+            dir.path().join("MyModule.luau").exists(),
+            "a normal sibling must still be materialized"
+        );
+        assert!(
+            ctx.stats
+                .warnings
+                .iter()
+                .any(|w| w.to_lowercase().contains("package")),
+            "expected a skip warning, got: {:?}",
+            ctx.stats.warnings
+        );
     }
 }
