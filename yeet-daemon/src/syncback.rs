@@ -358,11 +358,21 @@ fn write_instance(
     let script_kind = script_kind_of(inst);
     let child_ids = ctx.children.get(&id).cloned().unwrap_or_default();
 
-    let sanitized_base = sanitize_name(&inst.name);
+    let mut sanitized_base = sanitize_name(&inst.name);
+    // M21 (path-3): reserve the promotion stems (`init` / `init.server` /
+    // `init.client`) for a *leaf* script. Writing one as `init*.luau` lets the
+    // re-ingest reader promote the PARENT directory from it, absorbing this
+    // instance and shadowing a real folder-init.
+    if let Some(kind) = script_kind
+        && child_ids.is_empty()
+        && is_reserved_leaf_stem(&sanitized_base, kind)
+    {
+        sanitized_base = format!("_{sanitized_base}");
+    }
     let name = disambiguate(&sanitized_base, used_names);
     if name != inst.name {
         ctx.stats.warnings.push(format!(
-            "renamed {}/{} -> {}/{} (illegal or case-insensitive duplicate name)",
+            "renamed {}/{} -> {}/{} (illegal, reserved, or case-insensitive duplicate name)",
             parent_rel, inst.name, parent_rel, name
         ));
     }
@@ -550,6 +560,20 @@ fn disambiguate(base: &str, used: &BTreeSet<String>) -> String {
         }
     }
     unreachable!("exhausted 2^32 name suffixes");
+}
+
+/// True when a LEAF script's generated on-disk stem (`name` + kind suffix, no
+/// `.luau` extension) would equal a directory-promotion stem — `init`,
+/// `init.server`, or `init.client`. Such a file is read back on the next
+/// Studio→disk round-trip as the *parent* directory's own source, silently
+/// absorbing this instance and shadowing a real folder-init (M21 / path-3).
+/// The match is case-sensitive because the promotion reader matches these
+/// literally. Callers must gate on the instance being a childless script; a
+/// folder or a script-with-children legitimately owns an `init.luau` inside
+/// its own directory and must not be renamed.
+fn is_reserved_leaf_stem(name: &str, kind: ScriptKind) -> bool {
+    let stem = format!("{name}{}", script_suffix(kind));
+    matches!(stem.as_str(), "init" | "init.server" | "init.client")
 }
 
 // ─── Instance classification helpers ──────────────────────────────────────
@@ -1066,5 +1090,92 @@ mod tests {
         // Windows a trailing `aux.config.luau` resolves to the AUX *device*,
         // so `exists()` can report true regardless of what we wrote.
         assert_eq!(stats.scripts_written, 1);
+    }
+
+    // ─── M21: leaf instance named `init` (path-3) ─────────────────────────
+
+    #[test]
+    fn write_instance_reserves_leaf_named_init_against_parent_promotion() {
+        // A leaf script literally named `init` collides with the PARENT's own
+        // promotion file (`init.luau`) and would clobber it; on re-ingest the
+        // parent absorbs the leaf. It must be renamed (`_init`) with a warning.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let opts = test_opts(dir.path().to_path_buf());
+        // Foo is a ModuleScript WITH a child -> promoted to Foo/init.luau (its
+        // own source). Its child is a leaf ModuleScript literally named `init`.
+        let mut instances = HashMap::new();
+        instances.insert(1, script_inst(1, Some(0), "Foo", "foo-source\n"));
+        instances.insert(2, script_inst(2, Some(1), "init", "leaf-source\n"));
+        let mut children = HashMap::new();
+        children.insert(0u64, vec![1u64]);
+        children.insert(1u64, vec![2u64]);
+
+        let mut ctx = WriteContext {
+            opts: &opts,
+            instances: &instances,
+            children: &children,
+            stats: SyncbackStats::default(),
+            tree_base: Tree::new(),
+        };
+        write_children(0, dir.path(), "src", &mut ctx).expect("write_children");
+
+        // Foo's own promotion source survives intact...
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join("Foo/init.luau")).unwrap(),
+            "foo-source\n"
+        );
+        // ...and the leaf `init` is written to a distinct, non-promotion file.
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join("Foo/_init.luau")).unwrap(),
+            "leaf-source\n"
+        );
+        assert!(
+            ctx.stats.warnings.iter().any(|w| w.contains("init")),
+            "expected a rename warning, got: {:?}",
+            ctx.stats.warnings
+        );
+    }
+
+    #[test]
+    fn write_instance_reserves_leaf_init_for_all_script_kinds() {
+        // Each leaf named `init`, one per kind, must be pushed off the
+        // promotion filename for that kind.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let opts = test_opts(dir.path().to_path_buf());
+        let mut instances = HashMap::new();
+        instances.insert(10, inst(10, Some(0), "Folder", "M"));
+        instances.insert(11, script_inst(11, Some(10), "init", "m\n")); // ModuleScript
+        instances.insert(20, inst(20, Some(0), "Folder", "S"));
+        let mut s = inst(21, Some(20), "Script", "init");
+        s.properties
+            .insert("Source".to_owned(), SerializedProperty::String("s\n".to_owned()));
+        instances.insert(21, s);
+        instances.insert(30, inst(30, Some(0), "Folder", "L"));
+        let mut l = inst(31, Some(30), "LocalScript", "init");
+        l.properties
+            .insert("Source".to_owned(), SerializedProperty::String("l\n".to_owned()));
+        instances.insert(31, l);
+        let mut children = HashMap::new();
+        children.insert(0u64, vec![10u64, 20u64, 30u64]);
+        children.insert(10u64, vec![11u64]);
+        children.insert(20u64, vec![21u64]);
+        children.insert(30u64, vec![31u64]);
+
+        let mut ctx = WriteContext {
+            opts: &opts,
+            instances: &instances,
+            children: &children,
+            stats: SyncbackStats::default(),
+            tree_base: Tree::new(),
+        };
+        write_children(0, dir.path(), "src", &mut ctx).expect("write_children");
+
+        assert!(dir.path().join("M/_init.luau").exists());
+        assert!(dir.path().join("S/_init.server.luau").exists());
+        assert!(dir.path().join("L/_init.client.luau").exists());
+        // No promotion-shaped leaf leaked through.
+        assert!(!dir.path().join("M/init.luau").exists());
+        assert!(!dir.path().join("S/init.server.luau").exists());
+        assert!(!dir.path().join("L/init.client.luau").exists());
     }
 }
