@@ -17,8 +17,12 @@
 -- This component renders one TextLabel per line per column, so file
 -- sizes >~5K lines start to feel sluggish — the dock's ScrollingFrame
 -- still works but the initial Roact mount cost is O(N). For the typical
--- Roblox script this is fine; large generated files would need
--- virtualization (out of scope for now).
+-- Roblox script this is fine. Above diffLines' MAX_DIFF_LINES cap,
+-- `diffLines.align` returns a sentinel (see REGRESSION(A15) in
+-- diffLines.luau) and this component renders a plain-text fallback
+-- (one TextLabel per side, not per line) instead of the per-line
+-- render below. True virtualization of the normal per-line render is
+-- still out of scope.
 
 local Roact = require(script.Parent.Parent.Parent.Packages.Roact)
 local theme = require(script.Parent.Parent.theme)
@@ -191,16 +195,120 @@ local function buildColumn(
 	}, children)
 end
 
+-- REGRESSION(A15) fallback column: the whole side rendered as a single
+-- TextLabel (one Instance, `AutomaticSize` to fit the text) instead of
+-- `buildColumn`'s one-Frame-plus-two-TextLabels-per-line. Instance
+-- count is O(1) in the number of lines, so this can't reproduce the
+-- freeze/OOM `buildColumn` would hit on a huge file. No diff
+-- colouring or gutter — the lines aren't aligned, just shown as-is.
+local function buildPlainColumn(
+	lines: { string },
+	label: string,
+	accent: Color3,
+	layoutOrder: number
+): any
+	return Roact.createElement("ScrollingFrame", {
+		Size = UDim2.new(0.5, -1, 1, 0),
+		BackgroundColor3 = theme.colors.diffNeutral,
+		BorderSizePixel = 0,
+		LayoutOrder = layoutOrder,
+		AutomaticCanvasSize = Enum.AutomaticSize.Y,
+		CanvasSize = UDim2.new(),
+		ScrollBarThickness = 6,
+		ScrollBarImageColor3 = theme.colors.surface,
+	}, {
+		layout = Roact.createElement("UIListLayout", {
+			FillDirection = Enum.FillDirection.Vertical,
+			SortOrder = Enum.SortOrder.LayoutOrder,
+			Padding = UDim.new(0, 0),
+		}),
+		header = columnHeader(label, accent),
+		body = Roact.createElement("TextLabel", {
+			Size = UDim2.new(1, 0, 0, 0),
+			AutomaticSize = Enum.AutomaticSize.Y,
+			BackgroundTransparency = 1,
+			Text = table.concat(lines, "\n"),
+			TextColor3 = theme.colors.text,
+			Font = theme.typography.code.font,
+			TextSize = theme.typography.code.size,
+			TextXAlignment = Enum.TextXAlignment.Left,
+			TextYAlignment = Enum.TextYAlignment.Top,
+			TextWrapped = false,
+			LayoutOrder = 1,
+		}, {
+			pad = Roact.createElement("UIPadding", {
+				PaddingLeft = UDim.new(0, 6),
+				PaddingRight = UDim.new(0, 6),
+				PaddingTop = UDim.new(0, 2),
+			}),
+		}),
+	})
+end
+
+-- Banner shown above the plain-text columns explaining why the
+-- per-line diff was skipped.
+local function tooLargeBanner(): any
+	return Roact.createElement("TextLabel", {
+		Size = UDim2.new(1, 0, 0, 22),
+		BackgroundColor3 = theme.colors.surface,
+		BorderSizePixel = 0,
+		Text = "File too large for diff — showing plain text.",
+		TextColor3 = theme.colors.textMuted,
+		Font = theme.typography.label.font,
+		TextSize = theme.typography.label.size,
+		TextXAlignment = Enum.TextXAlignment.Left,
+		LayoutOrder = 0,
+	}, {
+		pad = Roact.createElement("UIPadding", {
+			PaddingLeft = UDim.new(0, 8),
+		}),
+	})
+end
+
 local function DiffView(props: Props)
 	local left = props.left
 	local right = props.right
 	local rows = diffLines.align(left, right)
-	local maxLine = math.max(#left, #right)
-	local gutterPx = gutterWidth(maxLine)
 	local leftLabel = props.leftLabel or "STUDIO"
 	local rightLabel = props.rightLabel or "IDE"
 	local leftAccent = props.leftAccent or theme.colors.accentStudio
 	local rightAccent = props.rightAccent or theme.colors.accentIde
+
+	-- REGRESSION(A15): `align` refused to compute a real alignment for
+	-- input this large (see MAX_DIFF_LINES in diffLines.luau). Render
+	-- plain, un-diffed text instead of falling through to `buildColumn`
+	-- below, which would mount a Frame + 2 TextLabels per line — the
+	-- freeze/OOM this guard exists to prevent.
+	if diffLines.isTooLarge(rows) then
+		return Roact.createElement("Frame", {
+			Size = props.size or UDim2.new(1, 0, 1, 0),
+			BackgroundTransparency = 1,
+			LayoutOrder = props.layoutOrder,
+		}, {
+			layout = Roact.createElement("UIListLayout", {
+				FillDirection = Enum.FillDirection.Vertical,
+				SortOrder = Enum.SortOrder.LayoutOrder,
+				Padding = UDim.new(0, 2),
+			}),
+			banner = tooLargeBanner(),
+			columns = Roact.createElement("Frame", {
+				Size = UDim2.new(1, 0, 1, -24),
+				BackgroundTransparency = 1,
+				LayoutOrder = 1,
+			}, {
+				layout = Roact.createElement("UIListLayout", {
+					FillDirection = Enum.FillDirection.Horizontal,
+					SortOrder = Enum.SortOrder.LayoutOrder,
+					Padding = UDim.new(0, 2),
+				}),
+				leftCol = buildPlainColumn(left, leftLabel, leftAccent, 1),
+				rightCol = buildPlainColumn(right, rightLabel, rightAccent, 2),
+			}),
+		})
+	end
+
+	local maxLine = math.max(#left, #right)
+	local gutterPx = gutterWidth(maxLine)
 
 	return Roact.createElement("Frame", {
 		Size = props.size or UDim2.new(1, 0, 1, 0),
