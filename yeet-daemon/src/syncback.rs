@@ -517,8 +517,13 @@ fn sanitize_name(raw: &str) -> String {
     } else {
         trimmed.to_owned()
     };
-    let upper = result.to_ascii_uppercase();
-    if WINDOWS_RESERVED.contains(&upper.as_str()) {
+    // M22 (path-4): compare the segment BEFORE the first '.'. Windows treats
+    // `CON.luau`, `aux.config`, `NUL.data`, … as the reserved *device* too, so
+    // matching the whole uppercased string (pre-M22) let them through and the
+    // OS write aborted the entire syncback. `trimmed` never starts with '.'
+    // (leading dots are trimmed above), so the first split segment is the stem.
+    let stem = result.split('.').next().unwrap_or(result.as_str());
+    if WINDOWS_RESERVED.contains(&stem.to_ascii_uppercase().as_str()) {
         result = format!("_{result}");
     }
     result
@@ -1004,5 +1009,62 @@ mod tests {
             "non-colliding names must not trigger any warning, got: {:?}",
             ctx.stats.warnings
         );
+    }
+
+    // ─── M22: reserved device names WITH an extension (path-4) ────────────
+
+    #[test]
+    fn sanitize_reserves_device_names_with_extension() {
+        // The reserved-name guard must compare the segment BEFORE the first
+        // '.', because Windows treats `CON.luau`, `aux.config`, etc. as the
+        // reserved device too. Guarding only the whole string (pre-M22) let
+        // these through and the OS write aborted the entire syncback.
+        assert_eq!(sanitize_name("CON.luau"), "_CON.luau");
+        assert_eq!(sanitize_name("aux.config"), "_aux.config");
+        assert_eq!(sanitize_name("NUL.data"), "_NUL.data");
+        assert_eq!(sanitize_name("com1.server.luau"), "_com1.server.luau");
+        // Bare reserved names keep the pre-M22 behavior.
+        assert_eq!(sanitize_name("CON"), "_CON");
+        assert_eq!(sanitize_name("nul"), "_nul");
+        // No false positives: names that merely start with reserved letters.
+        assert_eq!(sanitize_name("console.luau"), "console.luau");
+        assert_eq!(sanitize_name("auxiliary"), "auxiliary");
+        assert_eq!(sanitize_name("Content.luau"), "Content.luau");
+    }
+
+    #[test]
+    fn materialize_completes_with_reserved_device_name_instance() {
+        // A single instance whose filename stem is a reserved device name
+        // (`aux.config` -> `aux.config.luau`, stem `aux`) must not abort the
+        // whole syncback. Before the fix the OS write fails on Windows and
+        // `materialize` returns Err without writing default.project.json.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut session =
+            SyncbackSession::new("req-m22".to_owned(), test_opts(dir.path().to_path_buf()));
+        session
+            .ingest_chunk(
+                0,
+                vec![
+                    inst(1, None, "DataModel", "game"),
+                    inst(2, Some(1), "Folder", "ServerScriptService"),
+                    script_inst(3, Some(2), "aux.config", "return 1\n"),
+                ],
+            )
+            .expect("ingest");
+        let stats = materialize(session, 1).expect("materialize must complete, not abort");
+        assert!(
+            dir.path().join("default.project.json").exists(),
+            "project file must be written"
+        );
+        assert!(
+            dir.path()
+                .join("src/ServerScriptService/_aux.config.luau")
+                .exists(),
+            "script must land under a de-reserved name"
+        );
+        // NB: we deliberately don't assert `!aux.config.luau.exists()` — on
+        // Windows a trailing `aux.config.luau` resolves to the AUX *device*,
+        // so `exists()` can report true regardless of what we wrote.
+        assert_eq!(stats.scripts_written, 1);
     }
 }
