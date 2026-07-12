@@ -150,11 +150,15 @@ type self = {
 	log: Log,
 	-- Hash of the content we last wrote into `Source` for each path.
 	-- Used by SourceWatcher to reject self-triggered property changes.
-	-- Map from path → { hash, sentAt } pair recording the last Applier-driven
+	-- Map from path → { hash, sentAt, size } recording the last Applier-driven
 	-- Source write. `isEcho` rejects matches older than ECHO_WINDOW_SEC so a
 	-- user reverting to the same content (e.g. via Ctrl+Z) is not silently
-	-- swallowed as our own bounce.
-	recentlyApplied: { [string]: { hash: string, sentAt: number } },
+	-- swallowed as our own bounce. `size` is the byte length of the hashed
+	-- content; it lets `isEcho` reject a Source of different length WITHOUT
+	-- hashing it (A12 — avoids a full SHA-256 per keystroke). `nil` when the
+	-- seating site had no content on hand, in which case `isEcho` falls back
+	-- to hashing (correct, just not cheap).
+	recentlyApplied: { [string]: { hash: string, sentAt: number, size: number? } },
 	-- Live entry count for `recentlyApplied`. Tracked explicitly because
 	-- Luau hash tables don't expose `#table` — we'd otherwise have to
 	-- iterate to know when to sweep. Updated in `seatEcho`, reset on
@@ -343,16 +347,38 @@ function Applier.resolvePath(self: Applier, instance: Instance): (string?, Scrip
 	return nil, nil
 end
 
-function Applier.isEcho(self: Applier, path: string, hash: string): boolean
+-- `content` is the raw Source string, NOT a precomputed hash. `isEcho` does
+-- the cheap rejects (stale window, then byte-length mismatch) BEFORE it ever
+-- computes the SHA-256, so the SourceWatcher hot path no longer hashes the
+-- whole Source on every keystroke — during normal typing the length differs
+-- each stroke and this returns `false` without hashing (A12).
+--
+-- REGRESSION(A12): the result is identical to the old hash-based check. The
+-- old form returned true iff (entry exists AND hash matches AND within
+-- window); this returns true iff (entry exists AND within window AND size
+-- matches AND hash matches) — the same conjunction, only reordered so the
+-- cheap terms short-circuit first. `size` always equals the byte length of
+-- the content behind `entry.hash` (seated together), so whenever the hash
+-- would match, the length matches too; the length test can only reject
+-- cases the hash test would also reject.
+function Applier.isEcho(self: Applier, path: string, content: string): boolean
 	local entry = self.recentlyApplied[path]
-	if entry == nil or entry.hash ~= hash then
+	if entry == nil then
 		return false
 	end
-	-- Hash matches a previous self-write — but only treat it as an echo if
-	-- that write happened recently. A stale match (user reverted to old
-	-- content via undo, or rewrote the same lines) must propagate to the
-	-- daemon as a real edit.
-	return (os.clock() - entry.sentAt) < ECHO_WINDOW_SEC
+	-- A stale match (user reverted to old content via undo, or rewrote the
+	-- same lines) must propagate to the daemon as a real edit. Checking the
+	-- window first also means an expired entry never triggers a hash.
+	if (os.clock() - entry.sentAt) >= ECHO_WINDOW_SEC then
+		return false
+	end
+	-- A differing byte length cannot be an echo of what we wrote; skip the
+	-- SHA-256 entirely. `size` is nil only at seating sites that lacked the
+	-- content, where we must fall through and hash to stay correct.
+	if entry.size ~= nil and #content ~= entry.size then
+		return false
+	end
+	return entry.hash == Sha256.hex(content)
 end
 
 -- Symmetrical to `seatEcho`: drops the entry and keeps the live count
@@ -393,11 +419,11 @@ end
 -- stale (renames, deletions whose paths never come back) would let the
 -- table grow without bound — irrelevant for memory in any short session
 -- but a real production-soak risk.
-local function seatEcho(self: Applier, path: string, hash: string)
+local function seatEcho(self: Applier, path: string, hash: string, size: number?)
 	if self.recentlyApplied[path] == nil then
 		self.recentlyAppliedCount += 1
 	end
-	self.recentlyApplied[path] = { hash = hash, sentAt = os.clock() }
+	self.recentlyApplied[path] = { hash = hash, sentAt = os.clock(), size = size }
 	if self.recentlyAppliedCount >= MAX_RECENTLY_APPLIED then
 		local kept = sweepStaleEchos(self)
 		self.log(`recentlyApplied swept: kept {kept} of {MAX_RECENTLY_APPLIED} entries`)
@@ -424,13 +450,19 @@ function Applier.forgetLocalRename(
 	hash: string
 )
 	local instance = self.fileToInstance[oldPath]
+	local size: number? = nil
 	if instance ~= nil then
 		self.fileToInstance[oldPath] = nil
 		self.fileToInstance[newPath] = instance
 		self.instanceToPath[instance] = newPath
+		if instance:IsA("LuaSourceContainer") then
+			-- SourceWatcher fires its rename hook synchronously right after
+			-- hashing this content, so #Source still matches `hash` (A12).
+			size = #(instance :: LuaSourceContainer).Source
+		end
 	end
 	forgetEcho(self, oldPath)
-	seatEcho(self, newPath, hash)
+	seatEcho(self, newPath, hash, size)
 end
 
 local function withRecording(name: string, action: () -> ()): (boolean, string?)
@@ -453,8 +485,8 @@ end
 -- Seeds `recentlyApplied` for every path we just materialized and notifies the
 -- watcher. Called inside the bootstrap/create recording so the initial Source
 -- assignment in `TreeBuilder` is already committed when we reach here.
-local function registerTracked(self: Applier, path: string, inst: Instance, hash: string)
-	seatEcho(self, path, hash)
+local function registerTracked(self: Applier, path: string, inst: Instance, hash: string, size: number?)
+	seatEcho(self, path, hash, size)
 	local hook = self.onTracked
 	if hook ~= nil then
 		hook(path, inst)
@@ -497,7 +529,7 @@ local function applyProjectOpenedForPreview(self: Applier, project: Project)
 		})
 		self.fileToInstance[entry.path] = entry.instance
 		self.instanceToPath[entry.instance] = entry.path
-		registerTracked(self, entry.path, entry.instance, sha)
+		registerTracked(self, entry.path, entry.instance, sha, #entry.studio_content)
 	end
 
 	self:startLiveWatcher()
@@ -621,7 +653,7 @@ local function applyProjectOpened(self: Applier, msg: any)
 		local inst = self.fileToInstance[file.path]
 		if inst ~= nil then
 			self.instanceToPath[inst] = file.path
-			registerTracked(self, file.path, inst, file.sha256)
+			registerTracked(self, file.path, inst, file.sha256, #file.content)
 		end
 	end
 	self.log(`bootstrap: {#initialFiles} file(s) materialized`)
@@ -647,12 +679,12 @@ local function applyProjectOpened(self: Applier, msg: any)
 			-- matter to the daemon but the log reads top-down.
 			for _, entry in divergent do
 				local sha = Sha256.hex(entry.studio_content)
-				seatEcho(self, entry.path, sha)
+				seatEcho(self, entry.path, sha, #entry.studio_content)
 				hook(entry.path, entry.kind, entry.studio_content, sha)
 			end
 			for _, entry in untracked do
 				local sha = Sha256.hex(entry.studio_content)
-				seatEcho(self, entry.path, sha)
+				seatEcho(self, entry.path, sha, #entry.studio_content)
 				hook(entry.path, entry.kind, entry.studio_content, sha)
 			end
 			self.log(
@@ -686,7 +718,7 @@ local function applyFileCreated(self: Applier, msg: any)
 		return
 	end
 	if created ~= nil then
-		registerTracked(self, snap.path, created, snap.sha256)
+		registerTracked(self, snap.path, created, snap.sha256, #snap.content)
 		self.log(`+ {snap.path}`)
 	else
 		self.log(`skipped (no mapping): {snap.path}`)
@@ -728,7 +760,7 @@ local function applyFileChanged(self: Applier, msg: any)
 	-- Seat the hash BEFORE the assignment: `GetPropertyChangedSignal` fires
 	-- synchronously during the write, and the watcher will read
 	-- `recentlyApplied` inside that callback.
-	seatEcho(self, msg.path, hash)
+	seatEcho(self, msg.path, hash, #content)
 	local ok, err = withRecording("YeetFileChanged", function()
 		(inst :: LuaSourceContainer).Source = content
 	end)
@@ -809,7 +841,7 @@ local function applyFileRenamed(self: Applier, msg: any)
 		})
 		return
 	end
-	seatEcho(self, newPath, hash)
+	seatEcho(self, newPath, hash, #content)
 	local newName = TreeBuilder.basenameFor(newPath)
 	local ok, err = withRecording("YeetFileRenamed", function()
 		if newName ~= "" and (inst :: any).Name ~= newName then
@@ -909,7 +941,16 @@ end
 -- so the daemon's echoed `file_changed` broadcast (if it ever gets one) is
 -- absorbed cleanly.
 function Applier.recordSelfEdit(self: Applier, path: string, hash: string)
-	seatEcho(self, path, hash)
+	-- `hash` was just computed by SourceWatcher from the live Source and we run
+	-- synchronously before any yield, so #Source still matches it. Seating the
+	-- length lets the next keystroke be rejected as a non-echo without a
+	-- re-hash (A12).
+	local inst = self.fileToInstance[path]
+	local size: number? = nil
+	if inst ~= nil and inst:IsA("LuaSourceContainer") then
+		size = #(inst :: LuaSourceContainer).Source
+	end
+	seatEcho(self, path, hash, size)
 end
 
 -- Called by SourceWatcher when the user deletes a tracked script in Studio.
@@ -1102,7 +1143,7 @@ local function detectPromotionChain(self: Applier, mapPath: string, mapParent: I
 					self.fileToInstance[newPath] = cursor
 					self.instanceToPath[cursor] = newPath
 					forgetEcho(self, cached)
-					seatEcho(self, newPath, sha)
+					seatEcho(self, newPath, sha, #src)
 				end
 			end
 		end
@@ -1168,7 +1209,7 @@ local function detectDemotionChain(self: Applier, mapPath: string, mapParent: In
 			self.fileToInstance[newPath] = instance
 			self.instanceToPath[instance] = newPath
 			forgetEcho(self, cached)
-			seatEcho(self, newPath, sha)
+			seatEcho(self, newPath, sha, #src)
 		end
 	end)
 end
@@ -1237,7 +1278,7 @@ function Applier.startLiveWatcher(self: Applier)
 			-- Seat the hash in `recentlyApplied` BEFORE the hook fires its
 			-- `file_created` — our eventual daemon FileChanged echo (if any)
 			-- would otherwise be treated as a user edit and rebound.
-			seatEcho(self, path, sha)
+			seatEcho(self, path, sha, #source)
 			self.fileToInstance[path] = desc
 			self.instanceToPath[desc] = path
 			hook(path, kind, source, sha)

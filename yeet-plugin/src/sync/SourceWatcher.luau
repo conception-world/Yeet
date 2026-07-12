@@ -5,13 +5,15 @@
 --
 -- Anti-echo has two tiers:
 --   1. Synchronous drop: as soon as the property-changed signal fires, we
---      hash the current Source and ask `isEcho(path, hash)`. If the hash
---      matches the value the Applier just stashed, we return immediately
---      without scheduling anything.
+--      hand the current Source to `isEcho(path, content)`. That compares the
+--      byte length against the Applier's last write first and only computes
+--      the SHA-256 when the length matches, so an ordinary keystroke drops
+--      out here without hashing the whole Source (A12). If it is our own
+--      echo, we return immediately without scheduling anything.
 --   2. Trailing-edge debounce (200ms): rapid typing would otherwise spam
 --      `FileChanged` frames. We delay the send until the user pauses for
---      200ms, then re-read Source + re-check `isEcho`, in case the Applier
---      wrote over the edit in the meantime.
+--      200ms, then re-read Source + re-check `isEcho`, hashing once there to
+--      build the frame, in case the Applier wrote over the edit meanwhile.
 
 -- The user's spec says "throttle of 200ms" but describes debounce semantics
 -- ("avoid spam on rapid typing"). Debounce is what actually matches that
@@ -30,7 +32,9 @@ export type RenameHandler = (
 	content: string,
 	hash: string
 ) -> ()
-export type EchoPredicate = (path: string, hash: string) -> boolean
+-- Receives the raw Source content (NOT a precomputed hash): the Applier does
+-- a cheap byte-length reject before hashing, so callers must not pre-hash.
+export type EchoPredicate = (path: string, content: string) -> boolean
 export type Hasher = (content: string) -> string
 export type Log = (line: string) -> ()
 export type PathResolver = (instance: Instance) -> (string?, ScriptKind?)
@@ -276,10 +280,15 @@ function SourceWatcher.track(self: SourceWatcher, path: string, instance: Instan
 			-- emitted (if applicable) and the syncPath helper logged.
 			return
 		end
-		local syncHash = self.hash(current)
-		if self.isEcho(livePath, syncHash) then
-			-- Our own write; Applier already seeded `recentlyApplied` with this
-			-- hash, so the change is a no-op from the sync perspective.
+		-- A12: hand the raw Source to `isEcho`. It rejects on byte length
+		-- before hashing, so a keystroke that changes the length (the common
+		-- case) costs no SHA-256 here; the hash now lives in the debounce.
+		-- REGRESSION(A12): this drop MUST stay before `gen += 1`. An Applier
+		-- echo has to leave a pending user-edit debounce untouched — bumping
+		-- gen on an echo would supersede (and silently discard) that edit.
+		if self.isEcho(livePath, current) then
+			-- Our own write; Applier already seeded `recentlyApplied`, so the
+			-- change is a no-op from the sync perspective.
 			return
 		end
 
@@ -298,13 +307,14 @@ function SourceWatcher.track(self: SourceWatcher, path: string, instance: Instan
 			if finalPath == nil then
 				return
 			end
-			local finalHash = self.hash(latest)
-			-- Re-check: the daemon may have pushed a FileChanged during the
-			-- 200ms window; if our current Source already matches what the
-			-- Applier last wrote, there is nothing new to report.
-			if self.isEcho(finalPath, finalHash) then
+			-- Re-check on the raw Source: the daemon may have pushed a
+			-- FileChanged during the 200ms window; if our Source already
+			-- matches what the Applier last wrote, there is nothing new to
+			-- report. Hash only after we know it is a real edit to forward.
+			if self.isEcho(finalPath, latest) then
 				return
 			end
+			local finalHash = self.hash(latest)
 			self.log(`-> file_changed {finalPath}`)
 			self.onEdit(finalPath, latest, finalHash)
 		end)
