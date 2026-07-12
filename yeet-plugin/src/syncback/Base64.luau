@@ -18,6 +18,14 @@ for i = 1, 64 do
 	CHARS[i] = ALPHABET:sub(i, i)
 end
 
+-- Triplets processed between `task.wait()` yields. A big mesh/union blob
+-- (many MB raw) run through the tight bit32 loop below with no yield point
+-- froze Studio for the whole encode; this keeps each uninterrupted burst
+-- around a frame's worth of work without making small inputs (the common
+-- case) pay for a yield they'll never reach. 60,000 triplets is 180,000
+-- input bytes / 240,000 output chars per block.
+local TRIPLETS_PER_BLOCK = 60000
+
 local Base64 = {}
 
 -- Encodes a byte string (each character treated as one octet, exactly how
@@ -38,9 +46,14 @@ function Base64.encode(bytes: string): string
 	local outIdx = 0
 
 	-- Walk full 3-byte triplets. The trailing 1- or 2-byte tail is handled
-	-- below so the hot loop stays branch-free.
+	-- below so the hot loop stays branch-free. `task.wait()` every
+	-- `TRIPLETS_PER_BLOCK` yields the thread so a large input can't freeze
+	-- Studio; it's purely a checkpoint inserted into the same loop, so the
+	-- values written to `out` (and hence the final `table.concat`) are
+	-- byte-identical to running the loop uninterrupted.
 	local i = 1
 	local fullChunks = len - (len % 3)
+	local tripletsSinceYield = 0
 	while i <= fullChunks do
 		local b1, b2, b3 = string.byte(bytes, i, i + 2)
 		local n = b1 * 65536 + b2 * 256 + b3
@@ -53,6 +66,12 @@ function Base64.encode(bytes: string): string
 		outIdx += 1
 		out[outIdx] = CHARS[bit32.band(n, 0x3F) + 1]
 		i += 3
+
+		tripletsSinceYield += 1
+		if tripletsSinceYield >= TRIPLETS_PER_BLOCK then
+			tripletsSinceYield = 0
+			task.wait()
+		end
 	end
 
 	local rem = len - fullChunks

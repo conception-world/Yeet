@@ -11,7 +11,26 @@
 -- for unwiring that routing in `onComplete` / `onError`. This keeps the
 -- Applier's demux as the single source of truth for message dispatch.
 
+-- Hard cap on instances per chunk — a secondary bound alongside the byte
+-- budget below, so a chunk of tiny instances still can't balloon in *count*.
 local CHUNK_SIZE = 100
+
+-- Soft cap on serialized bytes per chunk. `SerializedInstance.binary`
+-- (rbxm_bytes_base64) and script `Source` text are the only fields that can
+-- grow unbounded, and a single MeshPart/UnionOperation blob can be many MiB
+-- once base64-inflated (see A5 — Source now rides in `properties` too). 8 MiB
+-- leaves the daemon's WS_MAX_FRAME_BYTES (16 MiB, see main.rs) a wide margin
+-- for the JSON envelope and string-escaping overhead, so a chunk built to
+-- this budget never gets near the wire cap.
+local CHUNK_BYTE_BUDGET = 8 * 1024 * 1024
+
+-- Flat allowance per instance for everything `estimateInstanceBytes` doesn't
+-- size exactly: JSON punctuation/keys, non-string properties, attributes,
+-- and tags. Generous on purpose — undercounting here only eats into the
+-- margin between the 8 MiB budget and the 16 MiB hard cap, never crosses it
+-- on its own.
+local INSTANCE_OVERHEAD_BYTES = 512
+
 local ACK_TIMEOUT_SECONDS = 10
 
 -- Wire-format types are redeclared locally; Luau --!strict does not carry
@@ -52,6 +71,10 @@ type WalkResult = {
 	services_included: { string },
 	root_id: number,
 }
+
+-- One `syncback_chunk` frame's worth of instances, as decided by
+-- `partitionIntoChunks`.
+type Chunk = { SerializedInstance }
 
 type Payload = { [string]: any }
 
@@ -108,10 +131,96 @@ local function encodeMode(mode: Mode): { [string]: any }
 	return { kind = obj.kind, overwrite = obj.overwrite }
 end
 
+-- Rough byte-size estimate for one instance's contribution to the JSON wire
+-- payload. A full JSONEncode just to measure size would double the cost of
+-- every syncback, so instead we sum the fields that can actually grow
+-- unbounded — string property/attribute values (Source, MeshId, ...) and the
+-- base64 `.rbxm` blob — and add `INSTANCE_OVERHEAD_BYTES` for everything
+-- else (keys, punctuation, numeric/vector fields, tags).
+local function estimateInstanceBytes(instance: SerializedInstance): number
+	local size = INSTANCE_OVERHEAD_BYTES + #instance.class_name + #instance.name
+	for _, value in instance.properties do
+		if value.type == "string" then
+			size += #value.value
+		end
+	end
+	for _, value in instance.attributes do
+		if value.type == "string" then
+			size += #value.value
+		end
+	end
+	for _, tag in instance.tags do
+		size += #tag
+	end
+	if instance.binary ~= nil then
+		size += #instance.binary.rbxm_bytes_base64
+	end
+	return size
+end
+
+-- Groups `instances` into wire-sized chunks: accumulate into the current
+-- chunk until either the byte budget or the count cap would be exceeded
+-- (whichever comes first), then flush and start a new one. A single instance
+-- whose own estimate already exceeds the budget is never placed alone in an
+-- over-cap frame — it's skipped and reported back via the returned warning
+-- list so the caller can surface it instead of losing it silently (A14).
+local function partitionIntoChunks(instances: { SerializedInstance }): ({ Chunk }, { string })
+	local chunks: { Chunk } = {}
+	local warnings: { string } = {}
+	local current: Chunk = {}
+	local currentBytes = 0
+
+	local function flush()
+		if #current > 0 then
+			table.insert(chunks, current)
+			current = {}
+			currentBytes = 0
+		end
+	end
+
+	for _, instance in instances do
+		local size = estimateInstanceBytes(instance)
+		if size > CHUNK_BYTE_BUDGET then
+			table.insert(
+				warnings,
+				string.format(
+					"skipped %s (%s, id %d): ~%d MiB exceeds the %d MiB syncback chunk budget",
+					instance.name,
+					instance.class_name,
+					instance.id,
+					math.ceil(size / (1024 * 1024)),
+					CHUNK_BYTE_BUDGET / (1024 * 1024)
+				)
+			)
+			continue
+		end
+		if #current >= CHUNK_SIZE or currentBytes + size > CHUNK_BYTE_BUDGET then
+			flush()
+		end
+		table.insert(current, instance)
+		currentBytes += size
+	end
+	flush()
+
+	if #chunks == 0 then
+		-- Preserve the "always at least one chunk before finalize" contract
+		-- the fixed-size sender had, even for an empty walk result or one
+		-- where every instance was skipped.
+		table.insert(chunks, {})
+	end
+
+	return chunks, warnings
+end
+
 function ChunkedSender.run(params: RunParams): Session
-	local instances = params.walk_result.instances
-	local total = #instances
-	local totalSeq = math.max(1, math.ceil(total / CHUNK_SIZE))
+	local chunks, skipWarnings = partitionIntoChunks(params.walk_result.instances)
+	local totalSeq = #chunks
+	-- Sendable total (post-skip) so `onProgress` reaches 100% at completion
+	-- even when `partitionIntoChunks` had to drop an oversized instance.
+	local total = 0
+	for _, chunk in chunks do
+		total += #chunk
+	end
 
 	local connection = params.connection
 	local opts = params.opts
@@ -120,6 +229,7 @@ function ChunkedSender.run(params: RunParams): Session
 	local finished = false
 	local lastSentSeq = -1
 	local lastAckedSeq = -1
+	local sentCount = 0
 	-- Monotonic token so older ack-timeouts don't fire after a newer chunk
 	-- has already been ack'd. Equivalent to a cancellation cookie per wait.
 	local ackTimeoutToken = 0
@@ -157,18 +267,11 @@ function ChunkedSender.run(params: RunParams): Session
 		if cancelled or finished then
 			return
 		end
-		local startIdx = seq * CHUNK_SIZE + 1
-		local endIdx = math.min(startIdx + CHUNK_SIZE - 1, total)
-		local count = endIdx - startIdx + 1
-		local slice = table.create(count)
-		for i = 1, count do
-			slice[i] = instances[startIdx + i - 1]
-		end
 		connection:send({
 			type = "syncback_chunk",
 			request_id = opts.request_id,
 			seq = seq,
-			instances = slice,
+			instances = chunks[seq + 1],
 		})
 		lastSentSeq = seq
 		scheduleAckTimeout(seq)
@@ -221,7 +324,7 @@ function ChunkedSender.run(params: RunParams): Session
 				return
 			end
 			lastAckedSeq = seq
-			local sentCount = math.min((seq + 1) * CHUNK_SIZE, total)
+			sentCount += #chunks[seq + 1]
 			params.onProgress(sentCount, total)
 			local nextSeq = seq + 1
 			if nextSeq < totalSeq then
@@ -236,7 +339,21 @@ function ChunkedSender.run(params: RunParams): Session
 				params.onError("syncback_complete without stats")
 				return
 			end
-			params.onComplete(stats :: SyncbackStats)
+			local typedStats = stats :: SyncbackStats
+			if #skipWarnings > 0 then
+				-- Surface plugin-side skips (oversized instances dropped by
+				-- `partitionIntoChunks`) through the same warnings list the
+				-- daemon already uses for its own non-fatal ingestion issues,
+				-- so SyncbackModal's completion screen shows them without any
+				-- change to the public callback shape.
+				if typeof(typedStats.warnings) ~= "table" then
+					typedStats.warnings = {}
+				end
+				for _, warning in skipWarnings do
+					table.insert(typedStats.warnings, warning)
+				end
+			end
+			params.onComplete(typedStats)
 		elseif kind == "syncback_error" then
 			fail(tostring(payload.message or "unknown syncback error"))
 		end

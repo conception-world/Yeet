@@ -10,9 +10,13 @@
 -- Inheritance is handled at encode time via `inst:IsA(class)` — an entry for
 -- "BasePart.Anchored" applies to every subclass without us listing them.
 --
--- `Source` is intentionally absent: script bodies travel as file content via
--- the existing sync channel, and `syncback.rs` already drops `Source` from
--- the property map server-side.
+-- `Source` is intentionally absent from this whitelist: for incremental
+-- FS<->Studio sync, script bodies travel as file content via the existing
+-- `FileChanged`/`FileCreated` channel, not as a property. Reverse-bootstrap
+-- syncback has no such channel, though — `Walker.serialize` injects
+-- `properties.Source` directly for every `LuaSourceContainer` instead of
+-- routing it through this table (see Walker.luau `encodeSource`), and
+-- `syncback.rs` drops it again before persisting `.meta.json`.
 
 export type Tag =
 	"string" | "bool" | "number"
@@ -263,15 +267,37 @@ function PropertyTable.decodeValue(encoded: Value): any?
 	return nil
 end
 
+-- Per-ClassName cache of which ENTRIES apply. `inst:IsA(entry.class)` depends
+-- only on the instance's ClassName — a static fact about the engine's class
+-- hierarchy, never on runtime state — so two instances sharing a ClassName
+-- always get the same applicable subset. Without this, encodeInstance ran
+-- the full `#ENTRIES` (~70-95) `IsA` sweep on every single instance in the
+-- walk instead of once per distinct class. The cache only ever grows to the
+-- fixed number of ClassNames the engine defines, so it's never cleared.
+local applicableEntriesByClassName: { [string]: { Entry } } = {}
+
+local function applicableEntriesFor(inst: Instance): { Entry }
+	local className = inst.ClassName
+	local cached = applicableEntriesByClassName[className]
+	if cached ~= nil then
+		return cached
+	end
+	local applicable: { Entry } = {}
+	for _, entry in ENTRIES do
+		if inst:IsA(entry.class) then
+			table.insert(applicable, entry)
+		end
+	end
+	applicableEntriesByClassName[className] = applicable
+	return applicable
+end
+
 -- Walk the whitelist for one instance and encode every applicable property.
 -- Read errors are swallowed (security-sandboxed props, deprecated accessors)
 -- so a single bad property doesn't abort the whole syncback.
 function PropertyTable.encodeInstance(inst: Instance): { [string]: Value }
 	local out: { [string]: Value } = {}
-	for _, entry in ENTRIES do
-		if not inst:IsA(entry.class) then
-			continue
-		end
+	for _, entry in applicableEntriesFor(inst) do
 		local ok, raw = pcall(function()
 			return (inst :: any)[entry.prop]
 		end)

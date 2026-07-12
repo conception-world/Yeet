@@ -207,18 +207,44 @@ type SerializeContext = {
 	plugin: Plugin?,
 }
 
+-- `PropertyTable.encodeInstance` deliberately excludes `Source` (its whitelist
+-- is a generic, non-script property table). During reverse-bootstrap syncback
+-- there is no *other* channel carrying the script body, so we inject it here
+-- for every `LuaSourceContainer`. `write_script_file` in `syncback.rs` reads
+-- `properties['Source']` as a plain string property, and `props_to_json`
+-- already strips `Source` back out when it writes `.meta.json` for scripts
+-- (`drop_source`) — so this only ever lands in the `.luau`/`.lua` body, never
+-- duplicated into the sidecar meta file.
+local function encodeSource(inst: Instance): Value?
+	if not inst:IsA("LuaSourceContainer") then
+		return nil
+	end
+	local ok, raw = pcall(function()
+		return (inst :: LuaSourceContainer).Source
+	end)
+	if not ok then
+		return nil
+	end
+	return PropertyTable.encodeValue("string", raw)
+end
+
 local function serialize(
 	inst: Instance,
 	id: number,
 	parent_id: number?,
 	ctx: SerializeContext
 ): SerializedInstance
+	local properties = PropertyTable.encodeInstance(inst)
+	local source = encodeSource(inst)
+	if source ~= nil then
+		properties.Source = source
+	end
 	local out: SerializedInstance = {
 		id = id,
 		parent_id = parent_id,
 		class_name = inst.ClassName,
 		name = inst.Name,
-		properties = PropertyTable.encodeInstance(inst),
+		properties = properties,
 		attributes = encodeAttributes(inst),
 		tags = encodeTags(inst),
 	}
