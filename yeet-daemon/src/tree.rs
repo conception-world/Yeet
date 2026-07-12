@@ -1,4 +1,5 @@
 use std::collections::HashMap;
+use std::io::Write as _;
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
@@ -45,9 +46,30 @@ pub fn save_base_tree(project_root: &Path, tree: &Tree) -> Result<()> {
         os.push(".tmp");
         PathBuf::from(os)
     };
-    std::fs::write(&tmp, &bytes).with_context(|| format!("write {}", tmp.display()))?;
+    // Write + fsync the temp file BEFORE renaming so a crash between the
+    // source-file write (which uses `sync_all` in `main::atomic_write`) and
+    // this base persist can't leave `base-tree.msgpack` stale on disk
+    // (AUDITORIA-YEET.md M15). Without the fsync the rename could be durable
+    // while the file's bytes are still only in the page cache, resurrecting an
+    // old base after a hard crash and provoking a spurious conflict on the
+    // next edit.
+    {
+        let mut f = std::fs::File::create(&tmp)
+            .with_context(|| format!("create {}", tmp.display()))?;
+        f.write_all(&bytes)
+            .with_context(|| format!("write {}", tmp.display()))?;
+        f.sync_all()
+            .with_context(|| format!("fsync {}", tmp.display()))?;
+    }
     std::fs::rename(&tmp, &path)
         .with_context(|| format!("rename {} -> {}", tmp.display(), path.display()))?;
+    // Best-effort fsync of the containing directory so the rename itself is
+    // durable. Opening a directory as a `File` fails on Windows (which needs
+    // FILE_FLAG_BACKUP_SEMANTICS), so this is a no-op there; the file fsync +
+    // rename above is the durability guarantee on that platform.
+    if let Ok(dir_handle) = std::fs::File::open(dir) {
+        let _ = dir_handle.sync_all();
+    }
     Ok(())
 }
 
@@ -100,5 +122,35 @@ mod tests {
     fn base_tree_missing_returns_none() {
         let dir = tempdir().unwrap();
         assert!(load_base_tree(dir.path()).unwrap().is_none());
+    }
+
+    #[test]
+    fn base_tree_overwrite_leaves_no_tmp() {
+        // M15: the durable (fsync + rename) write path must replace an
+        // existing base tree cleanly and never strand the sibling `.tmp`.
+        let dir = tempdir().unwrap();
+        let mut tree: Tree = HashMap::new();
+        tree.insert(
+            "src/A.luau".to_owned(),
+            TreeEntry {
+                kind: ScriptKind::ModuleScript,
+                content: "return 1\n".to_owned(),
+                sha256: "aaa".to_owned(),
+            },
+        );
+        save_base_tree(dir.path(), &tree).unwrap();
+        tree.insert(
+            "src/B.luau".to_owned(),
+            TreeEntry {
+                kind: ScriptKind::ModuleScript,
+                content: "return 2\n".to_owned(),
+                sha256: "bbb".to_owned(),
+            },
+        );
+        save_base_tree(dir.path(), &tree).unwrap();
+        let loaded = load_base_tree(dir.path()).unwrap().expect("tree present");
+        assert_eq!(loaded, tree);
+        let tmp = dir.path().join(".yeet/base-tree.msgpack.tmp");
+        assert!(!tmp.exists(), "temp file must not linger after save");
     }
 }
