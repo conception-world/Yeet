@@ -5,7 +5,7 @@ import * as path from "node:path";
 import * as vscode from "vscode";
 import { createProject } from "./create";
 import { openProject } from "./openProject";
-import { YeetControlChannel } from "./websocket";
+import { type OutboundFrame, YeetControlChannel } from "./websocket";
 
 const DAEMON_PORT = 34872;
 const KILL_GRACE_MS = 2000;
@@ -105,6 +105,15 @@ export function activate(context: vscode.ExtensionContext): void {
 	);
 }
 
+// Pure: maps the command-facing direction to the wire frame. Pulled out of
+// runBulkSync so the type-to-direction mapping is checkable on its own,
+// independent of the send/log/warn side effects around it.
+function buildBulkSyncRequest(direction: "from-studio" | "from-ide"): OutboundFrame {
+	return direction === "from-studio"
+		? { type: "bulk_sync_from_studio_request" }
+		: { type: "bulk_sync_from_ide_request" };
+}
+
 async function runBulkSync(direction: "from-studio" | "from-ide"): Promise<void> {
 	if (channel === undefined || daemon === undefined) {
 		const label = direction === "from-studio" ? "Sync From Studio" : "Sync From Ide";
@@ -113,12 +122,18 @@ async function runBulkSync(direction: "from-studio" | "from-ide"): Promise<void>
 		);
 		return;
 	}
-	if (direction === "from-studio") {
-		channel.send({ type: "bulk_sync_from_studio_request" });
-		output?.appendLine("[yeet] sent bulk_sync_from_studio_request");
+	const request = buildBulkSyncRequest(direction);
+	// `send` already warns the user when it drops a frame (disconnected
+	// socket), but it can't know here whether the *attempt* succeeded —
+	// only the caller can decide whether "sent" is true. Previously this
+	// logged "sent" unconditionally, which was actively misleading when
+	// the daemon was unreachable and the frame never left the process.
+	if (channel.send(request)) {
+		output?.appendLine(`[yeet] sent ${request.type}`);
 	} else {
-		channel.send({ type: "bulk_sync_from_ide_request" });
-		output?.appendLine("[yeet] sent bulk_sync_from_ide_request");
+		void vscode.window.showWarningMessage(
+			"Yeet: bulk sync request was not sent — the daemon control channel is disconnected.",
+		);
 	}
 }
 

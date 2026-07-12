@@ -163,15 +163,28 @@ export class YeetControlChannel extends EventEmitter {
 		}
 	}
 
-	send(msg: OutboundFrame): void {
+	/// Sends a frame and reports whether it actually went out. When the
+	/// socket isn't OPEN (daemon not connected yet, mid-reconnect, or
+	/// disposed), the frame is dropped: previously this happened
+	/// silently apart from an Output log line, so callers like
+	/// `runBulkSync` had no way to tell success from failure and logged
+	/// "sent" regardless. Also surfaces a warning toast here — once,
+	/// for every caller — so a dropped control command (bulk sync
+	/// request, pick-folder response, ...) is never invisible just
+	/// because the daemon happened to be unreachable at that moment.
+	send(msg: OutboundFrame): boolean {
 		const sock = this.socket;
 		if (sock === undefined || sock.readyState !== WebSocket.OPEN) {
 			this.output.appendLine(
 				`[yeet:ctl] dropping send (socket not open): ${msg.type}`,
 			);
-			return;
+			void vscode.window.showWarningMessage(
+				`Yeet: "${msg.type}" was not sent — the daemon control channel is disconnected.`,
+			);
+			return false;
 		}
 		sock.send(JSON.stringify(msg));
+		return true;
 	}
 
 	private openOnce(isInitial: boolean): Promise<void> {
