@@ -926,6 +926,11 @@ function Widget._onConnectPressed(self: Widget)
           content = content,
           sha256 = hash,
         })
+      else
+        -- B11: mirror the other hooks — a fully torn-down connection (nil
+        -- Handle) should not swallow the edit silently. (A transient
+        -- disconnect keeps the Handle non-nil and is buffered by Reconnect.)
+        self:_appendLog(`edit ignored (disconnected): {path}`)
       end
     end,
     onDelete = function(path)
@@ -939,6 +944,10 @@ function Widget._onConnectPressed(self: Widget)
           type = "file_deleted",
           path = path,
         })
+      else
+        -- B11: symmetric with onEdit — surface the dropped delete instead of
+        -- swallowing it.
+        self:_appendLog(`delete ignored (disconnected): {path}`)
       end
     end,
     onRename = function(oldPath, newPath, kind, content, hash)
