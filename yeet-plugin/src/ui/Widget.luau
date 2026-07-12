@@ -1318,6 +1318,9 @@ function Widget._onConnectPressed(self: Widget)
     onResumed = function(_sessionId: string, replayed: number)
       self:_appendLog(`resumed: {replayed} buffered frame(s)`)
     end,
+    onOutgoingFlush = function(count: number)
+      self:_appendLog(`flushed {count} buffered edit(s) after reconnect`)
+    end,
     onClose = function()
       self:_appendLog("socket closed")
       self.syncPreview:close()
