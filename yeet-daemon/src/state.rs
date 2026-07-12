@@ -86,6 +86,23 @@ impl FileMeta {
     }
 }
 
+/// One honored nested `default.project.json` (AUDITORIA-YEET.md A10 `wally-1`).
+/// Every source file under `fs_prefix` (the package's `$path` dir on disk) is
+/// re-keyed onto `instance_prefix` (the package folder renamed to the nested
+/// project's `name`), eliding the `$path`/`src` segment so the package folder
+/// becomes the `ModuleScript` instead of `src`. The transform is a pure prefix
+/// swap so it round-trips: `collapse` rewrites disk→instance, `fs_rel_for`
+/// rewrites instance→disk.
+#[derive(Debug, Clone)]
+pub struct PackageRemap {
+    /// Project-relative, forward-slashed dir the nested project's `$path`
+    /// resolves to, e.g. `Packages/_Index/foo@1.0.0/foo/src`.
+    pub fs_prefix: String,
+    /// Project-relative, forward-slashed instance path the package mounts at,
+    /// e.g. `Packages/_Index/foo@1.0.0/foo`.
+    pub instance_prefix: String,
+}
+
 #[derive(Debug)]
 pub struct ProjectState {
     pub root: PathBuf,
@@ -202,6 +219,11 @@ pub struct ProjectState {
     /// `FileRenamed` supersedes the optimistic push) and on `rotate_session_id`
     /// (a fresh handshake re-syncs the whole tree, so in-flight pushes are moot).
     pub pending_applies: HashMap<String, PendingApply>,
+    /// Honored nested `default.project.json` package mounts (A10 `wally-1`).
+    /// Rebuilt from disk on every `rescan_fs`. Empty for projects without Wally
+    /// packages, in which case `relative`/`fs_rel_for` are exact identities and
+    /// every path behaves exactly as before A10.
+    pub package_remaps: Vec<PackageRemap>,
 }
 
 pub type SharedState = Arc<RwLock<ProjectState>>;
@@ -276,6 +298,7 @@ impl ProjectState {
             pending_collisions: HashSet::new(),
             fs_removed_pending: HashMap::new(),
             pending_applies: HashMap::new(),
+            package_remaps: Vec::new(),
         };
         state.rescan_fs()?;
         if let Some(persisted) = tree::load_base_tree(root)? {
@@ -368,6 +391,11 @@ impl ProjectState {
         self.tree_fs.clear();
         self.meta.clear();
         self.meta_attributes.clear();
+        // A10 (wally-1): discover honored nested `default.project.json` package
+        // mounts first so `relative()` — called for every file just below — can
+        // collapse each package's `$path` subtree onto the package name. The
+        // remaps MUST exist before the first package source file is keyed.
+        self.rebuild_package_remaps();
         for (_, rel_dir) in self.project.path_mappings() {
             let dir = self.root.join(&rel_dir);
             if !dir.exists() {
@@ -390,6 +418,77 @@ impl ProjectState {
             }
         }
         Ok(())
+    }
+
+    /// Rebuilds `package_remaps` by scanning every mapped `$path` dir for nested
+    /// `default.project.json` files (A10 `wally-1`). Best-effort: a package
+    /// whose project file is unreadable, or richer than the simple
+    /// `{name, tree:{$path}}` shape, is skipped and keeps the plain
+    /// directory-structure mapping. `Packages/_Index` is still walked in full
+    /// (M7) — this only refines how the package's own subtree maps.
+    fn rebuild_package_remaps(&mut self) {
+        let mut remaps: Vec<PackageRemap> = Vec::new();
+        for (_, rel_dir) in self.project.path_mappings() {
+            let dir = self.root.join(&rel_dir);
+            if !dir.exists() {
+                continue;
+            }
+            for entry in walkdir::WalkDir::new(&dir)
+                .into_iter()
+                .filter_map(Result::ok)
+            {
+                if !entry.file_type().is_file() {
+                    continue;
+                }
+                let path = entry.path();
+                if path.file_name().and_then(|s| s.to_str())
+                    != Some(crate::project::PROJECT_FILE_NAME)
+                {
+                    continue;
+                }
+                let Some(pkg_dir) = path.parent() else {
+                    continue;
+                };
+                // The project root's own `default.project.json` is never a
+                // package mount.
+                if pkg_dir == self.root {
+                    continue;
+                }
+                if let Some(remap) = self.build_package_remap(pkg_dir, path) {
+                    remaps.push(remap);
+                }
+            }
+        }
+        // Longest `fs_prefix` first so a package nested inside another package's
+        // subtree (pathological but cheap to be correct about) matches before
+        // its ancestor.
+        remaps.sort_by(|a, b| b.fs_prefix.len().cmp(&a.fs_prefix.len()));
+        self.package_remaps = remaps;
+    }
+
+    /// Builds the `PackageRemap` for the `default.project.json` at
+    /// `project_json` inside `pkg_dir`, or `None` when it isn't the honored
+    /// Wally shape or its `$path` dir is missing on disk.
+    fn build_package_remap(&self, pkg_dir: &Path, project_json: &Path) -> Option<PackageRemap> {
+        let nested = crate::project::Project::load_nested_package(project_json)?;
+        let pkg_rel = self.rel_raw(pkg_dir)?;
+        if pkg_rel.is_empty() {
+            return None;
+        }
+        let fs_prefix = format!("{pkg_rel}/{}", nested.src);
+        if !self.root.join(&fs_prefix).is_dir() {
+            return None;
+        }
+        // instance_prefix = parent(pkg_dir) + package name: the `$path` segment
+        // is elided and the package directory is renamed to the project name.
+        let instance_prefix = match pkg_rel.rsplit_once('/') {
+            Some((parent, _)) => format!("{parent}/{}", nested.name),
+            None => nested.name.clone(),
+        };
+        Some(PackageRemap {
+            fs_prefix,
+            instance_prefix,
+        })
     }
 
     /// Reads a file, classifies it, stores it in `tree_fs` + `meta`, and
@@ -510,9 +609,12 @@ impl ProjectState {
         None
     }
 
-    /// Converts an absolute path into a project-relative, forward-slashed path,
-    /// or `None` if the path is outside the project root.
-    pub fn relative(&self, abs: &Path) -> Option<String> {
+    /// Absolute path → project-relative forward-slashed string, WITHOUT the A10
+    /// package collapse. Internal: `relative` layers the collapse on top. Remap
+    /// discovery needs the raw form because a package dir and its project file
+    /// sit above the `$path` prefix (so collapsing them would be a no-op) —
+    /// keeping this separate avoids depending on that coincidence.
+    fn rel_raw(&self, abs: &Path) -> Option<String> {
         let rel = abs.strip_prefix(&self.root).ok()?;
         let mut s = String::with_capacity(rel.as_os_str().len());
         for (i, comp) in rel.components().enumerate() {
@@ -522,6 +624,48 @@ impl ProjectState {
             s.push_str(comp.as_os_str().to_str()?);
         }
         Some(s)
+    }
+
+    /// Converts an absolute path into a project-relative, forward-slashed path,
+    /// or `None` if the path is outside the project root. Honored nested-package
+    /// `$path` subtrees are collapsed onto the package name here (A10 `wally-1`)
+    /// so `tree_fs`/`tree_base`/`tree_studio` and the watcher all key a package
+    /// file by the same instance-shaped path.
+    pub fn relative(&self, abs: &Path) -> Option<String> {
+        Some(self.collapse_package_path(self.rel_raw(abs)?))
+    }
+
+    /// Disk→instance half of a `PackageRemap`: rewrites a raw project-relative
+    /// path so a package's `$path` subtree maps onto the package name. Identity
+    /// for any path outside every honored package (i.e. every path when there
+    /// are no Wally packages).
+    fn collapse_package_path(&self, rel: String) -> String {
+        for remap in &self.package_remaps {
+            if rel == remap.fs_prefix {
+                return remap.instance_prefix.clone();
+            }
+            if let Some(sub) = strip_dir_prefix(&rel, &remap.fs_prefix) {
+                return format!("{}/{sub}", remap.instance_prefix);
+            }
+        }
+        rel
+    }
+
+    /// Instance→disk inverse of `relative`'s collapse: a tree key re-homed onto
+    /// a package name is rewritten back to the real on-disk path (re-inserting
+    /// the `$path`/`src` segment) so writes and deletes land on the actual file
+    /// (A10 `wally-1`). Identity for non-package keys, so every existing write
+    /// path is byte-for-byte unchanged.
+    pub fn fs_rel_for(&self, key: &str) -> String {
+        for remap in &self.package_remaps {
+            if key == remap.instance_prefix {
+                return remap.fs_prefix.clone();
+            }
+            if let Some(sub) = strip_dir_prefix(key, &remap.instance_prefix) {
+                return format!("{}/{sub}", remap.fs_prefix);
+            }
+        }
+        key.to_owned()
     }
 
     pub fn is_under_mapping(&self, rel: &str) -> bool {
@@ -598,6 +742,13 @@ pub fn encode_for_disk(canonical: &str, meta: FileMeta) -> String {
 pub fn sha256_hex(bytes: &[u8]) -> String {
     let digest = Sha256::digest(bytes);
     hex::encode(digest)
+}
+
+/// Returns the tail of `s` strictly below `prefix` (i.e. after `prefix/`), or
+/// `None` when `s` equals `prefix` or is unrelated. The trailing-slash check
+/// keeps a `PackageRemap` for `foo` from matching a sibling `foobar`.
+fn strip_dir_prefix<'a>(s: &'a str, prefix: &str) -> Option<&'a str> {
+    s.strip_prefix(prefix)?.strip_prefix('/')
 }
 
 /// Returns true for files ending in `.meta.json` (case-sensitive, matches
@@ -713,6 +864,77 @@ fn persist_session_id(root: &Path, id: &str) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ─── A10 (wally-1): honor nested `default.project.json` ───────────────────
+
+    /// A Wally package ships a `default.project.json` inside its folder
+    /// (`{name, tree:{$path:"src"}}`) so Rojo mounts `<pkg>/src` AS the package
+    /// ModuleScript. Before A10 the daemon walked the directory blindly, so
+    /// `.../foo/src/init.lua` made `src` the module and `foo` a bare Folder —
+    /// the Wally shim's `require(...["foo"])` then hit a Folder at runtime. The
+    /// scan must collapse the `$path` segment: `.../foo/src/init.lua` becomes
+    /// the module keyed at `.../foo/init.lua` (so the plugin's init-promotion
+    /// makes `foo` the ModuleScript) and `.../foo/src/Helper.lua` becomes its
+    /// child `.../foo/Helper.lua`.
+    #[test]
+    fn nested_wally_package_collapses_src_onto_package_name() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let root = dir.path();
+        std::fs::write(
+            root.join("default.project.json"),
+            r#"{"name":"T","tree":{"Packages":{"$path":"Packages"}}}"#,
+        )
+        .expect("write root project");
+        let pkg = root.join("Packages/_Index/foo@1.0.0/foo");
+        std::fs::create_dir_all(pkg.join("src")).expect("mkdir pkg/src");
+        std::fs::write(
+            pkg.join("default.project.json"),
+            r#"{"name":"foo","tree":{"$path":"src"}}"#,
+        )
+        .expect("write nested project");
+        std::fs::write(pkg.join("src/init.lua"), "return {}\n").expect("write init");
+        std::fs::write(pkg.join("src/Helper.lua"), "return 1\n").expect("write helper");
+
+        let project = Project::load(&root.join("default.project.json")).expect("load project");
+        let state = ProjectState::bootstrap(root, project, false, false).expect("bootstrap");
+
+        let module = "Packages/_Index/foo@1.0.0/foo/init.lua";
+        let child = "Packages/_Index/foo@1.0.0/foo/Helper.lua";
+        assert_eq!(
+            state.tree_fs.get(module).map(|e| e.content.as_str()),
+            Some("return {}\n"),
+            "package module must key at <pkg>/init.lua (foo is the ModuleScript)"
+        );
+        assert_eq!(
+            state.tree_fs.get(child).map(|e| e.content.as_str()),
+            Some("return 1\n"),
+            "sibling under src becomes a child of the package module"
+        );
+        assert!(
+            !state
+                .tree_fs
+                .contains_key("Packages/_Index/foo@1.0.0/foo/src/init.lua"),
+            "the `src` segment must be elided (foo must NOT stay a Folder with a child `src`)"
+        );
+        assert!(
+            !state
+                .tree_fs
+                .contains_key("Packages/_Index/foo@1.0.0/foo/src/Helper.lua"),
+            "no source file may keep the `src` segment once the package is honored"
+        );
+        // The collapse must be reversible so the daemon still writes to the real
+        // on-disk file (`.../foo/src/init.lua`) if it ever pushes to this path.
+        assert_eq!(
+            state.fs_rel_for(module),
+            "Packages/_Index/foo@1.0.0/foo/src/init.lua"
+        );
+        assert_eq!(
+            state.fs_rel_for(child),
+            "Packages/_Index/foo@1.0.0/foo/src/Helper.lua"
+        );
+        // A non-package path must pass through `fs_rel_for` unchanged.
+        assert_eq!(state.fs_rel_for("src/Main.luau"), "src/Main.luau");
+    }
 
     #[test]
     fn roundtrip_lf_no_bom() {

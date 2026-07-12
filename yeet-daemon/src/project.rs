@@ -38,6 +38,25 @@ pub struct TreeNode {
     pub children: BTreeMap<String, TreeNode>,
 }
 
+/// The `default.project.json` filename Rojo, Argon, and Wally all use. Kept
+/// here so the nested-package walk in `state.rs` doesn't have to reach into
+/// `main.rs` for the same literal.
+pub const PROJECT_FILE_NAME: &str = "default.project.json";
+
+/// A nested package project — the `{ "name": …, "tree": { "$path": "src" } }`
+/// shape Wally writes inside every package folder (e.g.
+/// `Packages/_Index/roblox_roact@1.4.4/roact/default.project.json`). Honoring
+/// it is what lets `<pkg>/src/init.lua` mount AS the package `ModuleScript`
+/// (named `name`) instead of leaving `src` as the module and the package a
+/// bare `Folder` — the runtime breakage in AUDITORIA-YEET.md A10 (`wally-1`).
+#[derive(Debug, Clone)]
+pub struct NestedPackage {
+    /// Instance name the package folder takes (the project's `name`).
+    pub name: String,
+    /// The single `$path`, relative to the package directory (typically `src`).
+    pub src: String,
+}
+
 impl Project {
     pub fn load(path: &Path) -> Result<Self> {
         let raw = std::fs::read_to_string(path)
@@ -45,6 +64,33 @@ impl Project {
         let project: Self = serde_json::from_str(&raw)
             .with_context(|| format!("parse {}", path.display()))?;
         Ok(project)
+    }
+
+    /// Parses a `default.project.json` found *inside* a package directory and
+    /// returns the nested-package mount iff it matches the simple
+    /// `{ name, tree: { $path } }` shape with no extra child instances and no
+    /// `$className`. Anything richer (a full multi-node Rojo project) is left
+    /// unhandled — we return `None` and the caller keeps the plain
+    /// directory-structure mapping, preserving existing behavior. Returns
+    /// `None` on read/parse error or a degenerate/unsafe `$path`.
+    pub fn load_nested_package(path: &Path) -> Option<NestedPackage> {
+        let raw = std::fs::read_to_string(path).ok()?;
+        let project: Self = serde_json::from_str(&raw).ok()?;
+        let src = project.tree.path.clone()?;
+        // Only the minimal Wally shape: a lone `$path`, no sub-instances and no
+        // class override to reconcile.
+        if !project.tree.children.is_empty() || project.tree.class_name.is_some() {
+            return None;
+        }
+        let src = src.replace('\\', "/");
+        if src.is_empty() || src == "." || src.starts_with('/') || src.split('/').any(|s| s == "..")
+        {
+            return None;
+        }
+        Some(NestedPackage {
+            name: project.name,
+            src,
+        })
     }
 
     /// Returns every `(instance_path_segments, filesystem_path)` pair produced by

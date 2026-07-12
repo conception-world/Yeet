@@ -1260,7 +1260,10 @@ async fn write_to_fs(
         }
     }
     let mut guard = state.write().await;
-    let abs = resolve_inside(&guard.root, path)
+    // A10: a package key like `.../foo/init.lua` must land on the real file
+    // `.../foo/src/init.lua`. Identity for every non-package path.
+    let fs_rel = guard.fs_rel_for(path);
+    let abs = resolve_inside(&guard.root, &fs_rel)
         .with_context(|| format!("refusing to write unsafe path {path}"))?;
     let meta = guard.meta_for(path);
     let encoded = encode_for_disk(&content, meta);
@@ -1360,7 +1363,9 @@ async fn delete_from_fs(
         }
     }
     let mut guard = state.write().await;
-    let abs = resolve_inside(&guard.root, path)
+    // A10: resolve a package key back to its real on-disk file before deleting.
+    let fs_rel = guard.fs_rel_for(path);
+    let abs = resolve_inside(&guard.root, &fs_rel)
         .with_context(|| format!("refusing to delete unsafe path {path}"))?;
     if abs.is_file() {
         std::fs::remove_file(&abs)
@@ -2991,7 +2996,9 @@ async fn handle_studio_renamed(
     }
 
     let mut guard = state.write().await;
-    let old_abs = match resolve_inside(&guard.root, &old_path) {
+    // A10: map package keys back to their real on-disk files for the rename I/O;
+    // the tree re-keying below still uses the collapsed (instance-shaped) paths.
+    let old_abs = match resolve_inside(&guard.root, &guard.fs_rel_for(&old_path)) {
         Ok(p) => p,
         Err(e) => {
             let reason = format!("resolve old_path {old_path}: {e:#}");
@@ -3009,7 +3016,7 @@ async fn handle_studio_renamed(
             return Ok(());
         }
     };
-    let new_abs = match resolve_inside(&guard.root, &new_path) {
+    let new_abs = match resolve_inside(&guard.root, &guard.fs_rel_for(&new_path)) {
         Ok(p) => p,
         Err(e) => {
             let reason = format!("resolve new_path {new_path}: {e:#}");
