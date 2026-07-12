@@ -1060,13 +1060,14 @@ function Widget._onConnectPressed(self: Widget)
   -- `ProjectOpened` (which skips auto-materialize and hands a snapshot back
   -- to this Widget for forwarding).
   applier:setBootstrapPreviewMode(true)
-  -- Auth handlers. The daemon's auth gate is best-effort: it never
-  -- bails the connection just because we lack a token. The only
-  -- thing the plugin needs to do is grab a token whenever the daemon
-  -- offers one (`auth_granted`), so future reconnects can include it
-  -- in `Hello.auth_token` and the daemon's match log stays clean.
-  -- No challenge/reject UI — the connection just works whether or
-  -- not we end up paired.
+  -- Auth handlers. The daemon issues a token via `auth_granted` when the
+  -- extension's pairing breadcrumb is fresh; we cache it and replay it in
+  -- `Hello.auth_token` on future reconnects. The daemon regenerates its token
+  -- every boot, so after a daemon restart our cached token is stale and the
+  -- daemon replies `auth_rejected` (it no longer echoes a token on mismatch —
+  -- that was a credential leak). On rejection we MUST clear the cached token so
+  -- the automatic reconnect re-pairs tokenless via a fresh breadcrumb; keeping
+  -- the stale token would loop reject→reconnect→reject forever.
   applier:setAuthGrantedHandler(function(payload: any)
     local token = tostring(payload.auth_token or "")
     if token == "" then
@@ -1079,6 +1080,21 @@ function Widget._onConnectPressed(self: Widget)
       self:_appendLog(`!! failed to persist auth token: {tostring(err)}`)
     else
       self:_appendLog(`auth token saved`)
+    end
+  end)
+  applier:setAuthRejectedHandler(function(payload: any)
+    -- The daemon rejected our token (typically stale after a daemon restart —
+    -- it regenerates the token every boot). Clear the cached token so the
+    -- automatic reconnect sends none and re-pairs via a fresh breadcrumb;
+    -- otherwise we would replay the same rejected token on every retry.
+    local reason = tostring((payload and payload.reason) or "unknown")
+    local ok, err = pcall(function()
+      self.plugin:SetSetting(AUTH_TOKEN_SETTING, "")
+    end)
+    if not ok then
+      self:_appendLog(`!! auth rejected ({reason}); failed to clear token: {tostring(err)}`)
+    else
+      self:_appendLog(`auth rejected ({reason}); cleared stored token, will re-pair`)
     end
   end)
   applier:setBootstrapSnapshotHook(function(snapshot)

@@ -3624,11 +3624,12 @@ fn decide_auth(
 /// defence-in-depth so a local process still has to read a per-project file
 /// rather than merely open the socket.
 ///
-/// On rejection the connection is closed (`bail`) and NOTHING is written — in
-/// particular the server token is never sent to a client that presented a
-/// wrong one, and the session never reaches `ProjectOpened { initial_files }`
-/// (that frame is emitted only inside the role session, after this returns
-/// `Ok`).
+/// On rejection an `AuthRejected { reason }` frame is written (reason only) and
+/// the connection is closed (`bail`). The server token is never sent to a
+/// client that presented a wrong one, and the session never reaches
+/// `ProjectOpened { initial_files }` (that frame is emitted only inside the role
+/// session, after this returns `Ok`). The `AuthRejected` frame lets a plugin
+/// holding a stale token clear it and re-pair instead of looping.
 async fn authenticate_or_pair(
     state: &SharedState,
     claimed_auth: &Option<String>,
@@ -3677,6 +3678,24 @@ async fn authenticate_or_pair(
                 reason,
                 "auth: rejecting connection (closing socket, server token NOT sent)"
             );
+            // Send an actionable AuthRejected (reason only, NEVER the token)
+            // before closing. The daemon regenerates its auth_token every boot,
+            // so a plugin that cached a token from a previous instance will
+            // present a stale one after a restart; without this signal it would
+            // reconnect with the same wrong token forever. On AuthRejected the
+            // plugin clears its stored token and re-pairs tokenless via the
+            // breadcrumb. Echoing the server token here is exactly the A16 leak
+            // we are closing, so it is never included.
+            if let Err(e) = write_frame(
+                writer,
+                &ServerMsg::AuthRejected {
+                    reason: reason.to_string(),
+                },
+            )
+            .await
+            {
+                warn!(error = ?e, "auth: failed to send auth_rejected before close");
+            }
             bail!("auth rejected: {reason}");
         }
     }
