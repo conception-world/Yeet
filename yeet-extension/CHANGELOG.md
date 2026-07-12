@@ -4,6 +4,59 @@ All notable changes to the Yeet VS Code extension are documented here.
 The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/);
 versions follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.5.0] — Security & stability audit
+
+A 13-area audit across the daemon, plugin, and extension. ~50 findings
+fixed (1 Critical, ~17 High), with 200+ regression tests added to the
+daemon. Plugin and extension must be updated together (a new apply-ack
+protocol message was added).
+
+### Security
+- **Auth gate rejects invalid tokens** instead of echoing the real
+  server token back to any caller (credential leak); the connection is
+  closed on mismatch. The plugin clears a stale token and re-pairs after
+  a daemon restart instead of looping.
+- **Syncback target confined to the user's home directory** — a
+  WebSocket client can no longer make the daemon write files anywhere on
+  disk. `..`/symlink escapes and overwriting a non-empty dir are refused.
+- **Origin allowlist hardened** against DNS-rebinding (exact loopback
+  match, not a prefix); non-loopback `--bind` now requires `--allow-remote`.
+
+### Fixed — data loss & correctness
+- **Case-only sibling names** (`Data`/`data`) no longer collapse onto one
+  file on NTFS (silent code loss).
+- **Removal tracking keyed by path, not content hash** — deleting two
+  identical-content files (or an unrelated delete+create) no longer loses
+  a deletion or fabricates a false rename.
+- **Apply-ack protocol** — the daemon advances its "confirmed" base tree
+  only after the plugin acknowledges the change applied, so a failed
+  Studio apply can't cascade into overwriting disk content that never
+  reached Studio.
+- **Lost-update guards** — a user edit is no longer silently clobbered
+  when a disk change lands in the debounce window; edits made during a
+  transient disconnect are buffered and re-sent on resume.
+- **Pending conflicts stay authoritative** during resolution; file moves
+  re-parent the instance; folder renames on disk sync; `.meta.json`
+  sidecars follow renames.
+
+### Fixed — Wally & tooling
+- **Wally packages work at runtime** — a package folder materializes as
+  its `ModuleScript` (honoring the nested `default.project.json`) instead
+  of a `Folder`, so `require(Packages.X)` resolves.
+- **`sourcemap.json` is generated and maintained by Yeet** (at setup and
+  on structural changes), so luau-lsp resolves requires and Wally types
+  without hand-running Rojo.
+
+### Fixed — performance
+- **No more Studio freezes** moving/deleting folders with many
+  descendants (event coalescing) or editing large scripts (hashing moved
+  off the keystroke path); large diffs are capped; syncback chunks by
+  byte budget.
+
+### Setup
+- `Yeet: Create` backs up an existing `default.project.json`, matches
+  `.gitignore` lines exactly, and ignores Wally package dirs.
+
 ## [0.4.1] — Conflict-overwrite guard + meta_attributes cleanup
 
 ### Fixed

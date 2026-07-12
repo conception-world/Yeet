@@ -1,7 +1,7 @@
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::time::Instant;
 
 use anyhow::{Context, Result};
 use sha2::{Digest, Sha256};
@@ -20,12 +20,6 @@ const SESSION_FILE: &str = ".yeet/session.json";
 /// frames. 1000 events is enough for ~hours of typical edits.
 const MAX_PENDING_DELTAS: usize = 1000;
 
-/// How long the daemon remembers that it just did a `fs::rename`, so the
-/// matching `notify::Remove(old) + Create(new)` pair from the filesystem
-/// watcher can be suppressed and not echoed back to the plugin. Sized to
-/// cover the watcher's 100 ms debounce window plus channel slack.
-const RENAME_ECHO_TTL: Duration = Duration::from_millis(500);
-
 /// A `tree_fs` entry that just disappeared from the watcher's point of
 /// view but might be the source half of a rename. Held briefly so a
 /// matching `Touched` (with the same `sha256`) can promote the pair into
@@ -35,6 +29,34 @@ pub struct FsRemovedPending {
     pub path: String,
     pub entry: TreeEntry,
     pub meta: FileMeta,
+    pub since: Instant,
+}
+
+/// A Studio-direction change the daemon has broadcast but the plugin has not
+/// yet confirmed applying (AUDITORIA-YEET.md A4 / M14 `resil-2`). Held in
+/// `ProjectState::pending_applies` between `push_to_studio`/`delete_on_studio`/
+/// the AutoMerge broadcast and the plugin's `FileApplied`. `tree_base` and
+/// `tree_studio` are NOT advanced while an entry is pending — only a matching
+/// `FileApplied` (or the old-plugin timeout fallback) advances them. This is
+/// what stops the daemon from believing Studio synced when `withRecording`
+/// silently failed, which used to cascade into overwriting disk content that
+/// never reached Studio.
+#[derive(Debug, Clone)]
+pub struct PendingApply {
+    /// The sha the plugin must echo in `FileApplied` for the confirmation to
+    /// count. Equals `entry.sha256` for a write; the empty string for a delete
+    /// (there is no content to hash). A `FileApplied` whose sha does not match
+    /// is a stale ACK for a superseded push and is ignored.
+    pub sha256: String,
+    /// The tree entry to install into `tree_base`/`tree_studio` once confirmed.
+    /// `None` means the pending op is a delete — confirmation removes the path
+    /// from both trees instead.
+    pub entry: Option<TreeEntry>,
+    /// When the change was first broadcast. Drives the old-plugin timeout
+    /// fallback: a plugin that never learned to send `FileApplied` would
+    /// otherwise stall the path forever, so after `APPLY_ACK_TIMEOUT_SECS` the
+    /// daemon advances the trees anyway (restoring the legacy behaviour) rather
+    /// than leaving Studio and disk wedged.
     pub since: Instant,
 }
 
@@ -62,6 +84,23 @@ impl FileMeta {
             has_bom: false,
         }
     }
+}
+
+/// One honored nested `default.project.json` (AUDITORIA-YEET.md A10 `wally-1`).
+/// Every source file under `fs_prefix` (the package's `$path` dir on disk) is
+/// re-keyed onto `instance_prefix` (the package folder renamed to the nested
+/// project's `name`), eliding the `$path`/`src` segment so the package folder
+/// becomes the `ModuleScript` instead of `src`. The transform is a pure prefix
+/// swap so it round-trips: `collapse` rewrites disk→instance, `fs_rel_for`
+/// rewrites instance→disk.
+#[derive(Debug, Clone)]
+pub struct PackageRemap {
+    /// Project-relative, forward-slashed dir the nested project's `$path`
+    /// resolves to, e.g. `Packages/_Index/foo@1.0.0/foo/src`.
+    pub fs_prefix: String,
+    /// Project-relative, forward-slashed instance path the package mounts at,
+    /// e.g. `Packages/_Index/foo@1.0.0/foo`.
+    pub instance_prefix: String,
 }
 
 #[derive(Debug)]
@@ -153,23 +192,45 @@ pub struct ProjectState {
     /// also reachable from the on-disk file with the same lifetime —
     /// process-memory zeroization gives no extra protection here.
     pub auth_token: String,
-    /// Suppresses the watcher echo from a daemon-initiated `fs::rename`.
-    /// Populated immediately before the rename, consumed by `handle_fs_event`
-    /// when the `Remove(old) + Touched(new)` pair surfaces. Entries older than
-    /// `RENAME_ECHO_TTL` are dropped opportunistically — no background sweep.
-    pub recently_renamed: HashMap<(String, String), Instant>,
     /// Paths currently flagged as colliding (two Studio instances resolving
     /// to the same project-relative path). Sync for these paths is paused
     /// until the plugin notifies a rename that clears the collision. Used
     /// by the studio-side mutation handlers to reject incoming `FileChanged`
     /// / `FileRenamed` with `SyncErrorKind::NameCollisionPending`.
     pub pending_collisions: HashSet<String>,
-    /// Recently observed filesystem removes, indexed by `sha256` of the
-    /// content that disappeared. When a `Touched` event later carries the
-    /// same hash, the pair is promoted to a `FileRenamed` instead of a
-    /// destructive Delete+Create — preserves Studio-side state
-    /// (attributes, tags, non-script children) across IDE-side renames.
+    /// Recently observed filesystem removes, indexed by **path** (not by
+    /// `sha256` of the content — see AUDITORIA-YEET.md finding A1). Keying
+    /// by content hash let two same-content deletes clobber each other's
+    /// entry (losing one deletion) and let unrelated delete+create pairs
+    /// of identical content pair up as a false rename. Each removal now
+    /// owns its own slot and reconciles independently by its own path.
+    /// When a `Touched` event later carries a matching `entry.sha256`
+    /// (subject to the watcher-4 / move-2 guards in `handle_fs_event`),
+    /// the pair is promoted to a `FileRenamed` instead of a destructive
+    /// Delete+Create — preserves Studio-side state (attributes, tags,
+    /// non-script children) across IDE-side renames.
     pub fs_removed_pending: HashMap<String, FsRemovedPending>,
+    /// Studio-direction changes broadcast to the plugin but not yet confirmed
+    /// applied (AUDITORIA-YEET.md A4 / M14). Keyed by path. `tree_base`/
+    /// `tree_studio` for a path stay at their old value while an entry sits
+    /// here; the plugin's `FileApplied` (or the timeout fallback in
+    /// `sweep_pending_applies`) is what advances them. Cleared on a real
+    /// Studio-side event for the path (a genuine `FileChanged`/`FileDeleted`/
+    /// `FileRenamed` supersedes the optimistic push) and on `rotate_session_id`
+    /// (a fresh handshake re-syncs the whole tree, so in-flight pushes are moot).
+    pub pending_applies: HashMap<String, PendingApply>,
+    /// Honored nested `default.project.json` package mounts (A10 `wally-1`).
+    /// Rebuilt from disk on every `rescan_fs`. Empty for projects without Wally
+    /// packages, in which case `relative`/`fs_rel_for` are exact identities and
+    /// every path behaves exactly as before A10.
+    pub package_remaps: Vec<PackageRemap>,
+    /// Nudges the background `sourcemap.json` writer (M1 `setup-1`/`wally-4`)
+    /// after a *structural* tree change — a path added, removed, or renamed.
+    /// `None` until `main` wires the writer task in (unit tests and syncback
+    /// construct state without it, so `mark_sourcemap_dirty` is a no-op there).
+    /// The writer debounces and only rewrites when the tree's shape actually
+    /// changed, so a content-only edit never touches the file.
+    pub sourcemap_tx: Option<mpsc::UnboundedSender<()>>,
 }
 
 pub type SharedState = Arc<RwLock<ProjectState>>;
@@ -241,9 +302,11 @@ impl ProjectState {
             pending_bulk_sync: HashMap::new(),
             mapping_roots_canonical,
             auth_token,
-            recently_renamed: HashMap::new(),
             pending_collisions: HashSet::new(),
             fs_removed_pending: HashMap::new(),
+            pending_applies: HashMap::new(),
+            package_remaps: Vec::new(),
+            sourcemap_tx: None,
         };
         state.rescan_fs()?;
         if let Some(persisted) = tree::load_base_tree(root)? {
@@ -294,6 +357,11 @@ impl ProjectState {
         let new_id = uuid::Uuid::new_v4().to_string();
         let old_id = std::mem::replace(&mut self.session_id, new_id.clone());
         self.pending_deltas.clear();
+        // A4: in-flight Studio-direction pushes belong to the old session. The
+        // next connection re-bootstraps the whole tree, so a lingering
+        // `pending_applies` entry (and its deferred `tree_base` advance) would
+        // be meaningless — drop them with the buffer.
+        self.pending_applies.clear();
         self.rotation_count = self.rotation_count.saturating_add(1);
         tracing::info!(
             old = %old_id,
@@ -324,11 +392,18 @@ impl ProjectState {
     }
 
     /// Walks every `$path`-mapped directory and seeds `tree_fs` + `meta`.
-    /// `tree_base` and `tree_studio` are left untouched.
-    fn rescan_fs(&mut self) -> Result<()> {
+    /// `tree_base` and `tree_studio` are left untouched. Public so the FS
+    /// event pipeline can re-run a full scan after a watcher backend
+    /// error/overflow dropped notifications (AUDITORIA-YEET.md M19).
+    pub fn rescan_fs(&mut self) -> Result<()> {
         self.tree_fs.clear();
         self.meta.clear();
         self.meta_attributes.clear();
+        // A10 (wally-1): discover honored nested `default.project.json` package
+        // mounts first so `relative()` — called for every file just below — can
+        // collapse each package's `$path` subtree onto the package name. The
+        // remaps MUST exist before the first package source file is keyed.
+        self.rebuild_package_remaps();
         for (_, rel_dir) in self.project.path_mappings() {
             let dir = self.root.join(&rel_dir);
             if !dir.exists() {
@@ -351,6 +426,77 @@ impl ProjectState {
             }
         }
         Ok(())
+    }
+
+    /// Rebuilds `package_remaps` by scanning every mapped `$path` dir for nested
+    /// `default.project.json` files (A10 `wally-1`). Best-effort: a package
+    /// whose project file is unreadable, or richer than the simple
+    /// `{name, tree:{$path}}` shape, is skipped and keeps the plain
+    /// directory-structure mapping. `Packages/_Index` is still walked in full
+    /// (M7) — this only refines how the package's own subtree maps.
+    fn rebuild_package_remaps(&mut self) {
+        let mut remaps: Vec<PackageRemap> = Vec::new();
+        for (_, rel_dir) in self.project.path_mappings() {
+            let dir = self.root.join(&rel_dir);
+            if !dir.exists() {
+                continue;
+            }
+            for entry in walkdir::WalkDir::new(&dir)
+                .into_iter()
+                .filter_map(Result::ok)
+            {
+                if !entry.file_type().is_file() {
+                    continue;
+                }
+                let path = entry.path();
+                if path.file_name().and_then(|s| s.to_str())
+                    != Some(crate::project::PROJECT_FILE_NAME)
+                {
+                    continue;
+                }
+                let Some(pkg_dir) = path.parent() else {
+                    continue;
+                };
+                // The project root's own `default.project.json` is never a
+                // package mount.
+                if pkg_dir == self.root {
+                    continue;
+                }
+                if let Some(remap) = self.build_package_remap(pkg_dir, path) {
+                    remaps.push(remap);
+                }
+            }
+        }
+        // Longest `fs_prefix` first so a package nested inside another package's
+        // subtree (pathological but cheap to be correct about) matches before
+        // its ancestor.
+        remaps.sort_by(|a, b| b.fs_prefix.len().cmp(&a.fs_prefix.len()));
+        self.package_remaps = remaps;
+    }
+
+    /// Builds the `PackageRemap` for the `default.project.json` at
+    /// `project_json` inside `pkg_dir`, or `None` when it isn't the honored
+    /// Wally shape or its `$path` dir is missing on disk.
+    fn build_package_remap(&self, pkg_dir: &Path, project_json: &Path) -> Option<PackageRemap> {
+        let nested = crate::project::Project::load_nested_package(project_json)?;
+        let pkg_rel = self.rel_raw(pkg_dir)?;
+        if pkg_rel.is_empty() {
+            return None;
+        }
+        let fs_prefix = format!("{pkg_rel}/{}", nested.src);
+        if !self.root.join(&fs_prefix).is_dir() {
+            return None;
+        }
+        // instance_prefix = parent(pkg_dir) + package name: the `$path` segment
+        // is elided and the package directory is renamed to the project name.
+        let instance_prefix = match pkg_rel.rsplit_once('/') {
+            Some((parent, _)) => format!("{parent}/{}", nested.name),
+            None => nested.name.clone(),
+        };
+        Some(PackageRemap {
+            fs_prefix,
+            instance_prefix,
+        })
     }
 
     /// Reads a file, classifies it, stores it in `tree_fs` + `meta`, and
@@ -471,9 +617,12 @@ impl ProjectState {
         None
     }
 
-    /// Converts an absolute path into a project-relative, forward-slashed path,
-    /// or `None` if the path is outside the project root.
-    pub fn relative(&self, abs: &Path) -> Option<String> {
+    /// Absolute path → project-relative forward-slashed string, WITHOUT the A10
+    /// package collapse. Internal: `relative` layers the collapse on top. Remap
+    /// discovery needs the raw form because a package dir and its project file
+    /// sit above the `$path` prefix (so collapsing them would be a no-op) —
+    /// keeping this separate avoids depending on that coincidence.
+    fn rel_raw(&self, abs: &Path) -> Option<String> {
         let rel = abs.strip_prefix(&self.root).ok()?;
         let mut s = String::with_capacity(rel.as_os_str().len());
         for (i, comp) in rel.components().enumerate() {
@@ -483,6 +632,48 @@ impl ProjectState {
             s.push_str(comp.as_os_str().to_str()?);
         }
         Some(s)
+    }
+
+    /// Converts an absolute path into a project-relative, forward-slashed path,
+    /// or `None` if the path is outside the project root. Honored nested-package
+    /// `$path` subtrees are collapsed onto the package name here (A10 `wally-1`)
+    /// so `tree_fs`/`tree_base`/`tree_studio` and the watcher all key a package
+    /// file by the same instance-shaped path.
+    pub fn relative(&self, abs: &Path) -> Option<String> {
+        Some(self.collapse_package_path(self.rel_raw(abs)?))
+    }
+
+    /// Disk→instance half of a `PackageRemap`: rewrites a raw project-relative
+    /// path so a package's `$path` subtree maps onto the package name. Identity
+    /// for any path outside every honored package (i.e. every path when there
+    /// are no Wally packages).
+    fn collapse_package_path(&self, rel: String) -> String {
+        for remap in &self.package_remaps {
+            if rel == remap.fs_prefix {
+                return remap.instance_prefix.clone();
+            }
+            if let Some(sub) = strip_dir_prefix(&rel, &remap.fs_prefix) {
+                return format!("{}/{sub}", remap.instance_prefix);
+            }
+        }
+        rel
+    }
+
+    /// Instance→disk inverse of `relative`'s collapse: a tree key re-homed onto
+    /// a package name is rewritten back to the real on-disk path (re-inserting
+    /// the `$path`/`src` segment) so writes and deletes land on the actual file
+    /// (A10 `wally-1`). Identity for non-package keys, so every existing write
+    /// path is byte-for-byte unchanged.
+    pub fn fs_rel_for(&self, key: &str) -> String {
+        for remap in &self.package_remaps {
+            if key == remap.instance_prefix {
+                return remap.fs_prefix.clone();
+            }
+            if let Some(sub) = strip_dir_prefix(key, &remap.instance_prefix) {
+                return format!("{}/{sub}", remap.fs_prefix);
+            }
+        }
+        key.to_owned()
     }
 
     pub fn is_under_mapping(&self, rel: &str) -> bool {
@@ -504,38 +695,16 @@ impl ProjectState {
         })
     }
 
-    /// Records that the daemon is about to perform a `fs::rename` from
-    /// `old_path` to `new_path`. The watcher will emit `Remove(old) +
-    /// Touched(new)` shortly after; `consume_rename_echo` swallows that
-    /// pair so the daemon does not re-broadcast its own work.
-    pub fn note_rename_echo(&mut self, old_path: String, new_path: String) {
-        self.prune_rename_echoes();
-        self.recently_renamed
-            .insert((old_path, new_path), Instant::now());
-    }
-
-    /// Checks whether a watcher event for `path` (either side of a recent
-    /// rename) should be suppressed. Removes the matching entry so the
-    /// echo is one-shot. Stale entries are pruned opportunistically.
-    pub fn consume_rename_echo(&mut self, path: &str) -> bool {
-        self.prune_rename_echoes();
-        let hit = self
-            .recently_renamed
-            .keys()
-            .find(|(old, new)| old == path || new == path)
-            .cloned();
-        if let Some(key) = hit {
-            self.recently_renamed.remove(&key);
-            true
-        } else {
-            false
+    /// Signals the background writer that the tracked file set changed shape
+    /// (M1). Cheap and best-effort: a full/closed channel just means a rewrite
+    /// is already scheduled or the daemon is shutting down. Callers already
+    /// holding the write lock invoke this for free; a content-only edit must
+    /// NOT call it — the writer's signature guard would skip the rewrite anyway,
+    /// but keeping the trigger structural avoids waking it needlessly.
+    pub fn mark_sourcemap_dirty(&self) {
+        if let Some(tx) = &self.sourcemap_tx {
+            let _ = tx.send(());
         }
-    }
-
-    fn prune_rename_echoes(&mut self) {
-        let now = Instant::now();
-        self.recently_renamed
-            .retain(|_, ts| now.duration_since(*ts) < RENAME_ECHO_TTL);
     }
 
     /// Convenience accessor: meta for `path`, or a sensible default if the
@@ -593,6 +762,13 @@ pub fn encode_for_disk(canonical: &str, meta: FileMeta) -> String {
 pub fn sha256_hex(bytes: &[u8]) -> String {
     let digest = Sha256::digest(bytes);
     hex::encode(digest)
+}
+
+/// Returns the tail of `s` strictly below `prefix` (i.e. after `prefix/`), or
+/// `None` when `s` equals `prefix` or is unrelated. The trailing-slash check
+/// keeps a `PackageRemap` for `foo` from matching a sibling `foobar`.
+fn strip_dir_prefix<'a>(s: &'a str, prefix: &str) -> Option<&'a str> {
+    s.strip_prefix(prefix)?.strip_prefix('/')
 }
 
 /// Returns true for files ending in `.meta.json` (case-sensitive, matches
@@ -708,6 +884,77 @@ fn persist_session_id(root: &Path, id: &str) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ─── A10 (wally-1): honor nested `default.project.json` ───────────────────
+
+    /// A Wally package ships a `default.project.json` inside its folder
+    /// (`{name, tree:{$path:"src"}}`) so Rojo mounts `<pkg>/src` AS the package
+    /// ModuleScript. Before A10 the daemon walked the directory blindly, so
+    /// `.../foo/src/init.lua` made `src` the module and `foo` a bare Folder —
+    /// the Wally shim's `require(...["foo"])` then hit a Folder at runtime. The
+    /// scan must collapse the `$path` segment: `.../foo/src/init.lua` becomes
+    /// the module keyed at `.../foo/init.lua` (so the plugin's init-promotion
+    /// makes `foo` the ModuleScript) and `.../foo/src/Helper.lua` becomes its
+    /// child `.../foo/Helper.lua`.
+    #[test]
+    fn nested_wally_package_collapses_src_onto_package_name() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let root = dir.path();
+        std::fs::write(
+            root.join("default.project.json"),
+            r#"{"name":"T","tree":{"Packages":{"$path":"Packages"}}}"#,
+        )
+        .expect("write root project");
+        let pkg = root.join("Packages/_Index/foo@1.0.0/foo");
+        std::fs::create_dir_all(pkg.join("src")).expect("mkdir pkg/src");
+        std::fs::write(
+            pkg.join("default.project.json"),
+            r#"{"name":"foo","tree":{"$path":"src"}}"#,
+        )
+        .expect("write nested project");
+        std::fs::write(pkg.join("src/init.lua"), "return {}\n").expect("write init");
+        std::fs::write(pkg.join("src/Helper.lua"), "return 1\n").expect("write helper");
+
+        let project = Project::load(&root.join("default.project.json")).expect("load project");
+        let state = ProjectState::bootstrap(root, project, false, false).expect("bootstrap");
+
+        let module = "Packages/_Index/foo@1.0.0/foo/init.lua";
+        let child = "Packages/_Index/foo@1.0.0/foo/Helper.lua";
+        assert_eq!(
+            state.tree_fs.get(module).map(|e| e.content.as_str()),
+            Some("return {}\n"),
+            "package module must key at <pkg>/init.lua (foo is the ModuleScript)"
+        );
+        assert_eq!(
+            state.tree_fs.get(child).map(|e| e.content.as_str()),
+            Some("return 1\n"),
+            "sibling under src becomes a child of the package module"
+        );
+        assert!(
+            !state
+                .tree_fs
+                .contains_key("Packages/_Index/foo@1.0.0/foo/src/init.lua"),
+            "the `src` segment must be elided (foo must NOT stay a Folder with a child `src`)"
+        );
+        assert!(
+            !state
+                .tree_fs
+                .contains_key("Packages/_Index/foo@1.0.0/foo/src/Helper.lua"),
+            "no source file may keep the `src` segment once the package is honored"
+        );
+        // The collapse must be reversible so the daemon still writes to the real
+        // on-disk file (`.../foo/src/init.lua`) if it ever pushes to this path.
+        assert_eq!(
+            state.fs_rel_for(module),
+            "Packages/_Index/foo@1.0.0/foo/src/init.lua"
+        );
+        assert_eq!(
+            state.fs_rel_for(child),
+            "Packages/_Index/foo@1.0.0/foo/src/Helper.lua"
+        );
+        // A non-package path must pass through `fs_rel_for` unchanged.
+        assert_eq!(state.fs_rel_for("src/Main.luau"), "src/Main.luau");
+    }
 
     #[test]
     fn roundtrip_lf_no_bom() {

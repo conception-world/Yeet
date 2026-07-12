@@ -40,7 +40,10 @@ export type Options = {
 }
 
 export type Handle = {
-	send: (self: Handle, payload: Payload) -> (),
+	-- Returns true when the frame was JSON-encoded and handed to the socket
+	-- without error, false otherwise (encode failure or socket Send throw).
+	-- Callers gate their "sent" bookkeeping/logging on this (B10).
+	send: (self: Handle, payload: Payload) -> boolean,
 	close: (self: Handle) -> (),
 }
 
@@ -113,7 +116,7 @@ function Connection.connect(url: string, handlers: Handlers, options: Options?):
 
 	local handle: Handle
 	handle = {
-		send = function(_self: Handle, payload: Payload)
+		send = function(_self: Handle, payload: Payload): boolean
 			local payloadType = tostring(payload.type or "<no-type>")
 			local okEncode, body = pcall(function()
 				return HttpService:JSONEncode(payload)
@@ -124,7 +127,7 @@ function Connection.connect(url: string, handlers: Handlers, options: Options?):
 					payloadType,
 					tostring(body)
 				))
-				return
+				return false
 			end
 			local bytes = #body
 			if bytes >= LARGE_FRAME_BYTES then
@@ -144,7 +147,9 @@ function Connection.connect(url: string, handlers: Handlers, options: Options?):
 					bytes,
 					tostring(err)
 				))
+				return false
 			end
+			return true
 		end,
 		close = function(_self: Handle)
 			pcall(function()

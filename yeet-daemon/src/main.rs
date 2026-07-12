@@ -1,4 +1,4 @@
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeSet, HashMap, HashSet};
 use std::io::Write as _;
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
@@ -32,9 +32,10 @@ use yeet_daemon::protocol::{
     SerializedInstance, ServerMsg, StudioFileSnapshot, SyncErrorKind, SyncbackMode,
     SyncbackTemplate, classify, is_init_filename,
 };
+use yeet_daemon::sourcemap;
 use yeet_daemon::state::{
-    FileMeta, FsRemovedPending, ProjectState, SharedState, encode_for_disk, is_meta_file,
-    normalize_from_disk, resolve_inside, sha256_hex,
+    FileMeta, FsRemovedPending, PendingApply, ProjectState, SharedState, encode_for_disk,
+    is_meta_file, normalize_from_disk, resolve_inside, sha256_hex,
 };
 use yeet_daemon::syncback::{self, SyncbackOptions, SyncbackSession, SyncbackSessions};
 use yeet_daemon::tree::{self, TreeEntry};
@@ -101,6 +102,18 @@ const WS_IDLE_TIMEOUT_SECS: u64 = 600;
 /// 30s gives a reasonable detection latency without burning a tokio task
 /// timer on a per-second tick.
 const WS_IDLE_CHECK_SECS: u64 = 30;
+/// A4 apply-ACK: how long a Studio-direction push (recorded in
+/// `pending_applies`) may wait for the plugin's `FileApplied` before the
+/// old-plugin timeout fallback advances `tree_base`/`tree_studio` anyway. A
+/// current plugin ACKs within a round-trip (milliseconds on loopback), so this
+/// only ever fires for a pre-A4 plugin that never learned to ACK, or a genuinely
+/// lost frame — in which case restoring the legacy "advance on broadcast"
+/// behaviour after a delay is safer than wedging the path forever.
+const APPLY_ACK_TIMEOUT_SECS: u64 = 8;
+/// How often `run_plugin_session` sweeps `pending_applies` for entries past
+/// `APPLY_ACK_TIMEOUT_SECS`. Kept short (relative to the idle check) so the
+/// fallback latency for an old plugin is bounded to a few seconds.
+const APPLY_SWEEP_CHECK_SECS: u64 = 2;
 /// Minimum plugin/extension `Hello { version }` value the daemon will accept.
 /// Compared via `semver::Version`, NOT lexicographically.
 ///
@@ -139,6 +152,12 @@ const BUILD_STAMP: &str = "rename-surface-errors-1";
 /// Sized above the watcher's 100 ms debounce so the From/To pair always
 /// lands inside the window even on slower platforms.
 const FS_RENAME_PAIR_TTL: Duration = Duration::from_millis(250);
+
+/// Debounce window for coalescing a burst of structural tree changes (bulk
+/// sync, a `git checkout` storm, a folder rename fanning out per-child events)
+/// into a single `sourcemap.json` rewrite (M1). Long enough to swallow a burst,
+/// short enough that the LSP sees a fresh map within a fraction of a second.
+const SOURCEMAP_DEBOUNCE: Duration = Duration::from_millis(300);
 
 struct CliArgs {
     project_root: PathBuf,
@@ -220,8 +239,27 @@ async fn main() -> Result<()> {
     let (fs_tx, fs_rx) = mpsc::channel::<FileEvent>(EVENT_CHANNEL_CAPACITY);
     let _watcher = watcher::spawn(&args.project_root, fs_tx)?;
 
-    let state_inner =
+    let mut state_inner =
         ProjectState::bootstrap(&args.project_root, project, args.debug_echo, args.dry_run)?;
+    // Emit an initial `sourcemap.json` from the freshly-scanned tree (M1
+    // `setup-1`/`wally-4`) so luau-lsp can resolve `game.<Service>.<Script>`,
+    // `require(Packages.X)`, and Wally types the moment the project opens —
+    // before this Yeet never generated one and type resolution was dead on a
+    // fresh setup. Best-effort: a failure here must not block the daemon.
+    if let Err(e) = sourcemap::write_sourcemap(
+        &state_inner.root,
+        &state_inner.project,
+        &state_inner.tree_fs,
+    ) {
+        warn!(error = ?e, "failed to write initial sourcemap.json");
+    }
+    // Wire the background writer: structural tree changes nudge `sourcemap_tx`;
+    // the writer debounces and regenerates the map. Seed its baseline signature
+    // from the tree we just wrote so the first structural change (not a stray
+    // content edit) is what triggers the next rewrite.
+    let sourcemap_sig = sourcemap::structure_signature(&state_inner.tree_fs);
+    let (sourcemap_tx, sourcemap_rx) = mpsc::unbounded_channel::<()>();
+    state_inner.sourcemap_tx = Some(sourcemap_tx);
     if args.dry_run {
         warn!(
             "DRY-RUN MODE: every disk write, disk delete, push to Studio and delete on \
@@ -273,6 +311,7 @@ async fn main() -> Result<()> {
     let (bcast_tx, _) = broadcast::channel::<Arc<ServerMsg>>(BROADCAST_CAPACITY);
 
     tokio::spawn(event_pump(state.clone(), fs_rx, bcast_tx.clone()));
+    tokio::spawn(sourcemap_writer(state.clone(), sourcemap_rx, sourcemap_sig));
 
     // Give the watcher's 100ms debounce + event_pump a moment to drain any
     // events that fired during the scan/sweep window above. Without this,
@@ -286,6 +325,11 @@ async fn main() -> Result<()> {
     let sessions: Arc<Mutex<SyncbackSessions>> = Arc::new(Mutex::new(SyncbackSessions::default()));
 
     let bind_addr = args.bind.as_deref().unwrap_or(BIND_ADDR);
+    // When bound to loopback (the default), enforce a loopback `Host` header
+    // on the WS upgrade as extra anti-rebinding defence. A non-loopback bind
+    // (only reachable via `--allow-remote`) legitimately sees remote Hosts,
+    // so the check is disabled there.
+    let enforce_loopback_host = is_loopback_bind_addr(bind_addr);
     let listener = TcpListener::bind(bind_addr)
         .await
         .with_context(|| format!("bind {bind_addr}"))?;
@@ -298,7 +342,7 @@ async fn main() -> Result<()> {
     info!(addr = %actual_addr, "yeet-daemon listening");
 
     tokio::select! {
-        res = accept_loop(listener, state, sessions, bcast_tx) => res,
+        res = accept_loop(listener, state, sessions, bcast_tx, enforce_loopback_host) => res,
         res = tokio::signal::ctrl_c() => {
             res.context("install ctrl+c handler")?;
             info!("shutdown: ctrl+c received");
@@ -313,12 +357,40 @@ fn init_tracing() {
     tracing_subscriber::fmt().with_env_filter(filter).init();
 }
 
+/// Refuses a non-loopback `--bind` unless `--allow-remote` was passed, and
+/// emits a prominent warning when a remote bind is allowed (AUDITORIA-YEET.md
+/// B13). Loopback binds (the default) always pass silently. Split out from
+/// `parse_args` so the policy is unit-testable without touching argv.
+fn validate_bind_addr(bind: Option<&str>, allow_remote: bool) -> Result<()> {
+    let Some(addr) = bind else {
+        return Ok(());
+    };
+    if is_loopback_bind_addr(addr) {
+        return Ok(());
+    }
+    if !allow_remote {
+        bail!(
+            "--bind {addr} is not a loopback address. Binding to a non-loopback \
+             interface exposes your project's source code to the network — anyone who \
+             can reach this port could read and write it. Re-run with --allow-remote to \
+             confirm you intend this."
+        );
+    }
+    warn!(
+        bind = %addr,
+        "SECURITY: binding to a non-loopback address (--allow-remote). The daemon is \
+         reachable from the network; only do this on a trusted network."
+    );
+    Ok(())
+}
+
 fn parse_args() -> Result<CliArgs> {
     let mut positional: Option<String> = None;
     let mut debug_echo = false;
     let mut bind: Option<String> = None;
     let mut reset_base_tree = false;
     let mut dry_run = false;
+    let mut allow_remote = false;
     let mut iter = std::env::args().skip(1);
     while let Some(arg) = iter.next() {
         if arg == "--debug-echo" {
@@ -327,6 +399,8 @@ fn parse_args() -> Result<CliArgs> {
             reset_base_tree = true;
         } else if arg == "--dry-run" {
             dry_run = true;
+        } else if arg == "--allow-remote" {
+            allow_remote = true;
         } else if arg == "--bind" {
             bind = Some(
                 iter.next()
@@ -342,6 +416,9 @@ fn parse_args() -> Result<CliArgs> {
             bail!("unexpected extra argument: {arg}");
         }
     }
+    // A non-loopback bind must be opted into explicitly — the default stays
+    // loopback and unaffected.
+    validate_bind_addr(bind.as_deref(), allow_remote)?;
 
     let dir = match positional {
         Some(s) => PathBuf::from(s),
@@ -379,6 +456,37 @@ async fn event_pump(
     }
 }
 
+/// Background writer for `<root>/sourcemap.json` (M1). Wakes on a structural
+/// tree change signalled via `ProjectState::mark_sourcemap_dirty`, debounces a
+/// burst into one write, and regenerates the map only when the tree's *shape*
+/// (its `structure_signature`) actually changed since the last write — so a run
+/// of content-only marks, or a bulk op whose net structure is unchanged, never
+/// rewrites the file. The JSON is built under a read lock, then written to disk
+/// after the lock is released so the fsync never blocks reconciles.
+async fn sourcemap_writer(
+    state: SharedState,
+    mut rx: mpsc::UnboundedReceiver<()>,
+    mut last_sig: u64,
+) {
+    while rx.recv().await.is_some() {
+        tokio::time::sleep(SOURCEMAP_DEBOUNCE).await;
+        // Drain everything that piled up during the debounce window.
+        while rx.try_recv().is_ok() {}
+        let guard = state.read().await;
+        let sig = sourcemap::structure_signature(&guard.tree_fs);
+        if sig == last_sig {
+            continue;
+        }
+        last_sig = sig;
+        let root = guard.root.clone();
+        let value = sourcemap::build_sourcemap(&guard.project, &guard.tree_fs);
+        drop(guard);
+        if let Err(e) = sourcemap::write_value(&root, &value) {
+            warn!(error = ?e, "failed to write sourcemap.json");
+        }
+    }
+}
+
 async fn handle_fs_event(
     state: &SharedState,
     event: FileEvent,
@@ -389,6 +497,8 @@ async fn handle_fs_event(
     // three-way source merge.
     let abs_for_meta = match &event {
         FileEvent::Touched(p) | FileEvent::Removed(p) => p.clone(),
+        // Backend error/overflow: re-scan the whole tree and reconcile.
+        FileEvent::Rescan => return handle_rescan(state, bcast_tx).await,
     };
     if is_meta_file(&abs_for_meta) {
         return handle_meta_event(state, event, bcast_tx).await;
@@ -434,6 +544,16 @@ async fn handle_fs_event(
 
     let path = match event {
         FileEvent::Touched(abs) => {
+            // A directory Touched is the signal for a folder rename/move: on
+            // Windows a folder rename emits only a dir-level rename pair with
+            // NO per-child events, so the moved subtree would otherwise
+            // desync until the daemon restarts (AUDITORIA-YEET.md A7). Try to
+            // pair it as a directory rename (re-key subtree + per-child
+            // FileRenamed); if it isn't one, `handle_dir_touched` drops it,
+            // matching the previous not-a-file behavior.
+            if abs.is_dir() {
+                return handle_dir_touched(state, &abs, bcast_tx).await;
+            }
             // Each early return here would otherwise silently swallow the
             // event with no signal to the user, making "files don't appear
             // in Studio" undebuggable. Log every drop with the path and the
@@ -453,16 +573,12 @@ async fn handle_fs_event(
                 debug!(path = %rel, "fs drop: path is not under any $path mapping in default.project.json");
                 return Ok(());
             }
-            // Drop watcher echoes from a daemon-initiated `fs::rename`. The
-            // matching Remove(old) + Touched(new) pair is one-shot so the
-            // second `consume_rename_echo` call returns false naturally.
-            {
-                let mut guard = state.write().await;
-                if guard.consume_rename_echo(&rel) {
-                    debug!(path = %rel, "fs drop: suppressed echo of daemon rename");
-                    return Ok(());
-                }
-            }
+            // No path-based echo suppression here (AUDITORIA-YEET.md M17):
+            // the daemon's own rename echo is already dropped safely by the
+            // content-hash check below (`prev_hash == sha`) and the
+            // untracked-path check on the removal side. A path-based guard
+            // that ran before the hash check could instead swallow a REAL
+            // user edit to a just-renamed file inside the TTL window.
             let file_name = abs
                 .file_name()
                 .and_then(|s| s.to_str())
@@ -496,8 +612,43 @@ async fn handle_fs_event(
             // never trip it, but tight enough that the Modify(From) +
             // Modify(To) pair the OS emits for a rename always lands
             // inside it.
-            if let Some(pending) = guard.fs_removed_pending.remove(&sha) {
-                let old_path = pending.path.clone();
+            //
+            // `fs_removed_pending` is keyed by path now (AUDITORIA-YEET.md
+            // A1), so pairing means scanning for an entry whose content
+            // sha matches — guarded by two checks before it's promoted to
+            // a rename:
+            //   - watcher-4: only pair when `rel` (the new path) was NOT
+            //     already a tracked file (`prev_hash.is_none()`). If it
+            //     was, this Touched is an edit of a pre-existing file, not
+            //     a rename target — pairing would clobber its identity
+            //     (attributes/tags) with the deleted file's.
+            //   - move-2: never pair a removed entry with empty content.
+            //     Unrelated delete+create of empty stub files must stay
+            //     an independent delete+create, not leak the deleted
+            //     file's meta_attributes onto an unrelated new file.
+            // When several pending entries share the sha, prefer the one
+            // whose basename (file stem) matches the new path, else the
+            // oldest by `since`.
+            let rename_pick = if prev_hash.is_none() {
+                let new_stem = Path::new(&rel).file_stem().and_then(|s| s.to_str());
+                guard
+                    .fs_removed_pending
+                    .values()
+                    .filter(|p| p.entry.sha256 == sha && !p.entry.content.is_empty())
+                    .min_by_key(|p| {
+                        let same_stem =
+                            Path::new(&p.path).file_stem().and_then(|s| s.to_str()) == new_stem;
+                        (!same_stem, p.since)
+                    })
+                    .map(|p| p.path.clone())
+            } else {
+                None
+            };
+            if let Some(old_path) = rename_pick {
+                let pending = guard
+                    .fs_removed_pending
+                    .remove(&old_path)
+                    .expect("rename_pick was just read from fs_removed_pending");
                 let new_path = rel.clone();
                 let kind_resolved = pending.entry.kind; // preserve the original kind, matches `kind` here too
                 let _ = kind_resolved;
@@ -522,7 +673,6 @@ async fn handle_fs_event(
                 // event per child, so each child rename is handled on its
                 // own; the top-level rename only needs to move the script
                 // entry itself.
-                guard.note_rename_echo(old_path.clone(), new_path.clone());
                 persist_base(&guard)?;
                 let root = guard.root.clone();
                 let session_id = guard.session_id.clone();
@@ -588,15 +738,12 @@ async fn handle_fs_event(
         }
         FileEvent::Removed(abs) => {
             let mut guard = state.write().await;
-            let rel_for_echo = guard.relative(&abs);
-            if let Some(rel) = rel_for_echo.as_deref() {
-                if guard.consume_rename_echo(rel) {
-                    debug!(path = %rel, "fs drop: suppressed echo of daemon rename (removal side)");
-                    return Ok(());
-                }
-            }
+            // No path-based echo suppression (AUDITORIA-YEET.md M17): a
+            // daemon-initiated rename removes the old key from `tree_fs`
+            // first, so the watcher's Remove(old) lands on the untracked-path
+            // check below and is dropped there without a TTL guard.
             // Capture the entry BEFORE forgetting it so a later Touched
-            // with the same sha can promote the pair to a FileRenamed.
+            // with a matching sha can promote the pair to a FileRenamed.
             let rel = match guard.relative(&abs) {
                 Some(r) => r,
                 None => {
@@ -609,11 +756,14 @@ async fn handle_fs_event(
                 return Ok(());
             };
             let entry_meta = guard.meta_for(&rel);
-            let sha = entry.sha256.clone();
             guard.tree_fs.remove(&rel);
             guard.meta.remove(&rel);
+            // Keyed by path (AUDITORIA-YEET.md A1) — every removal gets its
+            // own slot, so two same-content deletes in the same window can
+            // no longer clobber each other. `entry.sha256` is what a later
+            // Touched matches against for rename pairing.
             guard.fs_removed_pending.insert(
-                sha.clone(),
+                rel.clone(),
                 FsRemovedPending {
                     path: rel.clone(),
                     entry,
@@ -625,17 +775,27 @@ async fn handle_fs_event(
             // Defer the actual reconcile (which would emit FileDeleted to
             // Studio + drop the tree_base entry) until the pairing window
             // expires. If a matching Touched lands inside the window, it
-            // consumes `fs_removed_pending[sha]` and the rename is emitted
-            // as a single `FileRenamed` instead.
+            // consumes `fs_removed_pending[rel]` and the rename is emitted
+            // as a single `FileRenamed` instead. Removing by its own path
+            // means this reconcile is independent of any other pending
+            // removal, even one with identical content.
             let state2 = state.clone();
             let bcast_tx2 = bcast_tx.clone();
-            let sha2 = sha.clone();
             let rel2 = rel.clone();
             tokio::spawn(async move {
                 tokio::time::sleep(FS_RENAME_PAIR_TTL).await;
                 let still_pending = {
                     let mut guard = state2.write().await;
-                    guard.fs_removed_pending.remove(&sha2).is_some()
+                    let was_pending = guard.fs_removed_pending.remove(&rel2).is_some();
+                    if was_pending {
+                        // B5: a real delete (no rename paired within the
+                        // window) — drop the orphaned attribute map too,
+                        // mirroring `delete_from_fs`. A paired rename instead
+                        // moves the attrs to the new path in the Touched branch
+                        // above, so this only fires when no pairing happened.
+                        guard.meta_attributes.remove(&rel2);
+                    }
+                    was_pending
                 };
                 if still_pending {
                     if let Err(e) = reconcile_path(&state2, &rel2, &bcast_tx2).await {
@@ -645,10 +805,276 @@ async fn handle_fs_event(
             });
             return Ok(());
         }
+        // `Rescan` is intercepted at the top of the function; this arm only
+        // satisfies match exhaustiveness.
+        FileEvent::Rescan => return Ok(()),
     };
 
     // From here on we're holding nothing; re-acquire to run the merge step.
     reconcile_path(state, &path, bcast_tx).await
+}
+
+/// Recovers from a watcher backend error/overflow (AUDITORIA-YEET.md M19):
+/// re-reads the entire tracked tree from disk, then reconciles every path
+/// whose state could have changed while notifications were being dropped.
+/// Heavier than a single-path reconcile, but a backend error is rare (a
+/// storm — git checkout, bulk `wally install`) and the alternative is a
+/// silent desync that only heals on the next reconnect.
+async fn handle_rescan(
+    state: &SharedState,
+    bcast_tx: &broadcast::Sender<Arc<ServerMsg>>,
+) -> Result<()> {
+    warn!("watcher backend error: re-scanning tracked tree and reconciling");
+    let paths: Vec<String> = {
+        let mut guard = state.write().await;
+        // Union the paths from BEFORE and AFTER the rescan: files that
+        // vanished during the storm survive only in base/studio, while ones
+        // that appeared or changed show up in the freshly rebuilt tree_fs.
+        let mut union: BTreeSet<String> = BTreeSet::new();
+        union.extend(guard.tree_fs.keys().cloned());
+        union.extend(guard.tree_studio.keys().cloned());
+        union.extend(guard.tree_base.keys().cloned());
+        guard.rescan_fs()?;
+        union.extend(guard.tree_fs.keys().cloned());
+        union.into_iter().collect()
+    };
+    for path in paths {
+        if let Err(e) = reconcile_path(state, &path, bcast_tx).await {
+            warn!(path = %path, error = ?e, "rescan reconcile failed");
+        }
+    }
+    Ok(())
+}
+
+/// A tracked source file found on disk under a directory being fingerprinted
+/// for rename detection: its forward-slashed sub-path relative to that
+/// directory plus its normalized-content sha256.
+struct DirScanFile {
+    subpath: String,
+    sha256: String,
+}
+
+/// Walks `dir_abs` recursively and returns every classifiable Roblox source
+/// file (skipping `.meta.json` sidecars and anything that doesn't classify),
+/// each with its sub-path relative to `dir_abs` and its normalized-content
+/// sha256. Used to fingerprint a directory's contents so a folder rename can
+/// be matched against a tracked `tree_fs` subtree.
+fn scan_dir_source_files(dir_abs: &Path) -> Vec<DirScanFile> {
+    let mut out = Vec::new();
+    for entry in walkdir::WalkDir::new(dir_abs).follow_links(false) {
+        let Ok(entry) = entry else { continue };
+        if !entry.file_type().is_file() {
+            continue;
+        }
+        let path = entry.path();
+        if is_meta_file(path) {
+            continue;
+        }
+        let Some(file_name) = path.file_name().and_then(|s| s.to_str()) else {
+            continue;
+        };
+        if classify(file_name).is_none() {
+            continue;
+        }
+        let Ok(rel) = path.strip_prefix(dir_abs) else {
+            continue;
+        };
+        let mut subpath = String::new();
+        for (i, comp) in rel.components().enumerate() {
+            let Some(part) = comp.as_os_str().to_str() else {
+                subpath.clear();
+                break;
+            };
+            if i > 0 {
+                subpath.push('/');
+            }
+            subpath.push_str(part);
+        }
+        if subpath.is_empty() {
+            continue;
+        }
+        let Ok(raw) = std::fs::read_to_string(path) else {
+            continue;
+        };
+        let (content, _meta) = normalize_from_disk(&raw);
+        out.push(DirScanFile {
+            subpath,
+            sha256: sha256_hex(content.as_bytes()),
+        });
+    }
+    out
+}
+
+/// Finds a tracked directory subtree that was renamed *to* `new_dir_rel`.
+/// A candidate old directory qualifies when (a) it is not `new_dir_rel`
+/// itself, (b) its on-disk path no longer exists — a rename removes the old
+/// dir, whereas a copy leaves it in place so copies never false-match — and
+/// (c) the `(sub-path, sha256)` signature of its `tree_fs` entries exactly
+/// equals `disk_sig` (the signature of the files now on disk under the new
+/// dir).
+///
+/// Candidates are derived from the directory prefixes present in `tree_fs`,
+/// so pairing works whether the old dir's `Removed` event was processed
+/// before or after this `Touched` — a directory `Removed` is a harmless
+/// no-op that leaves the subtree entries in `tree_fs`.
+fn find_dir_rename_source(
+    guard: &ProjectState,
+    new_dir_rel: &str,
+    disk_sig: &BTreeSet<(String, String)>,
+) -> Option<String> {
+    // Every ancestor directory prefix that appears in tree_fs is a candidate.
+    let mut candidates: BTreeSet<String> = BTreeSet::new();
+    for key in guard.tree_fs.keys() {
+        let mut start = 0usize;
+        while let Some(rel_pos) = key[start..].find('/') {
+            let end = start + rel_pos;
+            candidates.insert(key[..end].to_owned());
+            start = end + 1;
+        }
+    }
+    for cand in candidates {
+        if cand == new_dir_rel {
+            continue;
+        }
+        // A rename removes the old directory; a copy leaves it on disk.
+        if guard.root.join(&cand).exists() {
+            continue;
+        }
+        let prefix = format!("{cand}/");
+        let sig: BTreeSet<(String, String)> = guard
+            .tree_fs
+            .iter()
+            .filter(|(k, _)| k.starts_with(&prefix))
+            .map(|(k, e)| (k[prefix.len()..].to_owned(), e.sha256.clone()))
+            .collect();
+        if !sig.is_empty() && &sig == disk_sig {
+            return Some(cand);
+        }
+    }
+    None
+}
+
+/// Handles a `Touched` event whose path is a directory. On Windows a folder
+/// rename/move surfaces as a single dir-level rename pair with no per-child
+/// events, so the moved subtree would otherwise desync (AUDITORIA-YEET.md
+/// A7). We detect the rename by matching the new directory's on-disk source
+/// files against a tracked `tree_fs` subtree whose old directory has
+/// disappeared, then re-key every affected `tree_fs`/`tree_base`/
+/// `tree_studio`/`meta`/`meta_attributes` entry by prefix (the disk-side
+/// analog of `handle_studio_renamed`'s DirToDir re-key) and emit a per-child
+/// `FileRenamed` so Studio-side instance state (attributes, tags, non-script
+/// children) survives the move.
+///
+/// When the directory doesn't match a rename source it is dropped: brand-new
+/// directories arrive with their own per-file `Touched` events, which the
+/// normal file path already handles.
+async fn handle_dir_touched(
+    state: &SharedState,
+    new_dir_abs: &Path,
+    bcast_tx: &broadcast::Sender<Arc<ServerMsg>>,
+) -> Result<()> {
+    let new_dir_rel = {
+        let guard = state.read().await;
+        let Some(rel) = guard.relative(new_dir_abs) else {
+            return Ok(());
+        };
+        if !guard.is_under_mapping(&rel) {
+            return Ok(());
+        }
+        rel
+    };
+    // Fingerprint the source files now living under the new directory.
+    let disk = scan_dir_source_files(new_dir_abs);
+    if disk.is_empty() {
+        return Ok(());
+    }
+    let disk_sig: BTreeSet<(String, String)> = disk
+        .iter()
+        .map(|f| (f.subpath.clone(), f.sha256.clone()))
+        .collect();
+
+    let mut guard = state.write().await;
+    let Some(old_dir_rel) = find_dir_rename_source(&guard, &new_dir_rel, &disk_sig) else {
+        // Not attributable to a rename — drop (new dirs come with per-file
+        // events). Leaving `tree_fs` untouched preserves the old behavior.
+        return Ok(());
+    };
+
+    let old_prefix = format!("{old_dir_rel}/");
+    let new_prefix = format!("{new_dir_rel}/");
+    // Snapshot the per-child renames before re-keying so we can broadcast a
+    // FileRenamed for each. Content/sha/kind come from the tracked entry,
+    // which by construction (the signature match) equals what is on disk.
+    let mut children: Vec<(String, String, TreeEntry)> = Vec::new();
+    let old_keys: Vec<String> = guard
+        .tree_fs
+        .keys()
+        .filter(|k| k.starts_with(&old_prefix))
+        .cloned()
+        .collect();
+    for old_key in old_keys {
+        let suffix = &old_key[old_prefix.len()..];
+        let new_key = format!("{new_prefix}{suffix}");
+        if let Some(entry) = guard.tree_fs.get(&old_key).cloned() {
+            children.push((old_key, new_key, entry));
+        }
+    }
+
+    rekey_tree(&mut guard.tree_fs, &old_prefix, &new_prefix);
+    rekey_tree(&mut guard.tree_base, &old_prefix, &new_prefix);
+    rekey_tree(&mut guard.tree_studio, &old_prefix, &new_prefix);
+    rekey_meta(&mut guard.meta, &old_prefix, &new_prefix);
+    rekey_meta_attributes(&mut guard.meta_attributes, &old_prefix, &new_prefix);
+    // Re-key any collision flags so a paused path follows the rename.
+    let moved_collisions: Vec<String> = guard
+        .pending_collisions
+        .iter()
+        .filter(|p| p.starts_with(&old_prefix))
+        .cloned()
+        .collect();
+    for old_c in moved_collisions {
+        guard.pending_collisions.remove(&old_c);
+        let suffix = old_c[old_prefix.len()..].to_owned();
+        guard.pending_collisions.insert(format!("{new_prefix}{suffix}"));
+    }
+    persist_base(&guard)?;
+    let root = guard.root.clone();
+    let session_id = guard.session_id.clone();
+    drop(guard);
+
+    info!(
+        old_dir = %old_dir_rel,
+        new_dir = %new_dir_rel,
+        children = children.len(),
+        "fs directory rename detected; re-keyed subtree and emitting per-child FileRenamed"
+    );
+    for (old_key, new_key, entry) in children {
+        audit::record(
+            &root,
+            &audit::Entry {
+                ts: audit::now_rfc3339(),
+                kind: audit::Kind::FsRename,
+                path: &new_key,
+                sha_before: Some(&old_key),
+                sha_after: Some(&entry.sha256),
+                session_id: &session_id,
+                note: Some("ide-side directory rename (A7)"),
+            },
+        );
+        broadcast_server_msg(
+            state,
+            bcast_tx,
+            ServerMsg::FileRenamed {
+                old_path: old_key,
+                new_path: new_key,
+                content: entry.content,
+                sha256: entry.sha256,
+                kind: entry.kind,
+            },
+        )
+        .await;
+    }
+    Ok(())
 }
 
 /// Handles a `.meta.json` create/change/delete. Emits `AttributesChanged`
@@ -707,6 +1133,9 @@ async fn handle_meta_event(
             )
             .await;
         }
+        // Rescan is intercepted in `handle_fs_event`; it never reaches the
+        // meta-file router.
+        FileEvent::Rescan => {}
     }
     Ok(())
 }
@@ -758,15 +1187,30 @@ async fn reconcile_path(
     path: &str,
     bcast_tx: &broadcast::Sender<Arc<ServerMsg>>,
 ) -> Result<()> {
-    let outcome = {
+    let (outcome, has_pending) = {
         let guard = state.read().await;
-        merge_file(
+        let outcome = merge_file(
             path,
             guard.tree_base.get(path),
             guard.tree_studio.get(path),
             guard.tree_fs.get(path),
-        )
+        );
+        (outcome, guard.pending_conflicts.contains_key(path))
     };
+    // A2/race-1: while a conflict for `path` is awaiting the user's
+    // resolution, `pending_conflicts` is authoritative over the path. FS and
+    // Studio run as concurrent tokio tasks, so a clean / auto-merge / adopt
+    // outcome can arrive from the *other* side while the snapshot is open.
+    // Letting `apply_outcome` run it would rewrite disk/Studio and advance
+    // `tree_base` out from under the snapshot — the eventual `ConflictResolved`
+    // rebuilds from the snapshot's now-stale `base_content` and silently
+    // reverts that change (and, for AutoMerge, discards the merged code).
+    // Freeze the path on disk and re-sync the snapshot to the current trees
+    // instead; the explicit resolution paths (handshake, bulk resolutions)
+    // call `apply_outcome` directly and are unaffected.
+    if has_pending {
+        return refresh_pending_conflict(state, path, outcome, bcast_tx).await;
+    }
     apply_outcome(state, path, outcome, bcast_tx).await
 }
 
@@ -874,7 +1318,10 @@ async fn write_to_fs(
         }
     }
     let mut guard = state.write().await;
-    let abs = resolve_inside(&guard.root, path)
+    // A10: a package key like `.../foo/init.lua` must land on the real file
+    // `.../foo/src/init.lua`. Identity for every non-package path.
+    let fs_rel = guard.fs_rel_for(path);
+    let abs = resolve_inside(&guard.root, &fs_rel)
         .with_context(|| format!("refusing to write unsafe path {path}"))?;
     let meta = guard.meta_for(path);
     let encoded = encode_for_disk(&content, meta);
@@ -892,12 +1339,36 @@ async fn write_to_fs(
         sha256: sha.clone(),
     };
     guard.tree_fs.insert(path.to_owned(), entry.clone());
-    guard.tree_base.insert(path.to_owned(), entry.clone());
     if broadcast_to_studio {
-        guard.tree_studio.insert(path.to_owned(), entry);
+        // A4/M14: AutoMerge (and conflict resolution, which shares this path)
+        // write the merged bytes to disk here — the fs side is confirmed — but
+        // Studio must still ACK before tree_base/tree_studio move. Record the
+        // studio push as pending instead of advancing the "confirmed by both
+        // sides" base optimistically; `handle_file_applied` advances it once the
+        // plugin reports success. tree_base is left untouched, so nothing to
+        // persist yet.
+        guard.pending_applies.insert(
+            path.to_owned(),
+            PendingApply {
+                sha256: sha.clone(),
+                entry: Some(entry),
+                since: std::time::Instant::now(),
+            },
+        );
+        guard.meta.entry(path.to_owned()).or_insert(meta);
+    } else {
+        // Pure FS apply: the merge chose to write Studio's side to disk, so
+        // Studio already holds this content and both sides now agree — advance
+        // base immediately (there is nothing to ACK on the Studio side).
+        guard.tree_base.insert(path.to_owned(), entry);
+        guard.meta.entry(path.to_owned()).or_insert(meta);
+        persist_base(&guard)?;
     }
-    guard.meta.entry(path.to_owned()).or_insert(meta);
-    persist_base(&guard)?;
+    // A create (new path) or delete reshapes the tree; a plain content
+    // overwrite does not. We mark unconditionally and let the writer's
+    // signature guard drop the no-op — this is the chokepoint for the silent
+    // Studio→disk create path, which never broadcasts a `FileCreated` (M1).
+    guard.mark_sourcemap_dirty();
     let root = guard.root.clone();
     let session_id = guard.session_id.clone();
     drop(guard);
@@ -955,7 +1426,9 @@ async fn delete_from_fs(
         }
     }
     let mut guard = state.write().await;
-    let abs = resolve_inside(&guard.root, path)
+    // A10: resolve a package key back to its real on-disk file before deleting.
+    let fs_rel = guard.fs_rel_for(path);
+    let abs = resolve_inside(&guard.root, &fs_rel)
         .with_context(|| format!("refusing to delete unsafe path {path}"))?;
     if abs.is_file() {
         std::fs::remove_file(&abs)
@@ -985,13 +1458,31 @@ async fn delete_from_fs(
     }
     let sha_before = guard.tree_fs.get(path).map(|e| e.sha256.clone());
     guard.tree_fs.remove(path);
-    guard.tree_base.remove(path);
     guard.meta.remove(path);
     guard.meta_attributes.remove(path);
     if broadcast_to_studio {
-        guard.tree_studio.remove(path);
+        // A4/M14: the disk delete is done (fs side confirmed) but Studio must
+        // ACK before tree_base/tree_studio drop the path. Record a pending
+        // delete rather than advancing base past an unconfirmed Studio removal.
+        // tree_base is untouched here, so no persist yet.
+        guard.pending_applies.insert(
+            path.to_owned(),
+            PendingApply {
+                sha256: String::new(),
+                entry: None,
+                since: std::time::Instant::now(),
+            },
+        );
+    } else {
+        // Pure FS delete: Studio has already dropped the instance, so base can
+        // drop the path now.
+        guard.tree_base.remove(path);
+        persist_base(&guard)?;
     }
-    persist_base(&guard)?;
+    // A delete removes a path from the tree — a structural change the sourcemap
+    // must reflect. Covers the silent Studio→disk delete path, which broadcasts
+    // no `FileDeleted` (M1).
+    guard.mark_sourcemap_dirty();
     let project_root = guard.root.clone();
     let session_id = guard.session_id.clone();
     drop(guard);
@@ -1450,9 +1941,22 @@ async fn push_to_studio(
         sha256: sha.clone(),
     };
     let existed = guard.tree_studio.contains_key(path);
-    guard.tree_studio.insert(path.to_owned(), entry.clone());
-    guard.tree_base.insert(path.to_owned(), entry);
-    persist_base(&guard)?;
+    // A4/M14 apply-ACK: do NOT advance tree_studio/tree_base here. Record the
+    // push as a pending apply and let `handle_file_applied` move the trees once
+    // the plugin confirms it actually mutated the DataModel. Advancing
+    // tree_base ("confirmed by both sides") before that confirmation is the
+    // silent-loss cascade this finding fixes: if `withRecording` fails plugin
+    // side, Studio never receives the content while the daemon already believes
+    // it synced. `tree_fs` already holds `content` (that is why we are pushing),
+    // so the fs side needs no change.
+    guard.pending_applies.insert(
+        path.to_owned(),
+        PendingApply {
+            sha256: sha.clone(),
+            entry: Some(entry),
+            since: std::time::Instant::now(),
+        },
+    );
     let receivers = bcast_tx.receiver_count();
     let project_root = guard.root.clone();
     let session_id = guard.session_id.clone();
@@ -1526,9 +2030,24 @@ async fn delete_on_studio(
     }
     let mut guard = state.write().await;
     let sha_before = guard.tree_studio.get(path).map(|e| e.sha256.clone());
-    guard.tree_studio.remove(path);
-    guard.tree_base.remove(path);
-    persist_base(&guard)?;
+    // A4/M14 apply-ACK: defer the tree_studio/tree_base removal until the plugin
+    // confirms it dropped the instance (`FileApplied` carries the empty-string
+    // delete sentinel), or the old-plugin timeout fallback fires. Removing
+    // tree_base now would let the daemon believe Studio deleted the instance
+    // when `withRecording` actually failed and it still exists.
+    guard.pending_applies.insert(
+        path.to_owned(),
+        PendingApply {
+            sha256: String::new(),
+            entry: None,
+            since: std::time::Instant::now(),
+        },
+    );
+    // B5: drop the orphaned per-path attribute map now (mirrors
+    // `delete_from_fs`). This one piece is cleared eagerly — a stale attr map
+    // re-attached to an instance that later reused the path is worse than
+    // re-deriving it from the on-disk `.meta.json` on the rare NAK.
+    guard.meta_attributes.remove(path);
     let project_root = guard.root.clone();
     let session_id = guard.session_id.clone();
     drop(guard);
@@ -1555,12 +2074,154 @@ async fn delete_on_studio(
     Ok(())
 }
 
+/// A4/M14 apply-ACK: the plugin confirmed it applied a Studio-direction push
+/// (`push_to_studio`, `delete_on_studio`, or the AutoMerge broadcast). This is
+/// the steady-state path that finally advances `tree_base`/`tree_studio` for
+/// that push — before it, the change lived only in `pending_applies`. The
+/// `sha256` must match the pending entry: a mismatch is a stale ACK for a push
+/// we have already superseded with a newer one, so advancing to it would clobber
+/// the newer intent. For a delete the plugin sends the empty string, which
+/// matches the empty-string sentinel recorded by `delete_on_studio`.
+async fn handle_file_applied(
+    state: &SharedState,
+    path: String,
+    sha256: String,
+) -> Result<()> {
+    let mut guard = state.write().await;
+    let Some(pending) = guard.pending_applies.get(&path) else {
+        // No pending apply: a redundant ACK (already advanced), an ACK that
+        // raced a superseding Studio event which cleared the pending, or a
+        // confused client. Harmless — ignore.
+        trace!(path = %path, "FileApplied with no pending apply; ignoring");
+        return Ok(());
+    };
+    if pending.sha256 != sha256 {
+        debug!(
+            path = %path,
+            expected = %pending.sha256,
+            got = %sha256,
+            "stale FileApplied ignored (sha mismatch): a newer push superseded this one"
+        );
+        return Ok(());
+    }
+    // Confirmed by both sides. Advance base + studio to the pending entry (or
+    // drop the path for a confirmed delete), then persist the base tree.
+    let entry = pending.entry.clone();
+    guard.pending_applies.remove(&path);
+    match entry {
+        Some(e) => {
+            guard.tree_studio.insert(path.clone(), e.clone());
+            guard.tree_base.insert(path.clone(), e);
+        }
+        None => {
+            guard.tree_studio.remove(&path);
+            guard.tree_base.remove(&path);
+        }
+    }
+    persist_base(&guard)?;
+    debug!(path = %path, "apply confirmed by plugin; tree_base advanced");
+    Ok(())
+}
+
+/// A4/M14 apply-NAK: the plugin could NOT apply a Studio-direction push
+/// (`TryBeginRecording` returned nil — user dragging a handle / another
+/// recording open — or the target instance could not be resolved). Drop the
+/// pending apply WITHOUT advancing `tree_base`, so the divergence stays real and
+/// the next reconcile re-detects it, and surface a `SyncError` so the failure is
+/// visible instead of silently swallowed (`swallow-1`). Because base stays put,
+/// a later user edit from Studio's still-old content raises a conflict rather
+/// than cascading into an overwrite of disk content that never reached Studio.
+async fn handle_file_apply_failed(
+    state: &SharedState,
+    path: String,
+    reason: String,
+    bcast_tx: &broadcast::Sender<Arc<ServerMsg>>,
+) -> Result<()> {
+    let had_pending = {
+        let mut guard = state.write().await;
+        guard.pending_applies.remove(&path).is_some()
+    };
+    if !had_pending {
+        trace!(path = %path, "FileApplyFailed with no pending apply; ignoring");
+        return Ok(());
+    }
+    warn!(
+        path = %path,
+        reason = %reason,
+        "plugin could not apply Studio change; leaving tree_base unadvanced so the divergence re-detects"
+    );
+    broadcast_server_msg(
+        state,
+        bcast_tx,
+        ServerMsg::SyncError {
+            kind: SyncErrorKind::HandlerFailed,
+            path,
+            reason: format!("Studio could not apply the change: {reason}"),
+        },
+    )
+    .await;
+    Ok(())
+}
+
+/// A4/M14 old-plugin timeout fallback. A current plugin ACKs a Studio-direction
+/// push within a round-trip, so `pending_applies` normally drains via
+/// `handle_file_applied`. But a pre-A4 plugin never sends `FileApplied`, and a
+/// frame can be lost — either would wedge the path forever (`tree_base` frozen,
+/// spurious conflicts on the next edit). So once an entry is older than
+/// `APPLY_ACK_TIMEOUT_SECS`, advance the trees anyway, restoring the legacy
+/// "advance on broadcast" behaviour for that path. A current plugin never
+/// reaches this branch; it is the documented escape hatch, not the happy path.
+async fn sweep_pending_applies(state: &SharedState) -> Result<()> {
+    let timeout = std::time::Duration::from_secs(APPLY_ACK_TIMEOUT_SECS);
+    let mut guard = state.write().await;
+    if guard.pending_applies.is_empty() {
+        return Ok(());
+    }
+    let now = std::time::Instant::now();
+    let expired: Vec<String> = guard
+        .pending_applies
+        .iter()
+        .filter(|(_, p)| now.duration_since(p.since) >= timeout)
+        .map(|(k, _)| k.clone())
+        .collect();
+    if expired.is_empty() {
+        return Ok(());
+    }
+    for path in &expired {
+        let Some(pending) = guard.pending_applies.remove(path) else {
+            continue;
+        };
+        match pending.entry {
+            Some(e) => {
+                guard.tree_studio.insert(path.clone(), e.clone());
+                guard.tree_base.insert(path.clone(), e);
+            }
+            None => {
+                guard.tree_studio.remove(path);
+                guard.tree_base.remove(path);
+            }
+        }
+        warn!(
+            path = %path,
+            timeout_secs = APPLY_ACK_TIMEOUT_SECS,
+            "apply-ACK timeout: advancing tree_base without confirmation (old plugin or lost FileApplied)"
+        );
+    }
+    persist_base(&guard)?;
+    Ok(())
+}
+
 async fn record_conflict(
     state: &SharedState,
     conflict: FileConflict,
     bcast_tx: &broadcast::Sender<Arc<ServerMsg>>,
 ) -> Result<()> {
     let mut guard = state.write().await;
+    // A4: a conflict is now authoritative over this path — drop any in-flight
+    // Studio-direction push. Otherwise a late `FileApplied` could advance
+    // tree_base to the pushed content while the user is resolving, corrupting
+    // the resolution snapshot.
+    guard.pending_applies.remove(&conflict.path);
     if guard.pending_conflicts.contains_key(&conflict.path) {
         // A conflict for this path is already waiting for the user to resolve
         // it in the UI. Overwriting it would corrupt the resolution: the user
@@ -1576,6 +2237,91 @@ async fn record_conflict(
     let view = conflict_to_view(&conflict);
     guard.pending_conflicts.insert(conflict.path.clone(), conflict);
     drop(guard);
+    broadcast_server_msg(
+        state,
+        bcast_tx,
+        ServerMsg::ConflictDetected {
+            conflicts: vec![view],
+        },
+    )
+    .await;
+    Ok(())
+}
+
+/// Called from `reconcile_path` when a background reconcile fires for a path
+/// that already has an open conflict (AUDITORIA-YEET.md A2/race-1). Rather
+/// than let the freshly-recomputed outcome mutate disk/Studio/`tree_base`, it
+/// keeps the path frozen on disk and re-syncs the pending snapshot to the
+/// current trees. The eventual `ConflictResolved` then rebuilds from a
+/// snapshot that matches the live state instead of the stale base captured at
+/// first detection.
+async fn refresh_pending_conflict(
+    state: &SharedState,
+    path: &str,
+    outcome: MergeOutcome,
+    bcast_tx: &broadcast::Sender<Arc<ServerMsg>>,
+) -> Result<()> {
+    // Build the refreshed snapshot from `outcome` (already merged against the
+    // current trees) plus each side's current content for display. A genuine
+    // `Conflict` is adopted verbatim; a clean / auto-merge outcome is captured
+    // as a hunk-less conflict whose `base_content` already equals the resolved
+    // content, so `rebuild_resolved` reproduces it exactly on resolution.
+    let fresh: Option<FileConflict> = {
+        let guard = state.read().await;
+        let studio_content = guard.tree_studio.get(path).map(|e| e.content.clone());
+        let fs_content = guard.tree_fs.get(path).map(|e| e.content.clone());
+        let resolvable = |content: String, kind: ScriptKind| FileConflict {
+            path: path.to_owned(),
+            conflict_kind: ConflictKind::Edit,
+            script_kind: kind,
+            base_content: Some(content),
+            studio_content: studio_content.clone(),
+            fs_content: fs_content.clone(),
+            conflict_hunks: Vec::new(),
+            auto_hunks: Vec::new(),
+        };
+        match outcome {
+            MergeOutcome::Conflict(c) => Some(c),
+            MergeOutcome::AutoMerge { content, kind } => Some(resolvable(content, kind)),
+            MergeOutcome::Apply {
+                content: Some(c),
+                kind,
+                ..
+            } => Some(resolvable(c, kind)),
+            MergeOutcome::AdoptBase => guard
+                .tree_fs
+                .get(path)
+                .or_else(|| guard.tree_studio.get(path))
+                .map(|e| resolvable(e.content.clone(), e.kind)),
+            // A delete-side clean outcome or a genuine no-op: leave the
+            // existing snapshot frozen. Nothing is lost — the open snapshot
+            // still carries both sides' content and disk stays untouched until
+            // the user resolves.
+            MergeOutcome::Apply { content: None, .. } | MergeOutcome::Noop => None,
+        }
+    };
+    let Some(fresh) = fresh else {
+        debug!(path = %path, "reconcile frozen: conflict pending, snapshot left as-is");
+        return Ok(());
+    };
+    // Preserve the conflict-vs-conflict guard (commit 7ca88f4): if the live
+    // divergence is byte-for-byte what the user is already resolving, don't
+    // clobber their in-progress hunk selection with an identical
+    // re-detection, and don't re-broadcast. Only replace when the trees moved.
+    let view = conflict_to_view(&fresh);
+    {
+        let mut guard = state.write().await;
+        if let Some(existing) = guard.pending_conflicts.get(path) {
+            if existing.base_content == fresh.base_content
+                && existing.studio_content == fresh.studio_content
+                && existing.fs_content == fresh.fs_content
+            {
+                debug!(path = %path, "reconcile frozen: pending conflict already matches current trees");
+                return Ok(());
+            }
+        }
+        guard.pending_conflicts.insert(path.to_owned(), fresh);
+    }
     broadcast_server_msg(
         state,
         bcast_tx,
@@ -1772,6 +2518,11 @@ async fn handle_studio_changed(
         content: content.clone(),
         sha256: actual_sha.clone(),
     };
+    // A4: a genuine Studio-side edit is authoritative about what Studio holds
+    // now, superseding any push we were still waiting to have confirmed. Drop
+    // the pending apply so a late `FileApplied` for the old push can't advance
+    // tree_base to content Studio no longer has.
+    guard.pending_applies.remove(&path);
     guard.tree_studio.insert(path.clone(), entry);
     // Bootstrap-diverge echoes use a 2-way compare (Studio vs IDE) instead
     // of the 3-way merge. The merge engine's "only one side changed
@@ -1834,6 +2585,9 @@ async fn handle_studio_deleted(
         warn!(path = %path, error = ?e, "rejecting client file_deleted: unsafe path");
         return Ok(());
     }
+    // A4: a Studio-side delete is authoritative — supersede any pending push we
+    // were still waiting to confirm for this path.
+    guard.pending_applies.remove(&path);
     if guard.tree_studio.remove(&path).is_none() {
         return Ok(());
     }
@@ -1905,6 +2659,86 @@ fn fs_rename_with_retry(from: &Path, to: &Path) -> std::io::Result<()> {
     Err(last_err.unwrap())
 }
 
+/// Given the absolute path to a script file, returns the absolute path to its
+/// sibling `.meta.json` sidecar following the Rojo/Yeet convention:
+/// `Foo.luau` / `Foo.server.luau` / `Foo.client.luau` all pair with
+/// `Foo.meta.json`; an `init.luau` (etc.) pairs with `init.meta.json` in the
+/// same directory. Returns `None` when the path is not a `.lua`/`.luau` file
+/// or has no file name.
+fn meta_sidecar_abs(script_abs: &Path) -> Option<PathBuf> {
+    let file = script_abs.file_name()?.to_str()?;
+    let meta_file = if is_init_filename(file) {
+        "init.meta.json".to_owned()
+    } else {
+        let stem = file
+            .strip_suffix(".luau")
+            .or_else(|| file.strip_suffix(".lua"))?;
+        let base = stem
+            .strip_suffix(".server")
+            .or_else(|| stem.strip_suffix(".client"))
+            .unwrap_or(stem);
+        format!("{base}.meta.json")
+    };
+    Some(script_abs.with_file_name(meta_file))
+}
+
+/// Moves a script's `.meta.json` sidecar alongside a rename of the script
+/// itself (AUDITORIA-YEET.md M11). Renaming only the `.luau` orphaned the
+/// sidecar, so its attributes vanished on a clean checkout. No-op when the
+/// source script has no sidecar or both sides resolve to the same file. Uses
+/// the same OneDrive-aware retry as the main-file rename.
+fn move_meta_sidecar(old_abs: &Path, new_abs: &Path) -> Result<(), String> {
+    let (Some(old_meta), Some(new_meta)) =
+        (meta_sidecar_abs(old_abs), meta_sidecar_abs(new_abs))
+    else {
+        return Ok(());
+    };
+    if old_meta == new_meta || !old_meta.is_file() {
+        return Ok(());
+    }
+    if let Some(parent) = new_meta.parent() {
+        std::fs::create_dir_all(parent)
+            .map_err(|e| format!("mkdir -p {}: {e}", parent.display()))?;
+    }
+    fs_rename_with_retry(&old_meta, &new_meta)
+        .map_err(|e| format!("rename meta {} -> {}: {e}", old_meta.display(), new_meta.display()))
+}
+
+/// Recursively moves every entry under `from_dir` into `into_dir` at the same
+/// relative sub-path, then removes the now-empty `from_dir`. Used by the
+/// DirToDir rename guard when the destination directory already exists because
+/// a child `LeafToLeaf` frame was applied before the container `DirToDir`
+/// (AUDITORIA-YEET.md M10): a raw `fs::rename` onto an existing directory fails
+/// on Windows and would split the subtree on disk. Entries already present at
+/// the destination (moved by the earlier child frame) are left in place, and
+/// any leftover source duplicate is dropped so the old directory empties out.
+fn merge_dir_into(from_dir: &Path, into_dir: &Path) -> Result<(), String> {
+    std::fs::create_dir_all(into_dir)
+        .map_err(|e| format!("mkdir -p {}: {e}", into_dir.display()))?;
+    let entries = std::fs::read_dir(from_dir)
+        .map_err(|e| format!("read_dir {}: {e}", from_dir.display()))?;
+    for entry in entries {
+        let entry = entry.map_err(|e| format!("read_dir entry in {}: {e}", from_dir.display()))?;
+        let from = entry.path();
+        let to = into_dir.join(entry.file_name());
+        let ft = entry
+            .file_type()
+            .map_err(|e| format!("file_type {}: {e}", from.display()))?;
+        if ft.is_dir() {
+            merge_dir_into(&from, &to)?;
+        } else if to.exists() {
+            // Destination already has this file (moved by the earlier child
+            // frame); drop the redundant source so the dir can be removed.
+            let _ = std::fs::remove_file(&from);
+        } else {
+            fs_rename_with_retry(&from, &to)
+                .map_err(|e| format!("merge-move {} -> {}: {e}", from.display(), to.display()))?;
+        }
+    }
+    let _ = std::fs::remove_dir(from_dir); // best-effort; only removes if empty
+    Ok(())
+}
+
 /// Performs every disk mutation for `handle_studio_renamed` and returns
 /// a `String` error on the first failure. The async caller catches the
 /// `Err` and emits a `SyncError` over the WebSocket so the plugin dock
@@ -1941,6 +2775,9 @@ fn perform_rename_io(
                 atomic_write(new_abs, encoded.as_bytes())
                     .map_err(|e| io_step(&format!("write {}", new_abs.display()), e))?;
             }
+            // M11: carry the paired `.meta.json` sidecar to the new name so
+            // instance attributes survive the rename.
+            move_meta_sidecar(old_abs, new_abs)?;
         }
         RenameCase::DirToDir => {
             let old_dir = old_abs
@@ -1956,12 +2793,22 @@ fn perform_rename_io(
                     .map_err(|e| io_step(&format!("mkdir -p {}", parent.display()), e))?;
             }
             if old_dir.is_dir() {
-                fs_rename_with_retry(&old_dir, &new_dir).map_err(|e| {
-                    io_step(
-                        &format!("rename dir {} -> {}", old_dir.display(), new_dir.display()),
-                        e,
-                    )
-                })?;
+                if new_dir.exists() {
+                    // M10: a child `LeafToLeaf` frame was applied before this
+                    // container `DirToDir` and already created `new_dir`,
+                    // moving some children into it. A raw `fs::rename` onto an
+                    // existing directory fails on Windows and would split the
+                    // subtree (HandlerFailed); merge the remaining `old_dir`
+                    // contents into `new_dir` instead, then drop `old_dir`.
+                    merge_dir_into(&old_dir, &new_dir)?;
+                } else {
+                    fs_rename_with_retry(&old_dir, &new_dir).map_err(|e| {
+                        io_step(
+                            &format!("rename dir {} -> {}", old_dir.display(), new_dir.display()),
+                            e,
+                        )
+                    })?;
+                }
             } else {
                 std::fs::create_dir_all(&new_dir)
                     .map_err(|e| io_step(&format!("mkdir {}", new_dir.display()), e))?;
@@ -1976,7 +2823,8 @@ fn perform_rename_io(
                 os.push(".yeet-tmp");
                 PathBuf::from(os)
             };
-            if old_abs.is_file() {
+            let staged = old_abs.is_file();
+            if staged {
                 fs_rename_with_retry(old_abs, &tmp).map_err(|e| {
                     io_step(
                         &format!("stage {} -> {}", old_abs.display(), tmp.display()),
@@ -1985,31 +2833,50 @@ fn perform_rename_io(
                 })?;
             }
             if let Some(parent) = new_abs.parent() {
-                std::fs::create_dir_all(parent)
-                    .map_err(|e| io_step(&format!("mkdir -p {}", parent.display()), e))?;
+                if let Err(e) = std::fs::create_dir_all(parent) {
+                    // M12: roll the staged content back to `old_abs` so it is
+                    // never stranded as `<name>.yeet-tmp` (unclassified,
+                    // ignored by rescan) if this step fails.
+                    if staged {
+                        let _ = fs_rename_with_retry(&tmp, old_abs);
+                    }
+                    return Err(io_step(&format!("mkdir -p {}", parent.display()), e));
+                }
             }
             if tmp.is_file() {
-                fs_rename_with_retry(&tmp, new_abs).map_err(|e| {
-                    io_step(
+                if let Err(e) = fs_rename_with_retry(&tmp, new_abs) {
+                    // M12: the finalize rename failed with the content already
+                    // staged; roll it back to `old_abs` before returning so no
+                    // data is lost in `.yeet-tmp`.
+                    let _ = fs_rename_with_retry(&tmp, old_abs);
+                    return Err(io_step(
                         &format!("finalize {} -> {}", tmp.display(), new_abs.display()),
                         e,
-                    )
-                })?;
+                    ));
+                }
             } else {
                 let encoded = encode_for_disk(content, new_meta);
                 atomic_write(new_abs, encoded.as_bytes())
                     .map_err(|e| io_step(&format!("write {}", new_abs.display()), e))?;
             }
+            // M11: move the paired sidecar (`Foo.meta.json` → `Foo/init.meta.json`).
+            move_meta_sidecar(old_abs, new_abs)?;
         }
         RenameCase::Demote => {
             let old_dir = old_abs
                 .parent()
                 .ok_or_else(|| format!("init path {old_path_disp} has no parent dir"))?
                 .to_path_buf();
+            // M11: the paired `init.meta.json` sidecar does not count as a
+            // blocking extra child — it moves out with the demotion below.
+            let old_sidecar = meta_sidecar_abs(old_abs);
             let extra_children = match std::fs::read_dir(&old_dir) {
                 Ok(it) => it
                     .filter_map(|e| e.ok())
-                    .filter(|e| e.path() != *old_abs)
+                    .filter(|e| {
+                        let p = e.path();
+                        p != *old_abs && old_sidecar.as_deref() != Some(p.as_path())
+                    })
                     .count(),
                 Err(_) => 0,
             };
@@ -2035,6 +2902,11 @@ fn perform_rename_io(
                 atomic_write(new_abs, encoded.as_bytes())
                     .map_err(|e| io_step(&format!("write {}", new_abs.display()), e))?;
             }
+            // M11: move `init.meta.json` → `<Name>.meta.json` BEFORE dropping
+            // the directory, otherwise the sidecar is orphaned and
+            // `remove_dir` (which only removes an empty dir) would silently
+            // leave the folder behind.
+            move_meta_sidecar(old_abs, new_abs)?;
             if old_dir.is_dir() {
                 let _ = std::fs::remove_dir(&old_dir);
             }
@@ -2191,7 +3063,9 @@ async fn handle_studio_renamed(
     }
 
     let mut guard = state.write().await;
-    let old_abs = match resolve_inside(&guard.root, &old_path) {
+    // A10: map package keys back to their real on-disk files for the rename I/O;
+    // the tree re-keying below still uses the collapsed (instance-shaped) paths.
+    let old_abs = match resolve_inside(&guard.root, &guard.fs_rel_for(&old_path)) {
         Ok(p) => p,
         Err(e) => {
             let reason = format!("resolve old_path {old_path}: {e:#}");
@@ -2209,7 +3083,7 @@ async fn handle_studio_renamed(
             return Ok(());
         }
     };
-    let new_abs = match resolve_inside(&guard.root, &new_path) {
+    let new_abs = match resolve_inside(&guard.root, &guard.fs_rel_for(&new_path)) {
         Ok(p) => p,
         Err(e) => {
             let reason = format!("resolve new_path {new_path}: {e:#}");
@@ -2229,6 +3103,27 @@ async fn handle_studio_renamed(
     };
     let case = RenameCase::classify(&old_path, &new_path);
     let new_meta = guard.meta_for(&new_path);
+
+    // M10: a folder move in Studio arrives as one container `DirToDir` frame
+    // plus a redundant `LeafToLeaf` for every child. When the `DirToDir` was
+    // applied first it already moved the child on disk and re-keyed all three
+    // trees, so this per-child frame is a no-op. Detect the already-applied
+    // shape (source gone, destination present, trees point at the new path)
+    // and skip it — re-running the I/O would needlessly re-write the file, and
+    // the plugin that originated the move has already reparented the instance.
+    if matches!(case, RenameCase::LeafToLeaf)
+        && !old_abs.exists()
+        && new_abs.exists()
+        && guard.tree_fs.contains_key(&new_path)
+        && !guard.tree_fs.contains_key(&old_path)
+    {
+        debug!(
+            old = %old_path,
+            new = %new_path,
+            "handle_studio_renamed: child rename already applied by a folder move; skipping redundant frame"
+        );
+        return Ok(());
+    }
 
     // Run all I/O outside the lock-holding path. Errors come back as
     // human-readable strings; we surface them to the plugin so the user
@@ -2266,6 +3161,13 @@ async fn handle_studio_renamed(
         sha256: actual_sha.clone(),
     };
 
+    // A4: renames are plugin-reported — both sides already moved in Studio — so
+    // the tree updates below advance tree_base directly (no ACK to wait on). But
+    // any push still pending for the old or new path is now moot; a late
+    // `FileApplied` for it must not resurrect a stale tree_base entry. Drop them.
+    guard.pending_applies.remove(&old_path);
+    guard.pending_applies.remove(&new_path);
+
     if matches!(case, RenameCase::DirToDir) {
         let old_dir_prefix = format!(
             "{}/",
@@ -2286,6 +3188,11 @@ async fn handle_studio_renamed(
         rekey_tree(&mut guard.tree_studio, &old_dir_prefix, &new_dir_prefix);
         rekey_meta(&mut guard.meta, &old_dir_prefix, &new_dir_prefix);
         rekey_meta_attributes(&mut guard.meta_attributes, &old_dir_prefix, &new_dir_prefix);
+        // A4: drop any pending push for a descendant of the moved directory —
+        // its old key no longer exists, so a late ACK would resurrect a phantom.
+        guard
+            .pending_applies
+            .retain(|k, _| !k.starts_with(&old_dir_prefix));
     } else {
         guard.tree_fs.remove(&old_path);
         guard.tree_base.remove(&old_path);
@@ -2302,7 +3209,6 @@ async fn handle_studio_renamed(
         guard.meta.insert(new_path.clone(), meta);
     }
 
-    guard.note_rename_echo(old_path.clone(), new_path.clone());
     let collision_cleared =
         guard.pending_collisions.remove(&old_path) | guard.pending_collisions.remove(&new_path);
     if let Err(e) = persist_base(&guard) {
@@ -3155,6 +4061,7 @@ async fn accept_loop(
     state: SharedState,
     sessions: Arc<Mutex<SyncbackSessions>>,
     bcast_tx: broadcast::Sender<Arc<ServerMsg>>,
+    enforce_loopback_host: bool,
 ) -> Result<()> {
     // Counter of currently-open WebSocket connections. Bounded by
     // `MAX_CONCURRENT_CONNECTIONS` to prevent a malicious local client
@@ -3202,11 +4109,95 @@ async fn accept_loop(
             // `guard` lives for the lifetime of this task; the counter
             // is decremented on every exit path via Drop.
             let _guard = guard;
-            if let Err(e) = handle_connection(stream, peer, state, sessions, bcast_tx).await {
+            if let Err(e) =
+                handle_connection(stream, peer, state, sessions, bcast_tx, enforce_loopback_host)
+                    .await
+            {
                 error!(%peer, error = ?e, "connection closed with error");
             }
         });
     }
+}
+
+/// Strips the `:port` (or `]:port` for a bracketed IPv6 literal) from a
+/// `host[:port]` authority, returning just the host. IPv6 literals keep their
+/// brackets so `host_is_loopback` can strip them uniformly.
+fn split_host(authority: &str) -> &str {
+    if let Some(close) = authority.find(']') {
+        // Bracketed IPv6 literal: the host is `[..]`; drop any trailing `:port`.
+        return &authority[..=close];
+    }
+    match authority.rsplit_once(':') {
+        Some((host, _port)) => host,
+        None => authority,
+    }
+}
+
+/// True iff `host` (no port; IPv6 may be bracketed) is a loopback host: the
+/// literal `localhost`, or an IP that parses into the loopback range
+/// (127.0.0.0/8 or ::1). Parsing as an IP is what defeats DNS-rebinding
+/// look-alikes — `127.0.0.1.evil.com` and `localhost.evil.com` are neither
+/// `localhost` nor a valid loopback IP, so they fail.
+fn host_is_loopback(host: &str) -> bool {
+    if host.eq_ignore_ascii_case("localhost") {
+        return true;
+    }
+    let bare = host
+        .strip_prefix('[')
+        .and_then(|s| s.strip_suffix(']'))
+        .unwrap_or(host);
+    bare.parse::<std::net::IpAddr>()
+        .map(|ip| ip.is_loopback())
+        .unwrap_or(false)
+}
+
+/// Origin allowlist for the WS upgrade (AUDITORIA-YEET.md M24). An absent /
+/// empty / `null` Origin passes — native clients (the Studio plugin) send no
+/// browser Origin. A present http(s) Origin passes ONLY when its host is an
+/// exact loopback host; every other http(s) Origin (any routable or look-alike
+/// host, e.g. `localhost.evil.com`) is rejected. A non-http(s) Origin
+/// (`file://`, an app scheme) passes — it is not a browser page on a routable
+/// host. The old code used `host.starts_with("localhost")`/`"127."`, which
+/// accepted rebinding look-alikes.
+fn origin_is_allowed(origin: &str) -> bool {
+    let origin = origin.trim();
+    if origin.is_empty() || origin.eq_ignore_ascii_case("null") {
+        return true;
+    }
+    let lower = origin.to_ascii_lowercase();
+    let rest = match lower
+        .strip_prefix("http://")
+        .or_else(|| lower.strip_prefix("https://"))
+    {
+        Some(rest) => rest,
+        None => return true,
+    };
+    let authority = rest
+        .split(|c| c == '/' || c == '?' || c == '#')
+        .next()
+        .unwrap_or("");
+    // Drop any userinfo (`user:pass@host`).
+    let hostport = authority.rsplit('@').next().unwrap_or(authority);
+    host_is_loopback(split_host(hostport))
+}
+
+/// Validates the WS upgrade `Host` header is loopback — defence against a
+/// DNS-rebound name reaching a loopback-bound daemon. An absent/empty Host
+/// passes (the Origin check is the primary gate and an absent Host is not a
+/// rebinding vector). Only enforced when the daemon is bound to loopback;
+/// `--allow-remote` deliberately opts out.
+fn host_header_is_loopback(host: Option<&str>) -> bool {
+    match host.map(str::trim) {
+        None | Some("") => true,
+        Some(h) => host_is_loopback(split_host(h)),
+    }
+}
+
+/// True iff a `--bind` address targets a loopback interface only. Gates the
+/// `--allow-remote` requirement (B13) and decides whether the loopback `Host`
+/// header check (M24) is enforced.
+fn is_loopback_bind_addr(addr: &str) -> bool {
+    host_is_loopback(split_host(addr.trim()))
 }
 
 async fn handle_connection(
@@ -3215,6 +4206,7 @@ async fn handle_connection(
     state: SharedState,
     sessions: Arc<Mutex<SyncbackSessions>>,
     bcast_tx: broadcast::Sender<Arc<ServerMsg>>,
+    enforce_loopback_host: bool,
 ) -> Result<()> {
     // Pin the frame/message cap explicitly. `WS_MAX_FRAME_BYTES` is set
     // tighter than tungstenite's defaults to bound peak attacker-
@@ -3227,60 +4219,45 @@ async fn handle_connection(
         max_message_size: Some(WS_MAX_MESSAGE_BYTES),
         ..WebSocketConfig::default()
     };
-    // Origin header allowlist. Browsers ALWAYS attach `Origin: <page>`
-    // when opening a WebSocket; the assumption was that a native
-    // client (Roblox Studio's HttpService, Node's `ws`, curl, custom
-    // CLI tools) wouldn't. In practice Studio DOES send an Origin
-    // header on its WebStreamClient — exact value depends on Studio
-    // build — so a blanket "reject any Origin" was too aggressive
-    // and broke the very plugin we're trying to authenticate.
+    // Origin header allowlist. Browsers ALWAYS attach `Origin: <page>` when
+    // opening a WebSocket; native clients (Roblox Studio's WebStreamClient,
+    // the extension, curl) send either no Origin, `null`, or a non-http(s)
+    // scheme — all of which pass. A present http(s) Origin passes ONLY when
+    // its host is an EXACT loopback host (`origin_is_allowed`): the realistic
+    // DNS-rebinding attack lands on a rebound name like `localhost.evil.com`
+    // whose Origin host is not loopback, so it is rejected. The old code
+    // matched hosts by prefix (`starts_with("localhost")`), which let
+    // `localhost.evil.com` through.
     //
-    // The narrower rule: reject ONLY origins that are unambiguously
-    // browser pages on a public HTTP(S) host. `loopback.localhost`,
-    // `127.0.0.1`, IPv6 loopback, and `null` (file:// origins,
-    // sandboxed iframes, Studio's plugin scheme) all PASS. The
-    // realistic browser-driven attack (random web page on the
-    // internet hijacking the daemon via DNS rebinding) lands on a
-    // rebound name like `evil.com` resolving to 127.0.0.1, where
-    // the page's Origin is still `https://evil.com` — that case is
-    // still rejected. Trade-off: a malicious local web page hosted
-    // at http://localhost can still connect, but anyone running an
-    // attacker-controlled localhost server already has process-level
-    // access to bypass the auth gate by other means.
-    let origin_check = |req: &Request, response: Response| -> Result<Response, ErrorResponse> {
-        let origin_header = req.headers().get("origin");
-        let origin_str = match origin_header {
-            Some(v) => v.to_str().unwrap_or(""),
-            None => "",
-        };
+    // When bound to loopback we additionally require the `Host` header to be
+    // loopback — a rebound name shows up there too. This is skipped under
+    // `--allow-remote`, where a non-loopback Host is expected.
+    let origin_check = move |req: &Request, response: Response| -> Result<Response, ErrorResponse> {
+        let origin_str = req
+            .headers()
+            .get("origin")
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or("");
         // Always log so future debugging has visibility into what
         // Studio / extensions / ad-hoc clients send.
         info!(origin = %origin_str, "ws upgrade origin");
-        if origin_str.is_empty() || origin_str == "null" {
-            return Ok(response);
-        }
-        // Strip scheme to look at the host part. We accept anything
-        // that doesn't look like an externally-routable HTTP(S) URL.
-        let lower = origin_str.to_ascii_lowercase();
-        let host_part = lower
-            .strip_prefix("http://")
-            .or_else(|| lower.strip_prefix("https://"))
-            .unwrap_or(&lower);
-        let host = host_part.split('/').next().unwrap_or("");
-        let is_loopback = host.starts_with("localhost")
-            || host.starts_with("127.")
-            || host.starts_with("[::1]")
-            || host.starts_with("[::ffff:127.")
-            || host.starts_with("0.0.0.0");
-        let is_http_scheme =
-            lower.starts_with("http://") || lower.starts_with("https://");
-        if is_http_scheme && !is_loopback {
-            let body = format!(
-                "yeet-daemon: refusing remote-host browser origin ({origin_str})"
-            );
+        if !origin_is_allowed(origin_str) {
+            let body = format!("yeet-daemon: refusing non-loopback browser origin ({origin_str})");
             let mut err = ErrorResponse::new(Some(body));
             *err.status_mut() = StatusCode::FORBIDDEN;
             return Err(err);
+        }
+        if enforce_loopback_host {
+            let host_hdr = req.headers().get("host").and_then(|v| v.to_str().ok());
+            if !host_header_is_loopback(host_hdr) {
+                let body = format!(
+                    "yeet-daemon: refusing non-loopback Host header ({})",
+                    host_hdr.unwrap_or("")
+                );
+                let mut err = ErrorResponse::new(Some(body));
+                *err.status_mut() = StatusCode::FORBIDDEN;
+                return Err(err);
+            }
         }
         Ok(response)
     };
@@ -3420,41 +4397,68 @@ type WsWriter = futures_util::stream::SplitSink<
 >;
 type WsReader = futures_util::stream::SplitStream<tokio_tungstenite::WebSocketStream<TcpStream>>;
 
-/// Lightweight auth gate. Threat model: the only realistic attacker
-/// at this layer is a remote browser tab (DNS rebinding) — that
-/// attack is blocked entirely by the Origin allowlist enforced
-/// during the WS upgrade (see `handle_connection`). A local
-/// malicious process with same-user privileges can read every file
-/// the daemon writes anyway, so adding cryptographic ceremony here
-/// just degrades UX without raising the security bar.
+/// Auth decision, factored out of `authenticate_or_pair` so the policy is
+/// unit-testable without a live socket. The I/O (sending `AuthGranted`,
+/// deleting the breadcrumb, closing the connection) is the caller's job.
+#[derive(Debug, PartialEq, Eq)]
+enum AuthOutcome {
+    /// Client is authorized; proceed to the session without sending a frame.
+    Proceed,
+    /// A plugin presented no token but a fresh pairing breadcrumb vouches for
+    /// it: send `AuthGranted` (so it can cache the token) then proceed.
+    GrantAndPair,
+    /// Reject the connection. The caller closes the socket WITHOUT sending the
+    /// server token; the `&'static str` is the log reason.
+    Reject(&'static str),
+}
+
+/// Pure auth policy (AUDITORIA-YEET.md A16). Rules:
+///   * A supplied token must match (constant-time). A mismatch is `Reject` —
+///     the server token is NEVER echoed back. That echo was the A16 leak:
+///     any client that guessed wrong received the real credential.
+///   * `role == "extension"` (and any non-plugin role) MUST present a valid
+///     token up-front. Those clients can read `.yeet/auth-token`, so there is
+///     no breadcrumb fallback for them.
+///   * A plugin with no token pairs via a fresh breadcrumb, or proceeds
+///     tokenless when none is present (first-run Studio before the extension
+///     is up — a legitimate flow we must keep).
+fn decide_auth(
+    claimed_auth: Option<&str>,
+    role: &str,
+    server_token: &str,
+    breadcrumb_valid: bool,
+) -> AuthOutcome {
+    if let Some(token) = claimed_auth.filter(|t| !t.is_empty()) {
+        return if auth::constant_time_eq(token, server_token) {
+            AuthOutcome::Proceed
+        } else {
+            AuthOutcome::Reject("auth token mismatch")
+        };
+    }
+    // No token offered. Breadcrumb pairing is a plugin-only convenience.
+    if role != "plugin" {
+        return AuthOutcome::Reject("missing auth token (required for this role)");
+    }
+    if breadcrumb_valid {
+        AuthOutcome::GrantAndPair
+    } else {
+        AuthOutcome::Proceed
+    }
+}
+
+/// Auth gate, run after the version check and before the role session starts.
+/// Threat model: the realistic attacker at this layer is a remote browser tab
+/// (DNS rebinding), blocked by the Origin/Host allowlist during the WS upgrade
+/// (`handle_connection`) plus the loopback bind. The token/breadcrumb gate is
+/// defence-in-depth so a local process still has to read a per-project file
+/// rather than merely open the socket.
 ///
-/// Behaviour:
-///   * If the client supplied a token: do a constant-time compare
-///     and log the result. **Never reject on mismatch** — the
-///     practical effect of mismatch is "the client used to pair
-///     against an older daemon instance and forgot to re-pair", and
-///     the right move is to just accept and let the connection
-///     proceed. The mismatch log is the breadcrumb a security-
-///     conscious operator can grep for.
-///   * If the client supplied no token AND a `yeet-pairing.txt`
-///     breadcrumb is fresh: opportunistically issue `AuthGranted`
-///     so the client can save the token and skip the dance on
-///     future reconnects. The breadcrumb is created automatically
-///     by `Yeet: Start` in the extension, so this happens without
-///     any user action in the normal flow.
-///   * If neither: just proceed silently. Connection works; the
-///     client doesn't get a token but it doesn't matter — the next
-///     time the extension is running, the breadcrumb appears and
-///     the client gets paired then.
-///
-/// The function never sends `AuthRejected` and never bails. It
-/// always returns Ok so the connection moves on to the version /
-/// role / handshake flow. Earlier versions enforced strict rejection
-/// here and the symptom was "Studio plugin can't connect" with no
-/// signal pointing at the auth gate as the culprit; switching to a
-/// best-effort posture keeps the convenience of automatic pairing
-/// while preserving the only defence that actually mattered (Origin
-/// allowlist).
+/// On rejection an `AuthRejected { reason }` frame is written (reason only) and
+/// the connection is closed (`bail`). The server token is never sent to a
+/// client that presented a wrong one, and the session never reaches
+/// `ProjectOpened { initial_files }` (that frame is emitted only inside the role
+/// session, after this returns `Ok`). The `AuthRejected` frame lets a plugin
+/// holding a stale token clear it and re-pair instead of looping.
 async fn authenticate_or_pair(
     state: &SharedState,
     claimed_auth: &Option<String>,
@@ -3467,59 +4471,63 @@ async fn authenticate_or_pair(
         let guard = state.read().await;
         (guard.auth_token.clone(), guard.root.clone())
     };
-    if let Some(t) = claimed_auth.as_deref().filter(|t| !t.is_empty()) {
-        if auth::constant_time_eq(t, &server_token) {
-            info!(%peer, %role, "auth: token matched");
-        } else {
-            warn!(
-                %peer,
-                %role,
-                "auth: token mismatch (accepting anyway — likely stale token from previous daemon instance)"
-            );
-            // Re-issue the current token so the client can refresh
-            // its stored value and skip the mismatch on next connect.
-            let _ = write_frame(
+    // The breadcrumb is consulted only for the plugin's no-token path; skip
+    // the filesystem read entirely for every other role.
+    let breadcrumb_valid =
+        role == "plugin" && auth::pairing_breadcrumb_valid(&project_root_path);
+    match decide_auth(claimed_auth.as_deref(), role, &server_token, breadcrumb_valid) {
+        AuthOutcome::Proceed => {
+            info!(%peer, %role, "auth: proceeding");
+            Ok(())
+        }
+        AuthOutcome::GrantAndPair => {
+            if let Err(e) = write_frame(
                 writer,
                 &ServerMsg::AuthGranted {
                     auth_token: server_token,
                 },
             )
-            .await;
+            .await
+            {
+                warn!(error = ?e, "auth: failed to send opportunistic auth_granted");
+            } else {
+                info!(%peer, %role, "auth: paired via breadcrumb (no token, fresh breadcrumb)");
+            }
+            // One-shot breadcrumb: delete after use so it can't pair a second
+            // client. The extension's refresh timer recreates it within ~30s.
+            if let Err(e) = auth::delete_pairing_breadcrumb(&project_root_path) {
+                warn!(error = ?e, "failed to delete pairing breadcrumb after pair");
+            }
+            Ok(())
         }
-        return Ok(());
+        AuthOutcome::Reject(reason) => {
+            warn!(
+                %peer,
+                %role,
+                reason,
+                "auth: rejecting connection (closing socket, server token NOT sent)"
+            );
+            // Send an actionable AuthRejected (reason only, NEVER the token)
+            // before closing. The daemon regenerates its auth_token every boot,
+            // so a plugin that cached a token from a previous instance will
+            // present a stale one after a restart; without this signal it would
+            // reconnect with the same wrong token forever. On AuthRejected the
+            // plugin clears its stored token and re-pairs tokenless via the
+            // breadcrumb. Echoing the server token here is exactly the A16 leak
+            // we are closing, so it is never included.
+            if let Err(e) = write_frame(
+                writer,
+                &ServerMsg::AuthRejected {
+                    reason: reason.to_string(),
+                },
+            )
+            .await
+            {
+                warn!(error = ?e, "auth: failed to send auth_rejected before close");
+            }
+            bail!("auth rejected: {reason}");
+        }
     }
-    // No token offered. If the breadcrumb is fresh (extension is
-    // running and keeping it alive), opportunistically pair.
-    if role == "plugin" && auth::pairing_breadcrumb_valid(&project_root_path) {
-        if let Err(e) = write_frame(
-            writer,
-            &ServerMsg::AuthGranted {
-                auth_token: server_token,
-            },
-        )
-        .await
-        {
-            warn!(error = ?e, "auth: failed to send opportunistic auth_granted");
-        } else {
-            info!(%peer, %role, "auth: paired via breadcrumb (no token, fresh breadcrumb)");
-        }
-        // Delete the breadcrumb after pair to keep it short-lived;
-        // extension's refresh timer will recreate it within ~30s,
-        // so a second plugin connect window is tiny but exists.
-        if let Err(e) = auth::delete_pairing_breadcrumb(&project_root_path) {
-            warn!(error = ?e, "failed to delete yeet-pairing.txt after pair");
-        }
-    } else {
-        // No token, no breadcrumb. Allow the connection regardless —
-        // see function docstring rationale. Just log so it's
-        // greppable.
-        info!(
-            %peer,
-            %role,
-            "auth: proceeding without token (no breadcrumb available; client will pair on next start)"
-        );
-    }
-    Ok(())
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -3608,6 +4616,13 @@ async fn run_plugin_session(
     // Skip missed ticks instead of bursting (a future async stall could
     // otherwise queue up multiple ticks back-to-back and kill the loop).
     idle_check.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    // A4/M14: sweep `pending_applies` for pushes that never got a `FileApplied`
+    // (old plugin / lost frame) and advance them past the timeout. Runs on its
+    // own short cadence so the fallback latency is a few seconds, not the 30s
+    // idle-check period.
+    let mut apply_sweep =
+        tokio::time::interval(std::time::Duration::from_secs(APPLY_SWEEP_CHECK_SECS));
+    apply_sweep.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     let mut last_activity = std::time::Instant::now();
     // Per-connection token bucket to bound how many inbound frames the
     // daemon's main loop has to parse per second. See RATE_LIMIT_*.
@@ -3709,6 +4724,15 @@ async fn run_plugin_session(
                         "closing idle plugin connection (no inbound frame inside timeout)"
                     );
                     break;
+                }
+            }
+            _ = apply_sweep.tick() => {
+                // A4/M14 old-plugin timeout fallback. A current plugin ACKs a
+                // Studio-direction push within a round-trip, so this normally
+                // finds nothing; it only fires for a pre-A4 plugin that never
+                // sends FileApplied, or a genuinely lost ACK.
+                if let Err(e) = sweep_pending_applies(&state).await {
+                    warn!(%peer, error = ?e, "sweep_pending_applies failed");
                 }
             }
         }
@@ -4279,6 +5303,8 @@ async fn dispatch_client_frame(
         ClientMsg::FileDeleted { .. } => "file_deleted",
         ClientMsg::NameCollision { .. } => "name_collision",
         ClientMsg::Hello { .. } => "hello",
+        ClientMsg::FileApplied { .. } => "file_applied",
+        ClientMsg::FileApplyFailed { .. } => "file_apply_failed",
         _ => "other",
     };
     info!(kind = msg_kind_label, "dispatch_client_frame");
@@ -4460,6 +5486,16 @@ async fn dispatch_client_frame(
             broadcast_server_msg(state, bcast_tx, ServerMsg::Pong { seq }).await;
             Ok(())
         }
+        ClientMsg::FileApplied { path, sha256 } => {
+            // A4/M14 apply-ACK: the plugin confirmed applying a Studio-direction
+            // push. Advance tree_base/tree_studio now that both sides agree.
+            handle_file_applied(state, path, sha256).await
+        }
+        ClientMsg::FileApplyFailed { path, reason } => {
+            // A4/M14 apply-NAK: Studio could not apply. Drop the pending apply
+            // (base stays put) and surface the failure instead of swallowing it.
+            handle_file_apply_failed(state, path, reason, bcast_tx).await
+        }
     }
 }
 
@@ -4625,6 +5661,88 @@ async fn handle_pick_folder_prompt(
 }
 
 #[allow(clippy::too_many_arguments)]
+/// Resolves the current user's home directory (`%USERPROFILE%` on Windows,
+/// `$HOME` elsewhere). Returns `None` when the variable is unset or empty, in
+/// which case a syncback is refused rather than allowed to write anywhere.
+fn user_home_dir() -> Option<PathBuf> {
+    let var = if cfg!(windows) { "USERPROFILE" } else { "HOME" };
+    std::env::var_os(var)
+        .map(PathBuf::from)
+        .filter(|p| !p.as_os_str().is_empty())
+}
+
+/// Confines a syncback `target_path` to the user's home directory
+/// (AUDITORIA-YEET.md A17 — arbitrary file write). The legitimate
+/// reverse-bootstrap targets a user-chosen NEW folder, so we cannot require
+/// it inside the served project root — but we can require it under `home`,
+/// reject `..` traversal, and canonicalize the nearest EXISTING ancestor so a
+/// symlinked ancestor cannot escape home. Returns a human-readable reason on
+/// rejection.
+fn validate_syncback_target(target: &Path, home: &Path) -> Result<(), String> {
+    if !target.is_absolute() {
+        return Err(format!("target_path must be absolute: {}", target.display()));
+    }
+    if target
+        .components()
+        .any(|c| matches!(c, std::path::Component::ParentDir))
+    {
+        return Err(format!(
+            "target_path must not contain '..' components: {}",
+            target.display()
+        ));
+    }
+    let canonical_home = home
+        .canonicalize()
+        .map_err(|e| format!("cannot resolve home directory {}: {e}", home.display()))?;
+    // Walk up to the nearest existing ancestor (the target leaf is typically
+    // new). Canonicalizing it resolves any symlink in the existing portion, so
+    // a `home/link -> C:\elsewhere` ancestor is caught here rather than
+    // silently followed at write time.
+    let mut cursor: &Path = target;
+    let existing = loop {
+        if cursor.exists() {
+            break cursor;
+        }
+        match cursor.parent() {
+            Some(parent) => cursor = parent,
+            None => {
+                return Err(format!(
+                    "target_path has no existing ancestor: {}",
+                    target.display()
+                ));
+            }
+        }
+    };
+    let canonical_existing = existing
+        .canonicalize()
+        .map_err(|e| format!("cannot resolve {}: {e}", existing.display()))?;
+    if !canonical_existing.starts_with(&canonical_home) {
+        return Err(format!(
+            "target_path {} resolves outside the home directory ({}); refusing arbitrary file write",
+            target.display(),
+            home.display()
+        ));
+    }
+    Ok(())
+}
+
+/// Refuses to overwrite a non-empty target directory unless the message
+/// carries explicit overwrite intent (`MergeExisting { overwrite: true }`). A
+/// missing / empty / new directory always passes.
+fn syncback_overwrite_ok(target: &Path, mode: SyncbackMode) -> Result<(), String> {
+    let non_empty = std::fs::read_dir(target)
+        .map(|mut entries| entries.next().is_some())
+        .unwrap_or(false);
+    if non_empty && !matches!(mode, SyncbackMode::MergeExisting { overwrite: true }) {
+        return Err(format!(
+            "target_path {} is a non-empty directory; refusing to overwrite without \
+             explicit merge-overwrite intent",
+            target.display()
+        ));
+    }
+    Ok(())
+}
+
 async fn handle_syncback_begin(
     state: &SharedState,
     sessions: &Arc<Mutex<SyncbackSessions>>,
@@ -4638,15 +5756,45 @@ async fn handle_syncback_begin(
     bcast_tx: &broadcast::Sender<Arc<ServerMsg>>,
 ) -> Result<()> {
     let target = PathBuf::from(&target_path);
-    if !target.is_absolute() {
+    // A17: the target comes straight off the wire. Confine it to the user's
+    // home dir, reject `..` traversal, and refuse to clobber a non-empty
+    // directory without explicit overwrite intent, before any write happens.
+    let Some(home) = user_home_dir() else {
         send_syncback_error(
             state,
             bcast_tx,
             request_id,
-            format!("target_path must be absolute: {target_path}"),
+            "daemon cannot determine the user home directory; refusing syncback".to_owned(),
         )
         .await;
         return Ok(());
+    };
+    if let Err(reason) = validate_syncback_target(&target, &home) {
+        send_syncback_error(state, bcast_tx, request_id.clone(), reason).await;
+        return Ok(());
+    }
+    if let Err(reason) = syncback_overwrite_ok(&target, mode) {
+        send_syncback_error(state, bcast_tx, request_id.clone(), reason).await;
+        return Ok(());
+    }
+    // Durable record of every accepted destination: reverse-bootstrap is the
+    // one path that writes outside the served project on the client's say-so.
+    {
+        let guard = state.read().await;
+        let session_id = guard.session_id.clone();
+        let target_str = target.display().to_string();
+        audit::record(
+            &guard.root,
+            &audit::Entry {
+                ts: audit::now_rfc3339(),
+                kind: audit::Kind::FsWrite,
+                path: &target_str,
+                sha_before: None,
+                sha_after: None,
+                session_id: &session_id,
+                note: Some("syncback target accepted"),
+            },
+        );
     }
     let opts = SyncbackOptions {
         target_path: target,
@@ -4852,6 +6000,18 @@ async fn broadcast_server_msg(
 ) {
     let arc = Arc::new(msg);
     let mut guard = state.write().await;
+    // A create / delete / rename changes the shape of the tree, so the
+    // sourcemap needs regenerating (M1). A `FileChanged` is content-only and is
+    // deliberately excluded. This is the single chokepoint for every
+    // broadcast-driven structural change (FS-side and Studio-side renames); the
+    // silent Studio→disk create/delete paths mark from `write_to_fs`/
+    // `delete_from_fs` since they never broadcast.
+    if matches!(
+        *arc,
+        ServerMsg::FileCreated { .. } | ServerMsg::FileDeleted { .. } | ServerMsg::FileRenamed { .. }
+    ) {
+        guard.mark_sourcemap_dirty();
+    }
     guard.record_delta((*arc).clone());
     // If no receivers exist (no clients connected), broadcast returns an
     // error — ignore it, the buffered copy is what counts for resume.
@@ -5434,7 +6594,8 @@ mod bulk_tests {
     //! of the `BulkSyncAction` match in `apply_bulk_resolution`.
 
     use super::{
-        apply_bulk_resolution, apply_bulk_resolutions, prune_all_empty_subdirs, BulkSyncResolution,
+        apply_bulk_resolution, apply_bulk_resolutions, handle_file_applied, prune_all_empty_subdirs,
+        BulkSyncResolution,
     };
     use std::sync::Arc;
     use std::time::Duration;
@@ -5524,6 +6685,18 @@ mod bulk_tests {
         );
     }
 
+    /// A4 apply-ACK helper: simulate the plugin confirming it applied a
+    /// Studio-direction push of `content` to `path`. A bulk push now only
+    /// advances `tree_base`/`tree_studio` once this arrives (before it the
+    /// change lives in `pending_applies`), so tests that assert the advanced
+    /// trees must drive the ACK the same way a live plugin would.
+    async fn ack(env: &Env, path: &str, content: &str) {
+        let sha = yeet_daemon::state::sha256_hex(content.as_bytes());
+        handle_file_applied(&env.state, path.to_owned(), sha)
+            .await
+            .expect("apply ack");
+    }
+
     // ─── KeepStudio: Studio content overwrites disk ──────────────────────
 
     #[tokio::test]
@@ -5580,9 +6753,28 @@ mod bulk_tests {
         let msgs = drain(&mut rx).await;
         let pushed = msgs.iter().any(|m| matches!(m, ServerMsg::FileChanged { path, content, .. } if path == "src/Foo.luau" && content == "disk_authoritative"));
         assert!(pushed, "expected FileChanged with disk content; got {msgs:?}");
+        // A4: the push is broadcast but tree_studio only advances once the
+        // plugin ACKs applying it. Before the ACK it sits in pending_applies.
+        {
+            let guard = env.state.read().await;
+            assert_eq!(
+                guard.tree_studio.get("src/Foo.luau").map(|e| e.content.as_str()),
+                Some("stale_studio"),
+                "tree_studio must NOT advance before the plugin confirms the apply"
+            );
+            assert!(
+                guard.pending_applies.contains_key("src/Foo.luau"),
+                "the unconfirmed push must be held in pending_applies"
+            );
+        }
+        ack(&env, "src/Foo.luau", "disk_authoritative").await;
         let guard = env.state.read().await;
         let entry = guard.tree_studio.get("src/Foo.luau").expect("studio entry");
         assert_eq!(entry.content, "disk_authoritative");
+        assert!(
+            !guard.pending_applies.contains_key("src/Foo.luau"),
+            "pending apply must clear once confirmed"
+        );
     }
 
     #[tokio::test]
@@ -5856,6 +7048,12 @@ mod bulk_tests {
             "Skip should not touch disk"
         );
 
+        // A4: the two Studio-direction pushes (PullToStudio, KeepIde) are
+        // broadcast but only advance tree_studio once the plugin confirms the
+        // apply. Drive the ACKs the way a live plugin would before asserting.
+        ack(&env, "src/IdeOnly.luau", "fresh_from_ide").await;
+        ack(&env, "src/SharedKeep.luau", "ide_keeps").await;
+
         let guard = env.state.read().await;
         assert_eq!(
             guard
@@ -5875,5 +7073,1734 @@ mod bulk_tests {
             "ide_keeps",
             "KeepIde should overwrite tree_studio"
         );
+    }
+}
+
+#[cfg(test)]
+mod fs_removed_pending_tests {
+    //! Direct tests of `handle_fs_event`'s `fs_removed_pending` flow — the
+    //! fix for AUDITORIA-YEET.md A1 (plus the move-2 and watcher-4 guards).
+    //! Mirrors the `bulk_tests` harness style: tempdir-backed project,
+    //! bootstrap, fire raw `FileEvent`s, inspect broadcasts + tree state.
+
+    use super::{
+        delete_on_studio, handle_file_applied, handle_fs_event, handle_studio_renamed,
+        perform_rename_io, RenameCase, FS_RENAME_PAIR_TTL,
+    };
+    use std::collections::HashMap;
+    use std::sync::Arc;
+    use std::time::Duration;
+    use tokio::sync::{broadcast, RwLock};
+    use yeet_daemon::project::Project;
+    use yeet_daemon::protocol::{ScriptKind, ServerMsg};
+    use yeet_daemon::state::{sha256_hex, FileMeta, ProjectState, SharedState};
+    use yeet_daemon::watcher::FileEvent;
+
+    /// A4 apply-ACK helpers: after a Studio-direction push/delete, `tree_base`/
+    /// `tree_studio` only advance once the plugin confirms the apply. Tests that
+    /// assert the advanced trees drive the ACK the same way a live plugin would.
+    async fn ack(state: &SharedState, path: &str, content: &str) {
+        handle_file_applied(state, path.to_owned(), sha256_hex(content.as_bytes()))
+            .await
+            .expect("apply ack");
+    }
+    async fn ack_delete(state: &SharedState, path: &str) {
+        handle_file_applied(state, path.to_owned(), String::new())
+            .await
+            .expect("apply ack (delete)");
+    }
+
+    /// A test environment: temp project root, daemon state, broadcast bus.
+    /// Drop order matters — `_root` must outlive `state` (which holds paths
+    /// relative to it), so the tempdir guard is the last field.
+    struct Env {
+        state: SharedState,
+        bcast_tx: broadcast::Sender<Arc<ServerMsg>>,
+        _root: tempfile::TempDir,
+    }
+
+    /// Builds a project with a single `src` mount under `ServerScriptService`,
+    /// writes `disk_files` to disk so `rescan_fs` ingests them, and
+    /// bootstraps `ProjectState`. `bootstrap` alone leaves `tree_studio`
+    /// empty (it only fills in once the plugin reports a snapshot), so this
+    /// also seeds `tree_studio` from `tree_fs` to model an already-synced
+    /// project — matching the audit's repro, which starts from files
+    /// already synced to Studio.
+    async fn make_env(disk_files: &[(&str, &str)]) -> Env {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let root = dir.path();
+        let project_json = r#"{
+            "name": "FsRemovedPendingTest",
+            "tree": {
+                "$className": "DataModel",
+                "ServerScriptService": {
+                    "$className": "ServerScriptService",
+                    "$path": "src"
+                }
+            }
+        }"#;
+        std::fs::write(root.join("default.project.json"), project_json).expect("write project");
+        std::fs::create_dir(root.join("src")).expect("mkdir src");
+        for (rel, content) in disk_files {
+            let abs = root.join(rel);
+            if let Some(p) = abs.parent() {
+                std::fs::create_dir_all(p).expect("mkdir -p");
+            }
+            std::fs::write(&abs, content).expect("write file");
+        }
+        let project = Project::load(&root.join("default.project.json")).expect("load project");
+        let state_inner =
+            ProjectState::bootstrap(root, project, false, false).expect("bootstrap");
+        let state: SharedState = Arc::new(RwLock::new(state_inner));
+        {
+            let mut guard = state.write().await;
+            guard.tree_studio = guard.tree_fs.clone();
+        }
+        let (bcast_tx, _) = broadcast::channel(64);
+        Env {
+            state,
+            bcast_tx,
+            _root: dir,
+        }
+    }
+
+    fn root_of(env: &Env) -> std::path::PathBuf {
+        env._root.path().to_path_buf()
+    }
+
+    /// Drains everything currently in `rx` with a short timeout. Tests use
+    /// this after triggering fs events to inspect what got broadcast.
+    async fn drain(rx: &mut broadcast::Receiver<Arc<ServerMsg>>) -> Vec<ServerMsg> {
+        let mut out = Vec::new();
+        loop {
+            match tokio::time::timeout(Duration::from_millis(20), rx.recv()).await {
+                Ok(Ok(m)) => out.push((*m).clone()),
+                _ => break,
+            }
+        }
+        out
+    }
+
+    /// Sleeps past the rename-pairing TTL so any deferred reconcile task
+    /// spawned by a `Removed` event (see `handle_fs_event`) has run.
+    async fn wait_out_pairing_window() {
+        tokio::time::sleep(FS_RENAME_PAIR_TTL + Duration::from_millis(400)).await;
+    }
+
+    // ─── A1 core: two same-content deletes must NOT clobber each other ───
+
+    #[tokio::test]
+    async fn two_identical_content_deletes_within_window_both_propagate() {
+        let env = make_env(&[("src/A.luau", "return {}"), ("src/B.luau", "return {}")]).await;
+        let mut rx = env.bcast_tx.subscribe();
+        let root = root_of(&env);
+
+        std::fs::remove_file(root.join("src/A.luau")).expect("rm A");
+        handle_fs_event(
+            &env.state,
+            FileEvent::Removed(root.join("src/A.luau")),
+            &env.bcast_tx,
+        )
+        .await
+        .expect("handle removed A");
+        std::fs::remove_file(root.join("src/B.luau")).expect("rm B");
+        handle_fs_event(
+            &env.state,
+            FileEvent::Removed(root.join("src/B.luau")),
+            &env.bcast_tx,
+        )
+        .await
+        .expect("handle removed B");
+
+        wait_out_pairing_window().await;
+        let msgs = drain(&mut rx).await;
+
+        let deleted_a = msgs
+            .iter()
+            .any(|m| matches!(m, ServerMsg::FileDeleted { path } if path == "src/A.luau"));
+        let deleted_b = msgs
+            .iter()
+            .any(|m| matches!(m, ServerMsg::FileDeleted { path } if path == "src/B.luau"));
+        assert!(deleted_a, "expected FileDeleted for A; got {msgs:?}");
+        assert!(
+            deleted_b,
+            "expected FileDeleted for B too (lost under sha-keying); got {msgs:?}"
+        );
+
+        // A4: the deletes are broadcast but tree_base/tree_studio only drop the
+        // paths once Studio confirms. Both are held in pending_applies until then.
+        {
+            let guard = env.state.read().await;
+            assert!(
+                guard.pending_applies.contains_key("src/A.luau"),
+                "A's delete must await confirmation in pending_applies"
+            );
+            assert!(
+                guard.pending_applies.contains_key("src/B.luau"),
+                "B's delete must await confirmation in pending_applies"
+            );
+        }
+        ack_delete(&env.state, "src/A.luau").await;
+        ack_delete(&env.state, "src/B.luau").await;
+
+        let guard = env.state.read().await;
+        assert!(
+            !guard.tree_base.contains_key("src/A.luau"),
+            "A must not linger as a phantom in tree_base"
+        );
+        assert!(
+            !guard.tree_base.contains_key("src/B.luau"),
+            "B must not linger as a phantom in tree_base"
+        );
+        assert!(!guard.tree_studio.contains_key("src/A.luau"));
+        assert!(!guard.tree_studio.contains_key("src/B.luau"));
+    }
+
+    // ─── watcher-4: Touched on a PRE-EXISTING file must not pair ─────────
+
+    #[tokio::test]
+    async fn remove_a_then_touch_preexisting_b_with_as_content_is_not_a_rename() {
+        let env = make_env(&[
+            ("src/A.luau", "local A = 1\nreturn A\n"),
+            ("src/B.luau", "local B = 2\nreturn B\n"),
+        ])
+        .await;
+        let mut rx = env.bcast_tx.subscribe();
+        let root = root_of(&env);
+
+        std::fs::remove_file(root.join("src/A.luau")).expect("rm A");
+        handle_fs_event(
+            &env.state,
+            FileEvent::Removed(root.join("src/A.luau")),
+            &env.bcast_tx,
+        )
+        .await
+        .expect("handle removed A");
+
+        // Overwrite pre-existing B with A's old content within the window.
+        std::fs::write(root.join("src/B.luau"), "local A = 1\nreturn A\n").expect("overwrite B");
+        handle_fs_event(
+            &env.state,
+            FileEvent::Touched(root.join("src/B.luau")),
+            &env.bcast_tx,
+        )
+        .await
+        .expect("handle touched B");
+
+        wait_out_pairing_window().await;
+        let msgs = drain(&mut rx).await;
+
+        let renamed = msgs
+            .iter()
+            .any(|m| matches!(m, ServerMsg::FileRenamed { .. }));
+        assert!(
+            !renamed,
+            "must NOT pair as a rename when B pre-existed; got {msgs:?}"
+        );
+
+        let deleted_a = msgs
+            .iter()
+            .any(|m| matches!(m, ServerMsg::FileDeleted { path } if path == "src/A.luau"));
+        assert!(
+            deleted_a,
+            "expected an independent FileDeleted for A; got {msgs:?}"
+        );
+
+        let changed_b = msgs.iter().any(|m| {
+            matches!(m, ServerMsg::FileChanged { path, content, .. }
+                if path == "src/B.luau" && content == "local A = 1\nreturn A\n")
+        });
+        assert!(
+            changed_b,
+            "expected a normal FileChanged for B; got {msgs:?}"
+        );
+
+        // A4: the FileChanged for B is broadcast but tree_studio advances only
+        // once Studio confirms applying it. Drive the ACK before asserting.
+        ack(&env.state, "src/B.luau", "local A = 1\nreturn A\n").await;
+
+        let guard = env.state.read().await;
+        assert_eq!(
+            guard
+                .tree_studio
+                .get("src/B.luau")
+                .map(|e| e.content.as_str()),
+            Some("local A = 1\nreturn A\n"),
+            "B's identity must be its own, not clobbered by A's rename"
+        );
+    }
+
+    // ─── Regression: a genuine single rename must still pair ─────────────
+
+    #[tokio::test]
+    async fn single_rename_still_pairs_as_filerenamed() {
+        let env = make_env(&[("src/Old.luau", "hello")]).await;
+        let mut rx = env.bcast_tx.subscribe();
+        let root = root_of(&env);
+
+        std::fs::remove_file(root.join("src/Old.luau")).expect("rm Old");
+        handle_fs_event(
+            &env.state,
+            FileEvent::Removed(root.join("src/Old.luau")),
+            &env.bcast_tx,
+        )
+        .await
+        .expect("handle removed Old");
+
+        std::fs::write(root.join("src/New.luau"), "hello").expect("write New");
+        handle_fs_event(
+            &env.state,
+            FileEvent::Touched(root.join("src/New.luau")),
+            &env.bcast_tx,
+        )
+        .await
+        .expect("handle touched New");
+
+        wait_out_pairing_window().await;
+        let msgs = drain(&mut rx).await;
+
+        let renames: Vec<_> = msgs
+            .iter()
+            .filter(|m| {
+                matches!(m, ServerMsg::FileRenamed { old_path, new_path, .. }
+                    if old_path == "src/Old.luau" && new_path == "src/New.luau")
+            })
+            .collect();
+        assert_eq!(
+            renames.len(),
+            1,
+            "expected exactly one FileRenamed; got {msgs:?}"
+        );
+
+        let stray_delete = msgs
+            .iter()
+            .any(|m| matches!(m, ServerMsg::FileDeleted { path } if path == "src/Old.luau"));
+        assert!(
+            !stray_delete,
+            "rename must not ALSO emit a stray FileDeleted; got {msgs:?}"
+        );
+
+        let guard = env.state.read().await;
+        assert!(!guard.fs_removed_pending.contains_key("src/Old.luau"));
+    }
+
+    // ─── M17: a real edit to a just-renamed file must not be swallowed ───
+
+    #[tokio::test]
+    async fn real_edit_after_rename_is_not_swallowed_as_echo() {
+        let env = make_env(&[("src/Old.luau", "hello")]).await;
+        let mut rx = env.bcast_tx.subscribe();
+        let root = root_of(&env);
+
+        // Rename Old -> New (pairs into a FileRenamed; pre-M17 this armed the
+        // path-based rename-echo guard for `src/New.luau`).
+        std::fs::remove_file(root.join("src/Old.luau")).expect("rm Old");
+        handle_fs_event(
+            &env.state,
+            FileEvent::Removed(root.join("src/Old.luau")),
+            &env.bcast_tx,
+        )
+        .await
+        .expect("handle removed Old");
+        std::fs::write(root.join("src/New.luau"), "hello").expect("write New");
+        handle_fs_event(
+            &env.state,
+            FileEvent::Touched(root.join("src/New.luau")),
+            &env.bcast_tx,
+        )
+        .await
+        .expect("handle touched New");
+
+        // A genuine user edit to the freshly-renamed file, well inside the old
+        // 500ms echo TTL. Pre-M17 `consume_rename_echo` dropped this silently.
+        std::fs::write(root.join("src/New.luau"), "hello world").expect("edit New");
+        handle_fs_event(
+            &env.state,
+            FileEvent::Touched(root.join("src/New.luau")),
+            &env.bcast_tx,
+        )
+        .await
+        .expect("handle edit New");
+
+        let msgs = drain(&mut rx).await;
+        let changed = msgs.iter().any(|m| {
+            matches!(m, ServerMsg::FileChanged { path, content, .. }
+                if path == "src/New.luau" && content == "hello world")
+        });
+        assert!(
+            changed,
+            "real edit to a just-renamed file must propagate, not be swallowed; got {msgs:?}"
+        );
+
+        let guard = env.state.read().await;
+        assert_eq!(
+            guard.tree_fs.get("src/New.luau").map(|e| e.content.as_str()),
+            Some("hello world")
+        );
+    }
+
+    // ─── A7: renaming a directory on disk re-keys the subtree ────────────
+
+    #[tokio::test]
+    async fn directory_rename_removed_then_touched_emits_per_child_filerenamed() {
+        let env = make_env(&[("src/Foo/Bar.luau", "return 1\n")]).await;
+        let mut rx = env.bcast_tx.subscribe();
+        let root = root_of(&env);
+
+        // Windows emits only a dir-level rename pair (Removed(Foo) +
+        // Touched(Baz)) with no per-child events — deliver them in that order.
+        std::fs::rename(root.join("src/Foo"), root.join("src/Baz")).expect("rename dir");
+        handle_fs_event(
+            &env.state,
+            FileEvent::Removed(root.join("src/Foo")),
+            &env.bcast_tx,
+        )
+        .await
+        .expect("handle removed dir");
+        handle_fs_event(
+            &env.state,
+            FileEvent::Touched(root.join("src/Baz")),
+            &env.bcast_tx,
+        )
+        .await
+        .expect("handle touched dir");
+
+        let msgs = drain(&mut rx).await;
+        let renamed = msgs.iter().any(|m| {
+            matches!(m, ServerMsg::FileRenamed { old_path, new_path, .. }
+                if old_path == "src/Foo/Bar.luau" && new_path == "src/Baz/Bar.luau")
+        });
+        assert!(renamed, "expected FileRenamed for the moved child; got {msgs:?}");
+
+        let guard = env.state.read().await;
+        assert!(
+            !guard.tree_fs.contains_key("src/Foo/Bar.luau"),
+            "old key must not linger in tree_fs"
+        );
+        assert!(guard.tree_fs.contains_key("src/Baz/Bar.luau"));
+        assert!(!guard.tree_studio.contains_key("src/Foo/Bar.luau"));
+        assert!(guard.tree_studio.contains_key("src/Baz/Bar.luau"));
+        assert!(!guard.tree_base.contains_key("src/Foo/Bar.luau"));
+        assert!(guard.tree_base.contains_key("src/Baz/Bar.luau"));
+    }
+
+    #[tokio::test]
+    async fn directory_rename_touched_before_removed_still_pairs() {
+        let env = make_env(&[("src/Foo/Bar.luau", "return 1\n")]).await;
+        let mut rx = env.bcast_tx.subscribe();
+        let root = root_of(&env);
+
+        std::fs::rename(root.join("src/Foo"), root.join("src/Baz")).expect("rename dir");
+        // Reverse order: the To event lands before the From event (HashMap
+        // flush order is non-deterministic, so both orders must work).
+        handle_fs_event(
+            &env.state,
+            FileEvent::Touched(root.join("src/Baz")),
+            &env.bcast_tx,
+        )
+        .await
+        .expect("handle touched dir");
+        handle_fs_event(
+            &env.state,
+            FileEvent::Removed(root.join("src/Foo")),
+            &env.bcast_tx,
+        )
+        .await
+        .expect("handle removed dir");
+
+        let msgs = drain(&mut rx).await;
+        let renames: Vec<_> = msgs
+            .iter()
+            .filter(|m| {
+                matches!(m, ServerMsg::FileRenamed { old_path, new_path, .. }
+                    if old_path == "src/Foo/Bar.luau" && new_path == "src/Baz/Bar.luau")
+            })
+            .collect();
+        assert_eq!(
+            renames.len(),
+            1,
+            "expected exactly one FileRenamed; got {msgs:?}"
+        );
+
+        let guard = env.state.read().await;
+        assert!(!guard.tree_fs.contains_key("src/Foo/Bar.luau"));
+        assert!(guard.tree_fs.contains_key("src/Baz/Bar.luau"));
+    }
+
+    #[tokio::test]
+    async fn directory_rename_rekeys_nested_subtree() {
+        let env = make_env(&[
+            ("src/Foo/init.luau", "return {}\n"),
+            ("src/Foo/Sub/Deep.luau", "return 2\n"),
+        ])
+        .await;
+        let mut rx = env.bcast_tx.subscribe();
+        let root = root_of(&env);
+
+        std::fs::rename(root.join("src/Foo"), root.join("src/Baz")).expect("rename dir");
+        handle_fs_event(
+            &env.state,
+            FileEvent::Removed(root.join("src/Foo")),
+            &env.bcast_tx,
+        )
+        .await
+        .expect("handle removed dir");
+        handle_fs_event(
+            &env.state,
+            FileEvent::Touched(root.join("src/Baz")),
+            &env.bcast_tx,
+        )
+        .await
+        .expect("handle touched dir");
+
+        let msgs = drain(&mut rx).await;
+        let renamed_deep = msgs.iter().any(|m| {
+            matches!(m, ServerMsg::FileRenamed { old_path, new_path, .. }
+                if old_path == "src/Foo/Sub/Deep.luau" && new_path == "src/Baz/Sub/Deep.luau")
+        });
+        let renamed_init = msgs.iter().any(|m| {
+            matches!(m, ServerMsg::FileRenamed { old_path, new_path, .. }
+                if old_path == "src/Foo/init.luau" && new_path == "src/Baz/init.luau")
+        });
+        assert!(renamed_deep, "nested child must be re-keyed; got {msgs:?}");
+        assert!(renamed_init, "init child must be re-keyed; got {msgs:?}");
+
+        let guard = env.state.read().await;
+        assert!(guard.tree_fs.contains_key("src/Baz/Sub/Deep.luau"));
+        assert!(guard.tree_fs.contains_key("src/Baz/init.luau"));
+        assert!(!guard.tree_fs.contains_key("src/Foo/Sub/Deep.luau"));
+        assert!(!guard.tree_fs.contains_key("src/Foo/init.luau"));
+    }
+
+    #[tokio::test]
+    async fn directory_copy_does_not_false_match_as_rename() {
+        // A copy leaves the original dir in place; the daemon must not treat
+        // the new dir as a rename of the still-present one.
+        let env = make_env(&[("src/Foo/Bar.luau", "return 1\n")]).await;
+        let mut rx = env.bcast_tx.subscribe();
+        let root = root_of(&env);
+
+        std::fs::create_dir_all(root.join("src/Baz")).expect("mkdir Baz");
+        std::fs::copy(
+            root.join("src/Foo/Bar.luau"),
+            root.join("src/Baz/Bar.luau"),
+        )
+        .expect("copy file");
+        handle_fs_event(
+            &env.state,
+            FileEvent::Touched(root.join("src/Baz")),
+            &env.bcast_tx,
+        )
+        .await
+        .expect("handle touched dir");
+
+        let msgs = drain(&mut rx).await;
+        let renamed = msgs.iter().any(|m| matches!(m, ServerMsg::FileRenamed { .. }));
+        assert!(
+            !renamed,
+            "a copy (original still present) must not pair as a rename; got {msgs:?}"
+        );
+
+        let guard = env.state.read().await;
+        assert!(
+            guard.tree_fs.contains_key("src/Foo/Bar.luau"),
+            "original entry must stay put"
+        );
+    }
+
+    // ─── M19: a Rescan reconciles changes the backend dropped ────────────
+
+    #[tokio::test]
+    async fn rescan_event_reconciles_a_missed_disk_change() {
+        let env = make_env(&[("src/A.luau", "return 1\n")]).await;
+        let mut rx = env.bcast_tx.subscribe();
+        let root = root_of(&env);
+
+        // Simulate a notification the backend dropped during a storm: change
+        // the file on disk but never deliver its individual Touched event.
+        std::fs::write(root.join("src/A.luau"), "return 2\n").expect("edit A");
+
+        // The backend error surfaces to the daemon as a Rescan.
+        handle_fs_event(&env.state, FileEvent::Rescan, &env.bcast_tx)
+            .await
+            .expect("handle rescan");
+
+        let msgs = drain(&mut rx).await;
+        let changed = msgs.iter().any(|m| {
+            matches!(m, ServerMsg::FileChanged { path, content, .. }
+                if path == "src/A.luau" && content == "return 2\n")
+        });
+        assert!(
+            changed,
+            "rescan must reconcile the change the backend dropped; got {msgs:?}"
+        );
+
+        let guard = env.state.read().await;
+        assert_eq!(
+            guard.tree_fs.get("src/A.luau").map(|e| e.content.as_str()),
+            Some("return 2\n")
+        );
+    }
+
+    // ─── M10: folder move — DirToDir dest-exists guard + no split ────────
+
+    #[test]
+    fn dirtodir_rename_merges_when_destination_dir_already_exists() {
+        // A child LeafToLeaf frame was applied first and already created
+        // `Bar/` (moving Child there). The container DirToDir must merge the
+        // leftover `Foo/init.luau` into the existing `Bar/` instead of a raw
+        // rename that fails on Windows and splits the tree (M10).
+        let dir = tempfile::tempdir().expect("tempdir");
+        let root = dir.path();
+        std::fs::create_dir_all(root.join("Foo")).unwrap();
+        std::fs::write(root.join("Foo/init.luau"), "return {}\n").unwrap();
+        std::fs::create_dir_all(root.join("Bar")).unwrap();
+        std::fs::write(root.join("Bar/Child.luau"), "return 1\n").unwrap();
+
+        let res = perform_rename_io(
+            RenameCase::DirToDir,
+            &root.join("Foo/init.luau"),
+            &root.join("Bar/init.luau"),
+            FileMeta::default_for_new_file(),
+            "return {}\n",
+            "Foo/init.luau",
+            "Bar/init.luau",
+        );
+        assert!(res.is_ok(), "DirToDir onto an existing dir must merge, got {res:?}");
+        assert!(root.join("Bar/init.luau").exists(), "init merged into Bar");
+        assert!(root.join("Bar/Child.luau").exists(), "pre-moved child preserved");
+        assert!(!root.join("Foo").exists(), "old dir removed after merge");
+    }
+
+    #[tokio::test]
+    async fn folder_move_child_frame_before_container_does_not_split() {
+        // Studio moved `Foo/` → `Bar/`; frames can arrive child-first. The
+        // container DirToDir must NOT fail with HandlerFailed, and the subtree
+        // must not split across `Foo`/`Bar` on disk or in the trees (M10).
+        let env = make_env(&[
+            ("src/Foo/init.luau", "return {}\n"),
+            ("src/Foo/Child.luau", "return 1\n"),
+        ])
+        .await;
+        let mut rx = env.bcast_tx.subscribe();
+
+        let child = "return 1\n";
+        handle_studio_renamed(
+            &env.state,
+            "src/Foo/Child.luau".to_owned(),
+            "src/Bar/Child.luau".to_owned(),
+            ScriptKind::ModuleScript,
+            child.to_owned(),
+            sha256_hex(child.as_bytes()),
+            &env.bcast_tx,
+        )
+        .await
+        .expect("child rename");
+        let init = "return {}\n";
+        handle_studio_renamed(
+            &env.state,
+            "src/Foo/init.luau".to_owned(),
+            "src/Bar/init.luau".to_owned(),
+            ScriptKind::ModuleScript,
+            init.to_owned(),
+            sha256_hex(init.as_bytes()),
+            &env.bcast_tx,
+        )
+        .await
+        .expect("container rename");
+
+        let msgs = drain(&mut rx).await;
+        let container_error = msgs.iter().any(|m| {
+            matches!(m, ServerMsg::SyncError { path, .. } if path == "src/Bar/init.luau")
+        });
+        assert!(
+            !container_error,
+            "container DirToDir must not surface a SyncError; got {msgs:?}"
+        );
+
+        let root = root_of(&env);
+        assert!(root.join("src/Bar/init.luau").exists());
+        assert!(root.join("src/Bar/Child.luau").exists());
+        assert!(!root.join("src/Foo").exists(), "old folder gone from disk");
+
+        let guard = env.state.read().await;
+        assert!(guard.tree_fs.contains_key("src/Bar/init.luau"));
+        assert!(guard.tree_fs.contains_key("src/Bar/Child.luau"));
+        assert!(!guard.tree_fs.contains_key("src/Foo/init.luau"), "no split");
+        assert!(!guard.tree_fs.contains_key("src/Foo/Child.luau"), "no split");
+    }
+
+    // ─── M11: rename carries the `.meta.json` sidecar ────────────────────
+
+    #[test]
+    fn leaf_rename_moves_meta_sidecar() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let root = dir.path();
+        std::fs::create_dir_all(root.join("src")).unwrap();
+        std::fs::write(root.join("src/Foo.luau"), "return 1\n").unwrap();
+        std::fs::write(root.join("src/Foo.meta.json"), "{\"properties\":{}}").unwrap();
+
+        let res = perform_rename_io(
+            RenameCase::LeafToLeaf,
+            &root.join("src/Foo.luau"),
+            &root.join("src/Bar.luau"),
+            FileMeta::default_for_new_file(),
+            "return 1\n",
+            "src/Foo.luau",
+            "src/Bar.luau",
+        );
+        assert!(res.is_ok(), "{res:?}");
+        assert!(root.join("src/Bar.luau").exists());
+        assert!(
+            root.join("src/Bar.meta.json").exists(),
+            "sidecar must move with the script (M11)"
+        );
+        assert!(!root.join("src/Foo.meta.json").exists(), "old sidecar must be gone");
+    }
+
+    #[test]
+    fn demote_rename_moves_init_meta_sidecar_and_removes_dir() {
+        // A lone `init.meta.json` sibling must not block the demote (it moves
+        // out with the script) and must land as `<Name>.meta.json` (M11).
+        let dir = tempfile::tempdir().expect("tempdir");
+        let root = dir.path();
+        std::fs::create_dir_all(root.join("src/Foo")).unwrap();
+        std::fs::write(root.join("src/Foo/init.luau"), "return 1\n").unwrap();
+        std::fs::write(root.join("src/Foo/init.meta.json"), "{\"properties\":{}}").unwrap();
+
+        let res = perform_rename_io(
+            RenameCase::Demote,
+            &root.join("src/Foo/init.luau"),
+            &root.join("src/Foo.luau"),
+            FileMeta::default_for_new_file(),
+            "return 1\n",
+            "src/Foo/init.luau",
+            "src/Foo.luau",
+        );
+        assert!(
+            res.is_ok(),
+            "demote with only a sidecar sibling must succeed, got {res:?}"
+        );
+        assert!(root.join("src/Foo.luau").exists());
+        assert!(
+            root.join("src/Foo.meta.json").exists(),
+            "sidecar demoted alongside the script (M11)"
+        );
+        assert!(!root.join("src/Foo").exists(), "old dir removed");
+    }
+
+    // ─── M12: Promote rolls back staging on finalize failure ─────────────
+
+    #[test]
+    fn promote_rolls_back_staging_when_finalize_fails() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let root = dir.path();
+        std::fs::create_dir_all(root.join("src")).unwrap();
+        std::fs::write(root.join("src/Foo.luau"), "return 1\n").unwrap();
+        // Force the finalize rename to fail: make `src/Foo/init.luau` an
+        // existing NON-EMPTY directory so renaming the staged file onto it
+        // errors on every platform.
+        std::fs::create_dir_all(root.join("src/Foo/init.luau")).unwrap();
+        std::fs::write(root.join("src/Foo/init.luau/blocker"), "x").unwrap();
+
+        let res = perform_rename_io(
+            RenameCase::Promote,
+            &root.join("src/Foo.luau"),
+            &root.join("src/Foo/init.luau"),
+            FileMeta::default_for_new_file(),
+            "return 1\n",
+            "src/Foo.luau",
+            "src/Foo/init.luau",
+        );
+        assert!(res.is_err(), "finalize onto a non-empty dir must fail");
+        // M12: content must be recoverable at old_abs, never stranded in the
+        // unclassified `.yeet-tmp` staging file.
+        assert!(
+            root.join("src/Foo.luau").exists(),
+            "staged content must roll back to the old path"
+        );
+        assert!(
+            !root.join("src/Foo.luau.yeet-tmp").exists(),
+            "no stray .yeet-tmp left behind"
+        );
+        assert_eq!(
+            std::fs::read_to_string(root.join("src/Foo.luau")).unwrap(),
+            "return 1\n"
+        );
+    }
+
+    // ─── B5: meta_attributes cleared on delete ───────────────────────────
+
+    #[tokio::test]
+    async fn delete_on_studio_clears_meta_attributes() {
+        let env = make_env(&[("src/Foo.luau", "return 1\n")]).await;
+        {
+            let mut guard = env.state.write().await;
+            guard
+                .meta_attributes
+                .insert("src/Foo.luau".to_owned(), HashMap::new());
+        }
+        delete_on_studio(&env.state, "src/Foo.luau", &env.bcast_tx)
+            .await
+            .expect("delete_on_studio");
+        let guard = env.state.read().await;
+        assert!(
+            !guard.meta_attributes.contains_key("src/Foo.luau"),
+            "meta_attributes must be cleared on studio delete (B5)"
+        );
+    }
+
+    #[tokio::test]
+    async fn fs_removal_clears_meta_attributes_after_window() {
+        let env = make_env(&[("src/Foo.luau", "return 1\n")]).await;
+        {
+            let mut guard = env.state.write().await;
+            guard
+                .meta_attributes
+                .insert("src/Foo.luau".to_owned(), HashMap::new());
+        }
+        let root = root_of(&env);
+        std::fs::remove_file(root.join("src/Foo.luau")).expect("rm Foo");
+        handle_fs_event(
+            &env.state,
+            FileEvent::Removed(root.join("src/Foo.luau")),
+            &env.bcast_tx,
+        )
+        .await
+        .expect("handle removed");
+        wait_out_pairing_window().await;
+        let guard = env.state.read().await;
+        assert!(
+            !guard.meta_attributes.contains_key("src/Foo.luau"),
+            "meta_attributes must be cleared once the removal finalizes (B5)"
+        );
+    }
+}
+
+#[cfg(test)]
+mod pending_conflict_authority_tests {
+    //! Regression tests for AUDITORIA-YEET.md A2 (`race-1`): while a conflict
+    //! is awaiting the user's resolution, `pending_conflicts` must be
+    //! authoritative over the path. A clean / auto-merge reconcile arriving
+    //! from the *other* concurrent task (FS vs Studio) must NOT rewrite
+    //! disk/Studio or advance `tree_base` out from under the open snapshot —
+    //! the later `ConflictResolved` would rebuild from the stale
+    //! `base_content` and silently revert the intermediate change (or, in the
+    //! AutoMerge case, discard the merged code). Instead the path is frozen on
+    //! disk and the snapshot is refreshed to the current trees.
+    //!
+    //! Mirrors the `fs_removed_pending_tests` harness: tempdir-backed project,
+    //! already-synced `tree_studio == tree_fs`, drive the real handlers, then
+    //! inspect trees / disk / broadcasts.
+
+    use super::{
+        handle_conflict_resolved, handle_fs_event, handle_studio_changed, reconcile_path,
+    };
+    use std::collections::HashMap;
+    use std::sync::Arc;
+    use std::time::Duration;
+    use tokio::sync::{broadcast, RwLock};
+    use yeet_daemon::project::Project;
+    use yeet_daemon::protocol::{FileResolution, ScriptKind, ServerMsg};
+    use yeet_daemon::state::{sha256_hex, ProjectState, SharedState};
+    use yeet_daemon::tree::TreeEntry;
+    use yeet_daemon::watcher::FileEvent;
+
+    struct Env {
+        state: SharedState,
+        bcast_tx: broadcast::Sender<Arc<ServerMsg>>,
+        _root: tempfile::TempDir,
+    }
+
+    async fn make_env(disk_files: &[(&str, &str)]) -> Env {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let root = dir.path();
+        let project_json = r#"{
+            "name": "PendingConflictTest",
+            "tree": {
+                "$className": "DataModel",
+                "ServerScriptService": {
+                    "$className": "ServerScriptService",
+                    "$path": "src"
+                }
+            }
+        }"#;
+        std::fs::write(root.join("default.project.json"), project_json).expect("write project");
+        std::fs::create_dir(root.join("src")).expect("mkdir src");
+        for (rel, content) in disk_files {
+            let abs = root.join(rel);
+            if let Some(p) = abs.parent() {
+                std::fs::create_dir_all(p).expect("mkdir -p");
+            }
+            std::fs::write(&abs, content).expect("write file");
+        }
+        let project = Project::load(&root.join("default.project.json")).expect("load project");
+        let state_inner =
+            ProjectState::bootstrap(root, project, false, false).expect("bootstrap");
+        let state: SharedState = Arc::new(RwLock::new(state_inner));
+        {
+            // Model an already-synced project: Studio agrees with disk/base.
+            let mut guard = state.write().await;
+            guard.tree_studio = guard.tree_fs.clone();
+        }
+        let (bcast_tx, _) = broadcast::channel(64);
+        Env {
+            state,
+            bcast_tx,
+            _root: dir,
+        }
+    }
+
+    fn root_of(env: &Env) -> std::path::PathBuf {
+        env._root.path().to_path_buf()
+    }
+
+    fn entry(content: &str) -> TreeEntry {
+        TreeEntry {
+            kind: ScriptKind::ModuleScript,
+            content: content.to_owned(),
+            sha256: sha256_hex(content.as_bytes()),
+        }
+    }
+
+    async fn drain(rx: &mut broadcast::Receiver<Arc<ServerMsg>>) -> Vec<ServerMsg> {
+        let mut out = Vec::new();
+        loop {
+            match tokio::time::timeout(Duration::from_millis(20), rx.recv()).await {
+                Ok(Ok(m)) => out.push((*m).clone()),
+                _ => break,
+            }
+        }
+        out
+    }
+
+    /// Drives base/studio/fs entries directly (bypassing the merge engine)
+    /// AND writes `fs` to disk, so a subsequent single `reconcile_path`
+    /// observes the exact 3-way divergence — the deterministic stand-in for
+    /// "edited Studio and disk nearly at once" from the audit repro.
+    async fn set_trees(env: &Env, path: &str, base: &str, studio: &str, fs: &str) {
+        std::fs::write(root_of(env).join(path), fs).expect("write fs to disk");
+        let mut g = env.state.write().await;
+        g.tree_base.insert(path.to_owned(), entry(base));
+        g.tree_studio.insert(path.to_owned(), entry(studio));
+        g.tree_fs.insert(path.to_owned(), entry(fs));
+    }
+
+    /// Forms a real overlapping-edit conflict at `path` and returns once it is
+    /// recorded in `pending_conflicts`. Drains the `ConflictDetected` frame.
+    async fn form_conflict(
+        env: &Env,
+        path: &str,
+        base: &str,
+        studio: &str,
+        fs: &str,
+    ) {
+        set_trees(env, path, base, studio, fs).await;
+        let mut rx = env.bcast_tx.subscribe();
+        reconcile_path(&env.state, path, &env.bcast_tx)
+            .await
+            .expect("reconcile forms conflict");
+        let _ = drain(&mut rx).await;
+        let g = env.state.read().await;
+        assert!(
+            g.pending_conflicts.contains_key(path),
+            "precondition: a conflict must be pending after form_conflict"
+        );
+    }
+
+    async fn resolve_taking_snapshot(env: &Env, path: &str) {
+        // Empty hunk map: `rebuild_resolved` falls back to the snapshot's
+        // `base_content`, i.e. whatever the authoritative snapshot currently
+        // resolves to. This is exactly the "user clicks resolve" moment.
+        handle_conflict_resolved(
+            &env.state,
+            vec![FileResolution {
+                path: path.to_owned(),
+                hunks: HashMap::new(),
+            }],
+            &env.bcast_tx,
+        )
+        .await
+        .expect("resolve");
+    }
+
+    // ─── A2 case 1: a clean revert during an open conflict must not silently
+    //     overwrite disk / advance base; resolution reflects current trees ──
+
+    #[tokio::test]
+    async fn clean_revert_during_conflict_freezes_disk_and_does_not_advance_base() {
+        let path = "src/Foo.luau";
+        let base = "line1\nBASE\nline3\n";
+        let studio = "line1\nSTUDIO\nline3\n";
+        let fs = "line1\nFS\nline3\n";
+        let env = make_env(&[(path, base)]).await;
+
+        form_conflict(&env, path, base, studio, fs).await;
+
+        // The user reverts the disk back to base while the conflict is open.
+        // Under the bug, `reconcile_path` runs `Apply { side: Fs }` (Studio's
+        // edit wins because disk == base again), overwriting disk with STUDIO
+        // and advancing tree_base — all while the stale snapshot lingers.
+        std::fs::write(root_of(&env).join(path), base).expect("revert disk to base");
+        let mut rx = env.bcast_tx.subscribe();
+        handle_fs_event(
+            &env.state,
+            FileEvent::Touched(root_of(&env).join(path)),
+            &env.bcast_tx,
+        )
+        .await
+        .expect("handle revert");
+        let _ = drain(&mut rx).await;
+
+        // A2 fix: disk stays at the reverted content, tree_base is NOT
+        // advanced, and the conflict is still authoritative over the path.
+        {
+            let g = env.state.read().await;
+            assert!(
+                g.pending_conflicts.contains_key(path),
+                "conflict must remain pending after a clean revert reconcile"
+            );
+            assert_eq!(
+                g.tree_base.get(path).map(|e| e.content.as_str()),
+                Some(base),
+                "tree_base must NOT be advanced by a reconcile while a conflict is open"
+            );
+        }
+        assert_eq!(
+            std::fs::read_to_string(root_of(&env).join(path)).expect("read disk"),
+            base,
+            "disk must stay at the user's reverted content, not be overwritten by Studio's edit"
+        );
+
+        // Resolving now reflects the CURRENT trees (Studio's live edit applied
+        // to a base == disk), NOT the stale base and NOT the vanished FS side.
+        resolve_taking_snapshot(&env, path).await;
+        assert_eq!(
+            std::fs::read_to_string(root_of(&env).join(path)).expect("read resolved"),
+            studio,
+            "resolution must reflect the current state (Studio's edit), not the stale base or discarded FS content"
+        );
+        let g = env.state.read().await;
+        assert!(
+            !g.pending_conflicts.contains_key(path),
+            "conflict must clear after resolution"
+        );
+    }
+
+    // ─── A2 case 2 (the data-loss core): an AutoMerge that lands during an
+    //     open conflict must NOT be discarded by the stale resolution ───────
+
+    #[tokio::test]
+    async fn automerge_during_conflict_is_not_discarded_by_stale_resolution() {
+        let path = "src/Mod.luau";
+        let base = "a\nb\nc\nd\ne\n";
+        let studio1 = "a\nS1\nc\nd\ne\n"; // line 2 — overlaps fs1
+        let fs1 = "a\nF1\nc\nd\ne\n"; // line 2 — overlaps studio1 → conflict
+        let env = make_env(&[(path, base)]).await;
+
+        form_conflict(&env, path, base, studio1, fs1).await;
+
+        // A new Studio edit arrives that is DISJOINT from the FS side (line 5,
+        // not line 2). The 3-way merge now resolves to a clean AutoMerge that
+        // keeps BOTH sides' changes.
+        let studio2 = "a\nb\nc\nd\nS2\n";
+        let merged = "a\nF1\nc\nd\nS2\n"; // F1 (line 2) + S2 (line 5)
+        let mut rx = env.bcast_tx.subscribe();
+        handle_studio_changed(
+            &env.state,
+            path.to_owned(),
+            studio2.to_owned(),
+            sha256_hex(studio2.as_bytes()),
+            None,
+            false,
+            &env.bcast_tx,
+        )
+        .await
+        .expect("studio edit");
+        let _ = drain(&mut rx).await;
+
+        // The AutoMerge must NOT have been written straight to disk + base
+        // (which is what strands the snapshot under the bug). Disk stays at
+        // the FS side; the merged content lives only in the refreshed snapshot
+        // until the user resolves.
+        {
+            let g = env.state.read().await;
+            assert!(
+                g.pending_conflicts.contains_key(path),
+                "conflict must remain pending; the AutoMerge is captured in the snapshot"
+            );
+            assert_eq!(
+                g.tree_base.get(path).map(|e| e.content.as_str()),
+                Some(base),
+                "tree_base must NOT be advanced to the auto-merged content while a conflict is open"
+            );
+        }
+        assert_eq!(
+            std::fs::read_to_string(root_of(&env).join(path)).expect("read disk"),
+            fs1,
+            "disk must stay frozen at the FS side until resolution"
+        );
+
+        // The user resolves. Under the bug the stale {base, studio1, fs1}
+        // snapshot rebuilds to studio1, discarding BOTH the merged FS change
+        // and the later Studio edit. With the fix, resolution yields the
+        // merged content.
+        resolve_taking_snapshot(&env, path).await;
+        assert_eq!(
+            std::fs::read_to_string(root_of(&env).join(path)).expect("read resolved"),
+            merged,
+            "the auto-merged content must survive the resolution, not be discarded for a stale side"
+        );
+    }
+
+    // ─── Guard preserved: an identical re-detection must not clobber the
+    //     in-progress resolution nor re-broadcast (commit 7ca88f4) ──────────
+
+    #[tokio::test]
+    async fn identical_reconflict_does_not_clobber_or_respam() {
+        let path = "src/Bar.luau";
+        let base = "a\nb\nc\nd\ne\n";
+        let studio = "a\nS\nc\nd\ne\n";
+        let fs = "a\nF\nc\nd\ne\n";
+        let env = make_env(&[(path, base)]).await;
+
+        form_conflict(&env, path, base, studio, fs).await;
+        let hunks_before = {
+            let g = env.state.read().await;
+            g.pending_conflicts.get(path).unwrap().conflict_hunks.len()
+        };
+
+        // Re-run reconcile with the trees unchanged (e.g. a bulk reconcile
+        // sweep touching an already-conflicted path). The snapshot must be
+        // left intact and nothing re-broadcast.
+        let mut rx = env.bcast_tx.subscribe();
+        reconcile_path(&env.state, path, &env.bcast_tx)
+            .await
+            .expect("re-reconcile");
+        let msgs = drain(&mut rx).await;
+        assert!(
+            !msgs
+                .iter()
+                .any(|m| matches!(m, ServerMsg::ConflictDetected { .. })),
+            "identical re-detection must not re-broadcast ConflictDetected; got {msgs:?}"
+        );
+
+        let g = env.state.read().await;
+        assert!(g.pending_conflicts.contains_key(path));
+        assert_eq!(
+            g.pending_conflicts.get(path).unwrap().conflict_hunks.len(),
+            hunks_before,
+            "the in-progress snapshot's hunks must be preserved verbatim"
+        );
+        assert_eq!(
+            g.tree_base.get(path).map(|e| e.content.as_str()),
+            Some(base),
+            "an identical re-reconcile must not advance tree_base"
+        );
+    }
+}
+
+#[cfg(test)]
+mod apply_ack_tests {
+    //! Regression tests for AUDITORIA-YEET.md A4 (`swallow-1`) / M14 (`resil-2`):
+    //! the apply-ACK protocol. A Studio-direction push must NOT advance
+    //! `tree_base` ("confirmed by both sides") until the plugin confirms it
+    //! applied the change with a `FileApplied`. Before that the change lives in
+    //! `pending_applies`. A `FileApplyFailed` (or an old-plugin timeout) must not
+    //! silently advance base — that is exactly the cascade that overwrites disk
+    //! content which never reached Studio.
+    //!
+    //! Harness mirrors `pending_conflict_authority_tests`: tempdir project,
+    //! already-synced `tree_studio == tree_base == tree_fs`, drive the real
+    //! push/delete/ACK entry points, inspect trees + broadcasts.
+
+    use super::{
+        delete_on_studio, handle_file_applied, handle_file_apply_failed, handle_studio_changed,
+        push_to_studio, sweep_pending_applies, APPLY_ACK_TIMEOUT_SECS,
+    };
+    use std::sync::Arc;
+    use std::time::{Duration, Instant};
+    use tokio::sync::{broadcast, RwLock};
+    use yeet_daemon::project::Project;
+    use yeet_daemon::protocol::{ScriptKind, ServerMsg, SyncErrorKind};
+    use yeet_daemon::state::{sha256_hex, ProjectState, SharedState};
+
+    struct Env {
+        state: SharedState,
+        bcast_tx: broadcast::Sender<Arc<ServerMsg>>,
+        _root: tempfile::TempDir,
+    }
+
+    async fn make_env(disk_files: &[(&str, &str)]) -> Env {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let root = dir.path();
+        let project_json = r#"{
+            "name": "ApplyAckTest",
+            "tree": {
+                "$className": "DataModel",
+                "ServerScriptService": {
+                    "$className": "ServerScriptService",
+                    "$path": "src"
+                }
+            }
+        }"#;
+        std::fs::write(root.join("default.project.json"), project_json).expect("write project");
+        std::fs::create_dir(root.join("src")).expect("mkdir src");
+        for (rel, content) in disk_files {
+            let abs = root.join(rel);
+            if let Some(p) = abs.parent() {
+                std::fs::create_dir_all(p).expect("mkdir -p");
+            }
+            std::fs::write(&abs, content).expect("write file");
+        }
+        let project = Project::load(&root.join("default.project.json")).expect("load project");
+        let state_inner =
+            ProjectState::bootstrap(root, project, false, false).expect("bootstrap");
+        let state: SharedState = Arc::new(RwLock::new(state_inner));
+        {
+            // Already-synced: Studio agrees with disk/base.
+            let mut guard = state.write().await;
+            guard.tree_studio = guard.tree_fs.clone();
+        }
+        let (bcast_tx, _) = broadcast::channel(64);
+        Env {
+            state,
+            bcast_tx,
+            _root: dir,
+        }
+    }
+
+    async fn drain(rx: &mut broadcast::Receiver<Arc<ServerMsg>>) -> Vec<ServerMsg> {
+        let mut out = Vec::new();
+        loop {
+            match tokio::time::timeout(Duration::from_millis(20), rx.recv()).await {
+                Ok(Ok(m)) => out.push((*m).clone()),
+                _ => break,
+            }
+        }
+        out
+    }
+
+    async fn push(env: &Env, path: &str, content: &str) {
+        push_to_studio(
+            &env.state,
+            path,
+            content.to_owned(),
+            ScriptKind::ModuleScript,
+            &env.bcast_tx,
+        )
+        .await
+        .expect("push_to_studio");
+    }
+
+    async fn base_of(env: &Env, path: &str) -> Option<String> {
+        env.state
+            .read()
+            .await
+            .tree_base
+            .get(path)
+            .map(|e| e.content.clone())
+    }
+
+    async fn studio_of(env: &Env, path: &str) -> Option<String> {
+        env.state
+            .read()
+            .await
+            .tree_studio
+            .get(path)
+            .map(|e| e.content.clone())
+    }
+
+    // ─── Core A4: a push holds base+studio until the plugin ACKs ─────────
+
+    #[tokio::test]
+    async fn push_holds_base_and_studio_until_ack() {
+        let path = "src/Foo.luau";
+        let env = make_env(&[(path, "old")]).await;
+        push(&env, path, "new").await;
+
+        // Pre-ACK: neither base nor studio moved; the change is parked in
+        // pending_applies keyed by the pushed sha.
+        assert_eq!(base_of(&env, path).await.as_deref(), Some("old"));
+        assert_eq!(studio_of(&env, path).await.as_deref(), Some("old"));
+        {
+            let g = env.state.read().await;
+            let pending = g.pending_applies.get(path).expect("pending recorded");
+            assert_eq!(pending.sha256, sha256_hex(b"new"));
+        }
+
+        // ACK: both sides advance to the confirmed content, pending clears.
+        handle_file_applied(&env.state, path.to_owned(), sha256_hex(b"new"))
+            .await
+            .expect("ack");
+        assert_eq!(base_of(&env, path).await.as_deref(), Some("new"));
+        assert_eq!(studio_of(&env, path).await.as_deref(), Some("new"));
+        assert!(!env.state.read().await.pending_applies.contains_key(path));
+    }
+
+    #[tokio::test]
+    async fn apply_ack_advances_base_exactly_once() {
+        let path = "src/Foo.luau";
+        let env = make_env(&[(path, "old")]).await;
+        push(&env, path, "new").await;
+        handle_file_applied(&env.state, path.to_owned(), sha256_hex(b"new"))
+            .await
+            .expect("ack");
+        assert_eq!(base_of(&env, path).await.as_deref(), Some("new"));
+
+        // A duplicate/late ACK for the same push is a no-op: pending already
+        // cleared, so nothing is re-applied and base stays put.
+        handle_file_applied(&env.state, path.to_owned(), sha256_hex(b"new"))
+            .await
+            .expect("dup ack");
+        assert_eq!(base_of(&env, path).await.as_deref(), Some("new"));
+        assert!(!env.state.read().await.pending_applies.contains_key(path));
+    }
+
+    // ─── A4: a NAK must NOT advance base, and must surface the failure ────
+
+    #[tokio::test]
+    async fn apply_failed_leaves_base_unadvanced_and_surfaces_error() {
+        let path = "src/Foo.luau";
+        let env = make_env(&[(path, "old")]).await;
+        push(&env, path, "new").await;
+
+        let mut rx = env.bcast_tx.subscribe();
+        handle_file_apply_failed(
+            &env.state,
+            path.to_owned(),
+            "TryBeginRecording returned nil".to_owned(),
+            &env.bcast_tx,
+        )
+        .await
+        .expect("nak");
+
+        // Base stayed at the old content (no silent advance); the divergence is
+        // still real and will re-detect on the next reconcile.
+        assert_eq!(base_of(&env, path).await.as_deref(), Some("old"));
+        assert_eq!(studio_of(&env, path).await.as_deref(), Some("old"));
+        assert!(!env.state.read().await.pending_applies.contains_key(path));
+
+        // The failure is surfaced, not swallowed.
+        let msgs = drain(&mut rx).await;
+        let surfaced = msgs.iter().any(|m| {
+            matches!(m, ServerMsg::SyncError { kind: SyncErrorKind::HandlerFailed, path: p, .. }
+                if p == path)
+        });
+        assert!(surfaced, "NAK must broadcast a SyncError; got {msgs:?}");
+    }
+
+    // ─── A4: old-plugin timeout fallback advances base without an ACK ─────
+
+    #[tokio::test]
+    async fn timeout_fallback_advances_base_for_old_plugin() {
+        let path = "src/Foo.luau";
+        let env = make_env(&[(path, "old")]).await;
+        push(&env, path, "new").await;
+
+        // Age the pending entry past the ACK timeout to simulate a pre-A4
+        // plugin that applied the change but never learned to ACK.
+        {
+            let mut g = env.state.write().await;
+            let pending = g.pending_applies.get_mut(path).expect("pending");
+            pending.since = Instant::now()
+                .checked_sub(Duration::from_secs(APPLY_ACK_TIMEOUT_SECS + 5))
+                .expect("clock underflow");
+        }
+        sweep_pending_applies(&env.state).await.expect("sweep");
+
+        assert_eq!(base_of(&env, path).await.as_deref(), Some("new"));
+        assert_eq!(studio_of(&env, path).await.as_deref(), Some("new"));
+        assert!(!env.state.read().await.pending_applies.contains_key(path));
+    }
+
+    #[tokio::test]
+    async fn timeout_sweep_leaves_fresh_pending_alone() {
+        let path = "src/Foo.luau";
+        let env = make_env(&[(path, "old")]).await;
+        push(&env, path, "new").await;
+
+        // A just-recorded pending is well inside the timeout — the sweep must
+        // not touch it (that would defeat the whole point of waiting for ACK).
+        sweep_pending_applies(&env.state).await.expect("sweep");
+        assert_eq!(base_of(&env, path).await.as_deref(), Some("old"));
+        assert!(env.state.read().await.pending_applies.contains_key(path));
+    }
+
+    // ─── A4: a stale ACK for a superseded push is ignored ────────────────
+
+    #[tokio::test]
+    async fn stale_ack_for_superseded_push_is_ignored() {
+        let path = "src/Foo.luau";
+        let env = make_env(&[(path, "old")]).await;
+        push(&env, path, "v1").await;
+        push(&env, path, "v2").await; // supersedes v1; pending now tracks v2
+
+        // The plugin ACKs the OLD push. Its sha no longer matches the pending,
+        // so it must be ignored — advancing to v1 would clobber the v2 intent.
+        handle_file_applied(&env.state, path.to_owned(), sha256_hex(b"v1"))
+            .await
+            .expect("stale ack");
+        assert_eq!(base_of(&env, path).await.as_deref(), Some("old"));
+        {
+            let g = env.state.read().await;
+            assert_eq!(
+                g.pending_applies.get(path).expect("pending still v2").sha256,
+                sha256_hex(b"v2")
+            );
+        }
+
+        // The ACK that matches the current push advances base to v2.
+        handle_file_applied(&env.state, path.to_owned(), sha256_hex(b"v2"))
+            .await
+            .expect("current ack");
+        assert_eq!(base_of(&env, path).await.as_deref(), Some("v2"));
+    }
+
+    // ─── A4: delete is gated the same way ────────────────────────────────
+
+    #[tokio::test]
+    async fn delete_holds_base_until_ack() {
+        let path = "src/Foo.luau";
+        let env = make_env(&[(path, "old")]).await;
+        delete_on_studio(&env.state, path, &env.bcast_tx)
+            .await
+            .expect("delete_on_studio");
+
+        // Pre-ACK: base/studio still hold the file; the delete is pending with
+        // the empty-string sentinel.
+        assert_eq!(base_of(&env, path).await.as_deref(), Some("old"));
+        {
+            let g = env.state.read().await;
+            let pending = g.pending_applies.get(path).expect("pending delete");
+            assert_eq!(pending.sha256, "");
+            assert!(pending.entry.is_none());
+        }
+
+        // ACK (empty sha for a delete): both trees drop the path.
+        handle_file_applied(&env.state, path.to_owned(), String::new())
+            .await
+            .expect("ack delete");
+        let g = env.state.read().await;
+        assert!(!g.tree_base.contains_key(path));
+        assert!(!g.tree_studio.contains_key(path));
+        assert!(!g.pending_applies.contains_key(path));
+    }
+
+    // ─── A4 cascade: a Studio edit that lands before the push is confirmed
+    //     supersedes the pending, and a late ACK cannot resurrect it ──────
+
+    #[tokio::test]
+    async fn studio_edit_supersedes_pending_and_prevents_overwrite_cascade() {
+        let path = "src/Foo.luau";
+        let env = make_env(&[(path, "old")]).await;
+
+        // Disk changed to "disknew" (git pull / format-on-save); the reconcile
+        // pushes it to Studio. Model that: tree_fs=disknew, push disknew.
+        {
+            let mut g = env.state.write().await;
+            g.tree_fs.insert(
+                path.to_owned(),
+                yeet_daemon::tree::TreeEntry {
+                    kind: ScriptKind::ModuleScript,
+                    content: "disknew".to_owned(),
+                    sha256: sha256_hex(b"disknew"),
+                },
+            );
+        }
+        push(&env, path, "disknew").await; // pending{disknew}; base/studio still "old"
+
+        // Studio was busy and never applied it. The user then edits the still-old
+        // script in Studio → the plugin reports the real Studio content.
+        let mut rx = env.bcast_tx.subscribe();
+        handle_studio_changed(
+            &env.state,
+            path.to_owned(),
+            "useredit".to_owned(),
+            sha256_hex(b"useredit"),
+            None,
+            false,
+            &env.bcast_tx,
+        )
+        .await
+        .expect("studio edit");
+        let _ = drain(&mut rx).await;
+
+        // The genuine Studio event supersedes the pending push.
+        assert!(
+            !env.state.read().await.pending_applies.contains_key(path),
+            "a real Studio edit must clear the pending push"
+        );
+        // studio (old) vs fs (disknew) both diverge from base (old) differently →
+        // a conflict, NOT a silent overwrite of the disk content.
+        assert!(
+            env.state.read().await.pending_conflicts.contains_key(path),
+            "the overlapping edit must raise a conflict, not overwrite disk"
+        );
+
+        // A late, now-stale ACK for the original push must NOT advance base to
+        // "disknew" (which would be the swallow-1 cascade).
+        handle_file_applied(&env.state, path.to_owned(), sha256_hex(b"disknew"))
+            .await
+            .expect("late stale ack");
+        assert_eq!(
+            base_of(&env, path).await.as_deref(),
+            Some("old"),
+            "a stale ACK must never advance base behind a live conflict"
+        );
+    }
+}
+
+#[cfg(test)]
+mod security_tests {
+    //! Regression tests for AUDITORIA-YEET.md security findings A16 (auth gate
+    //! leaked the token / never rejected), A17 (syncback arbitrary file write),
+    //! M24 (Origin/Host prefix-match DNS-rebinding bypass) and B13 (silent
+    //! non-loopback `--bind`). The policy for each finding is factored into a
+    //! pure function so it can be exercised without a live socket, mirroring
+    //! how the rest of the daemon tests its decision cores.
+
+    // ─── A16: auth gate ──────────────────────────────────────────────────
+    use super::{decide_auth, AuthOutcome};
+
+    const TOKEN: &str = "0011223344556677889900aabbccddee";
+
+    #[test]
+    fn matching_token_proceeds() {
+        assert_eq!(
+            decide_auth(Some(TOKEN), "plugin", TOKEN, false),
+            AuthOutcome::Proceed
+        );
+        assert_eq!(
+            decide_auth(Some(TOKEN), "extension", TOKEN, false),
+            AuthOutcome::Proceed
+        );
+    }
+
+    #[test]
+    fn wrong_token_is_rejected_and_never_grants() {
+        // The A16 leak: a mismatched token used to be answered with
+        // AuthGranted { server token }. It must now close the connection and
+        // MUST NOT reach the GrantAndPair (token-sending) arm — even when a
+        // breadcrumb happens to be fresh.
+        assert_eq!(
+            decide_auth(Some("deadbeef"), "plugin", TOKEN, false),
+            AuthOutcome::Reject("auth token mismatch")
+        );
+        assert_eq!(
+            decide_auth(Some("deadbeef"), "plugin", TOKEN, true),
+            AuthOutcome::Reject("auth token mismatch")
+        );
+        assert_eq!(
+            decide_auth(Some("deadbeef"), "extension", TOKEN, false),
+            AuthOutcome::Reject("auth token mismatch")
+        );
+    }
+
+    #[test]
+    fn extension_without_token_is_rejected() {
+        // Extension/CLI clients can read `.yeet/auth-token`, so they must
+        // present it up-front. No token → refused, breadcrumb or not.
+        assert_eq!(
+            decide_auth(None, "extension", TOKEN, false),
+            AuthOutcome::Reject("missing auth token (required for this role)")
+        );
+        assert_eq!(
+            decide_auth(None, "extension", TOKEN, true),
+            AuthOutcome::Reject("missing auth token (required for this role)")
+        );
+        // Empty string counts as "no token".
+        assert_eq!(
+            decide_auth(Some(""), "extension", TOKEN, false),
+            AuthOutcome::Reject("missing auth token (required for this role)")
+        );
+    }
+
+    #[test]
+    fn plugin_without_token_pairs_via_fresh_breadcrumb() {
+        assert_eq!(
+            decide_auth(None, "plugin", TOKEN, true),
+            AuthOutcome::GrantAndPair
+        );
+        // Empty string is treated as no token.
+        assert_eq!(
+            decide_auth(Some(""), "plugin", TOKEN, true),
+            AuthOutcome::GrantAndPair
+        );
+    }
+
+    #[test]
+    fn plugin_without_token_or_breadcrumb_still_proceeds() {
+        // First-run Studio before the extension is up (no breadcrumb yet)
+        // must still connect — the legitimate flow the audit says to keep.
+        assert_eq!(
+            decide_auth(None, "plugin", TOKEN, false),
+            AuthOutcome::Proceed
+        );
+    }
+
+    // ─── A17: syncback target confinement ────────────────────────────────
+    use super::{syncback_overwrite_ok, validate_syncback_target};
+    use yeet_daemon::protocol::SyncbackMode;
+
+    #[test]
+    fn syncback_accepts_new_folder_under_home() {
+        let home = tempfile::tempdir().expect("home");
+        // Brand-new leaf directly under home (the reverse-bootstrap case).
+        let target = home.path().join("MyNewGame");
+        assert!(validate_syncback_target(&target, home.path()).is_ok());
+        // Nested new folder whose nearest existing ancestor is still home.
+        std::fs::create_dir(home.path().join("Projects")).expect("mkdir");
+        let nested = home.path().join("Projects").join("Deep").join("Game");
+        assert!(validate_syncback_target(&nested, home.path()).is_ok());
+    }
+
+    #[test]
+    fn syncback_rejects_target_outside_home() {
+        let home = tempfile::tempdir().expect("home");
+        let elsewhere = tempfile::tempdir().expect("elsewhere");
+        let target = elsewhere.path().join("victim");
+        let err = validate_syncback_target(&target, home.path())
+            .expect_err("target outside home must be rejected");
+        assert!(err.contains("outside the home directory"), "got: {err}");
+    }
+
+    #[test]
+    fn syncback_rejects_parent_dir_traversal() {
+        let home = tempfile::tempdir().expect("home");
+        // Absolute path that escapes home via `..` — canonicalize can't
+        // resolve it past the non-existent leaf, so it's refused outright.
+        let target = home.path().join("..").join("escaped");
+        let err = validate_syncback_target(&target, home.path())
+            .expect_err("`..` traversal must be rejected");
+        assert!(err.contains("must not contain '..'"), "got: {err}");
+    }
+
+    #[test]
+    fn syncback_rejects_relative_target() {
+        let home = tempfile::tempdir().expect("home");
+        let target = std::path::Path::new("relative/evil");
+        let err = validate_syncback_target(target, home.path())
+            .expect_err("relative target must be rejected");
+        assert!(err.contains("must be absolute"), "got: {err}");
+    }
+
+    #[test]
+    fn syncback_overwrite_blocks_nonempty_dir_without_intent() {
+        let dir = tempfile::tempdir().expect("dir");
+        std::fs::write(dir.path().join("keep.luau"), "return {}").expect("seed");
+        // No explicit overwrite intent → refused.
+        assert!(syncback_overwrite_ok(dir.path(), SyncbackMode::NewProject).is_err());
+        assert!(
+            syncback_overwrite_ok(dir.path(), SyncbackMode::MergeExisting { overwrite: false })
+                .is_err()
+        );
+        // Explicit intent → allowed.
+        assert!(
+            syncback_overwrite_ok(dir.path(), SyncbackMode::MergeExisting { overwrite: true })
+                .is_ok()
+        );
+    }
+
+    #[test]
+    fn syncback_overwrite_allows_empty_or_missing_dir() {
+        let empty = tempfile::tempdir().expect("empty");
+        assert!(syncback_overwrite_ok(empty.path(), SyncbackMode::NewProject).is_ok());
+        let missing = empty.path().join("does-not-exist-yet");
+        assert!(syncback_overwrite_ok(&missing, SyncbackMode::NewProject).is_ok());
+    }
+
+    // ─── M24: Origin / Host exact-loopback matching (DNS rebinding) ───────
+    use super::{host_header_is_loopback, is_loopback_bind_addr, origin_is_allowed};
+
+    #[test]
+    fn origin_absent_or_non_browser_is_allowed() {
+        // The Studio plugin sends no browser Origin; these must all pass.
+        assert!(origin_is_allowed(""));
+        assert!(origin_is_allowed("null"));
+        assert!(origin_is_allowed("NULL"));
+        // Non-http(s) scheme (file://, app scheme) is not a routable browser
+        // page — passes.
+        assert!(origin_is_allowed("file://"));
+        assert!(origin_is_allowed("roblox-studio://plugin"));
+    }
+
+    #[test]
+    fn origin_exact_loopback_hosts_pass() {
+        for ok in [
+            "http://localhost",
+            "http://localhost:34872",
+            "https://localhost",
+            "http://127.0.0.1",
+            "http://127.0.0.1:34872",
+            "http://[::1]",
+            "http://[::1]:34872",
+            "http://user:pass@localhost:34872",
+        ] {
+            assert!(origin_is_allowed(ok), "should accept {ok}");
+        }
+    }
+
+    #[test]
+    fn origin_rebinding_lookalikes_are_rejected() {
+        // The M24 bug: `starts_with("localhost")` / `"127."` accepted these.
+        for bad in [
+            "http://localhost.evil.com",
+            "http://localhost.evil.com:34872",
+            "http://127.0.0.1.evil.com",
+            "http://localhostx",
+            "http://evil.com",
+            "https://evil.com:34872",
+            "http://0.0.0.0",
+            "http://169.254.0.1",
+        ] {
+            assert!(!origin_is_allowed(bad), "should reject {bad}");
+        }
+    }
+
+    #[test]
+    fn host_header_loopback_matching() {
+        assert!(host_header_is_loopback(None));
+        assert!(host_header_is_loopback(Some("")));
+        assert!(host_header_is_loopback(Some("127.0.0.1:34872")));
+        assert!(host_header_is_loopback(Some("localhost:34872")));
+        assert!(host_header_is_loopback(Some("[::1]:34872")));
+        assert!(!host_header_is_loopback(Some("localhost.evil.com:34872")));
+        assert!(!host_header_is_loopback(Some("evil.com")));
+        assert!(!host_header_is_loopback(Some("192.168.1.5:34872")));
+    }
+
+    #[test]
+    fn loopback_bind_addr_matching() {
+        assert!(is_loopback_bind_addr("127.0.0.1:34872"));
+        assert!(is_loopback_bind_addr("127.0.0.1:0"));
+        assert!(is_loopback_bind_addr("localhost:34872"));
+        assert!(is_loopback_bind_addr("[::1]:0"));
+        assert!(!is_loopback_bind_addr("0.0.0.0:34872"));
+        assert!(!is_loopback_bind_addr("192.168.1.5:34872"));
+    }
+
+    // ─── B13: --bind requires --allow-remote for non-loopback ────────────
+    use super::validate_bind_addr;
+
+    #[test]
+    fn bind_default_and_loopback_pass_without_flag() {
+        // No override → default 127.0.0.1 behaviour, unchanged.
+        assert!(validate_bind_addr(None, false).is_ok());
+        assert!(validate_bind_addr(Some("127.0.0.1:34872"), false).is_ok());
+        assert!(validate_bind_addr(Some("127.0.0.1:0"), false).is_ok());
+        assert!(validate_bind_addr(Some("[::1]:0"), false).is_ok());
+    }
+
+    #[test]
+    fn bind_non_loopback_refused_without_allow_remote() {
+        assert!(validate_bind_addr(Some("0.0.0.0:34872"), false).is_err());
+        assert!(validate_bind_addr(Some("192.168.1.5:34872"), false).is_err());
+    }
+
+    #[test]
+    fn bind_non_loopback_allowed_with_flag() {
+        assert!(validate_bind_addr(Some("0.0.0.0:34872"), true).is_ok());
+        assert!(validate_bind_addr(Some("192.168.1.5:34872"), true).is_ok());
     }
 }

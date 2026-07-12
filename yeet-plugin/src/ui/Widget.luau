@@ -26,7 +26,7 @@ local ScrollList = require(script.Parent.components.ScrollList)
 
 type Payload = { [string]: any }
 type ConnectionHandle = {
-  send: (self: ConnectionHandle, payload: Payload) -> (),
+  send: (self: ConnectionHandle, payload: Payload) -> boolean,
   close: (self: ConnectionHandle) -> (),
 }
 type FileResolution = {
@@ -147,11 +147,25 @@ type ApplierHandle = {
     self: ApplierHandle,
     hook: ((snapshot: { { path: string, kind: string, content: string, sha256: string } }) -> ())?
   ) -> (),
+  setProjectRootMismatchHook: (
+    self: ApplierHandle,
+    hook: ((expected: string, got: string) -> ())?
+  ) -> (),
+  setPendingEditProbe: (
+    self: ApplierHandle,
+    probe: ((path: string) -> (string?, string?))?
+  ) -> (),
+  setApplyHooks: (
+    self: ApplierHandle,
+    onApplied: ((path: string, sha256: string) -> ())?,
+    onApplyFailed: ((path: string, reason: string) -> ())?
+  ) -> (),
   reset: (self: ApplierHandle) -> (),
 }
 type SourceWatcherHandle = {
   track: (self: SourceWatcherHandle, path: string, instance: Instance) -> (),
   untrack: (self: SourceWatcherHandle, path: string) -> (),
+  peekPending: (self: SourceWatcherHandle, path: string) -> (string?, string?),
   destroy: (self: SourceWatcherHandle) -> (),
 }
 
@@ -573,7 +587,7 @@ type WidgetSettings = {
 function Widget.new(plugin: Plugin, initialSettings: WidgetSettings?): Widget
   local info = DockWidgetPluginGuiInfo.new(Enum.InitialDockState.Right, false, false, 320, 480, 280, 360)
   local gui = plugin:CreateDockWidgetPluginGui(WIDGET_ID, info)
-  gui.Title = "Yeet v0.4.1"
+  gui.Title = "Yeet v0.5.0"
   gui.Name = WIDGET_ID
 
   local resolver = ConflictResolver.new(plugin) :: any
@@ -901,23 +915,40 @@ function Widget._onConnectPressed(self: Widget)
     resolvePath = function(instance)
       return applier:resolvePath(instance)
     end,
-    onEdit = function(path, content, hash)
-      applier:recordSelfEdit(path, hash)
+    onEdit = function(path, content, hash): boolean
       if self.paused then
-        -- Pause swallows outgoing edits. The recordSelfEdit above still
-        -- runs so isEcho keeps the local mirror consistent if a stale
-        -- daemon broadcast arrives mid-pause.
-        return
+        -- Pause swallows outgoing edits, but still record the self-edit so
+        -- isEcho keeps the local mirror consistent if a stale daemon
+        -- broadcast arrives mid-pause. Report false so the watcher skips its
+        -- "-> file_changed" log (nothing went on the wire).
+        applier:recordSelfEdit(path, hash)
+        return false
       end
       local current = self.connection
-      if current ~= nil then
-        current:send({
-          type = "file_changed",
-          path = path,
-          content = content,
-          sha256 = hash,
-        })
+      if current == nil then
+        -- B11: mirror the other hooks — a fully torn-down connection (nil
+        -- Handle) should not swallow the edit silently. (A transient
+        -- disconnect keeps the Handle non-nil and is buffered by Reconnect.)
+        self:_appendLog(`edit ignored (disconnected): {path}`)
+        return false
       end
+      local sent = current:send({
+        type = "file_changed",
+        path = path,
+        content = content,
+        sha256 = hash,
+      })
+      if sent then
+        -- B10: seat the echo only after a successful (or buffered) send, so a
+        -- frame that never left keeps recentlyApplied honest.
+        applier:recordSelfEdit(path, hash)
+      else
+        -- B10: the socket looked usable but the frame did not go out. Surface
+        -- a distinct warning instead of only the generic "error:" line, which
+        -- left the status dot green and the "-> file_changed" log misleading.
+        self:_appendLog(`!! file_changed send FAILED (still connected?): {path}`)
+      end
+      return sent
     end,
     onDelete = function(path)
       applier:forgetLocalDelete(path)
@@ -930,6 +961,10 @@ function Widget._onConnectPressed(self: Widget)
           type = "file_deleted",
           path = path,
         })
+      else
+        -- B11: symmetric with onEdit — surface the dropped delete instead of
+        -- swallowing it.
+        self:_appendLog(`delete ignored (disconnected): {path}`)
       end
     end,
     onRename = function(oldPath, newPath, kind, content, hash)
@@ -973,6 +1008,38 @@ function Widget._onConnectPressed(self: Widget)
     sourceWatcher:track(path, instance)
   end, function(path)
     sourceWatcher:untrack(path)
+  end)
+  -- A3: let the Applier consult the watcher for a pending, not-yet-sent
+  -- Studio edit before it overwrites Source with daemon content.
+  applier:setPendingEditProbe(function(path: string)
+    return sourceWatcher:peekPending(path)
+  end)
+  -- A4/M14 apply-ACK: confirm (or report the failure of) each daemon-driven
+  -- apply so the daemon only advances tree_base once Studio actually holds the
+  -- change. These fire once per applied frame; on a torn-down connection we skip
+  -- quietly (the daemon's apply-ACK timeout covers a genuinely lost
+  -- confirmation) rather than spamming the log.
+  applier:setApplyHooks(function(path: string, sha256: string)
+    local current = self.connection
+    if current == nil then
+      return
+    end
+    current:send({
+      type = "file_applied",
+      path = path,
+      sha256 = sha256,
+    })
+  end, function(path: string, reason: string)
+    local current = self.connection
+    if current == nil then
+      return
+    end
+    current:send({
+      type = "file_apply_failed",
+      path = path,
+      reason = reason,
+    })
+    self:_appendLog(`!! apply failed: {path} ({reason})`)
   end)
   applier:setConflictDispatcher(function(conflicts)
     self.resolver:enqueue(conflicts)
@@ -1060,13 +1127,30 @@ function Widget._onConnectPressed(self: Widget)
   -- `ProjectOpened` (which skips auto-materialize and hands a snapshot back
   -- to this Widget for forwarding).
   applier:setBootstrapPreviewMode(true)
-  -- Auth handlers. The daemon's auth gate is best-effort: it never
-  -- bails the connection just because we lack a token. The only
-  -- thing the plugin needs to do is grab a token whenever the daemon
-  -- offers one (`auth_granted`), so future reconnects can include it
-  -- in `Hello.auth_token` and the daemon's match log stays clean.
-  -- No challenge/reject UI — the connection just works whether or
-  -- not we end up paired.
+  -- M26: refuse to materialize if the daemon starts advertising a different
+  -- project_root than the one we first bootstrapped against (cross-project
+  -- corruption guard). The Applier caches the root and fires this on a
+  -- mismatch; we surface it and tear the connection down.
+  applier:setProjectRootMismatchHook(function(expected: string, got: string)
+    self:_appendLog(
+      `!! daemon switched project_root ({expected} -> {got}); disconnecting to avoid cross-project corruption`
+    )
+    -- Defer the teardown: we're inside applier:dispatch, itself inside the
+    -- socket MessageReceived handler; tearing the connection down mid-stack
+    -- would disconnect the very signal we are running in.
+    task.defer(function()
+      self:_teardownConnection()
+    end)
+  end)
+  -- Auth handlers. The daemon issues a token via `auth_granted` when the
+  -- extension's pairing breadcrumb is fresh; we cache it and replay it in
+  -- `Hello.auth_token` on future reconnects. The daemon regenerates its token
+  -- every boot, so after a daemon restart our cached token is stale and the
+  -- daemon replies `auth_rejected` (it no longer echoes a token on mismatch —
+  -- that was a credential leak). On rejection we MUST clear the cached token so
+  -- the automatic reconnect re-pairs tokenless via a fresh breadcrumb; keeping
+  -- the stale token would loop reject→reconnect→reject forever.
+
   applier:setAuthGrantedHandler(function(payload: any)
     local token = tostring(payload.auth_token or "")
     if token == "" then
@@ -1079,6 +1163,21 @@ function Widget._onConnectPressed(self: Widget)
       self:_appendLog(`!! failed to persist auth token: {tostring(err)}`)
     else
       self:_appendLog(`auth token saved`)
+    end
+  end)
+  applier:setAuthRejectedHandler(function(payload: any)
+    -- The daemon rejected our token (typically stale after a daemon restart —
+    -- it regenerates the token every boot). Clear the cached token so the
+    -- automatic reconnect sends none and re-pairs via a fresh breadcrumb;
+    -- otherwise we would replay the same rejected token on every retry.
+    local reason = tostring((payload and payload.reason) or "unknown")
+    local ok, err = pcall(function()
+      self.plugin:SetSetting(AUTH_TOKEN_SETTING, "")
+    end)
+    if not ok then
+      self:_appendLog(`!! auth rejected ({reason}); failed to clear token: {tostring(err)}`)
+    else
+      self:_appendLog(`auth rejected ({reason}); cleared stored token, will re-pair`)
     end
   end)
   applier:setBootstrapSnapshotHook(function(snapshot)
@@ -1206,7 +1305,7 @@ function Widget._onConnectPressed(self: Widget)
         -- in lockstep with breaking protocol changes so the daemon can
         -- refuse old plugins instead of silently misinterpreting their
         -- frames.
-        version = "0.4.1",
+        version = "0.5.0",
         studio_snapshot = {},
         request_bootstrap_preview = true,
       }
@@ -1288,6 +1387,9 @@ function Widget._onConnectPressed(self: Widget)
     end,
     onResumed = function(_sessionId: string, replayed: number)
       self:_appendLog(`resumed: {replayed} buffered frame(s)`)
+    end,
+    onOutgoingFlush = function(count: number)
+      self:_appendLog(`flushed {count} buffered edit(s) after reconnect`)
     end,
     onClose = function()
       self:_appendLog("socket closed")

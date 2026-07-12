@@ -5,13 +5,15 @@
 --
 -- Anti-echo has two tiers:
 --   1. Synchronous drop: as soon as the property-changed signal fires, we
---      hash the current Source and ask `isEcho(path, hash)`. If the hash
---      matches the value the Applier just stashed, we return immediately
---      without scheduling anything.
+--      hand the current Source to `isEcho(path, content)`. That compares the
+--      byte length against the Applier's last write first and only computes
+--      the SHA-256 when the length matches, so an ordinary keystroke drops
+--      out here without hashing the whole Source (A12). If it is our own
+--      echo, we return immediately without scheduling anything.
 --   2. Trailing-edge debounce (200ms): rapid typing would otherwise spam
 --      `FileChanged` frames. We delay the send until the user pauses for
---      200ms, then re-read Source + re-check `isEcho`, in case the Applier
---      wrote over the edit in the meantime.
+--      200ms, then re-read Source + re-check `isEcho`, hashing once there to
+--      build the frame, in case the Applier wrote over the edit meanwhile.
 
 -- The user's spec says "throttle of 200ms" but describes debounce semantics
 -- ("avoid spam on rapid typing"). Debounce is what actually matches that
@@ -21,7 +23,11 @@ local DEBOUNCE_SECONDS = 0.2
 
 export type ScriptKind = "module_script" | "script" | "local_script"
 
-export type EditHandler = (path: string, content: string, hash: string) -> ()
+-- Returns true when the edit was actually forwarded (or buffered for a later
+-- flush), false when it was dropped/suppressed. The watcher gates its
+-- "-> file_changed" log on the result so a failed send isn't logged as sent
+-- (B10).
+export type EditHandler = (path: string, content: string, hash: string) -> boolean
 export type DeleteHandler = (path: string) -> ()
 export type RenameHandler = (
 	oldPath: string,
@@ -30,7 +36,9 @@ export type RenameHandler = (
 	content: string,
 	hash: string
 ) -> ()
-export type EchoPredicate = (path: string, hash: string) -> boolean
+-- Receives the raw Source content (NOT a precomputed hash): the Applier does
+-- a cheap byte-length reject before hashing, so callers must not pre-hash.
+export type EchoPredicate = (path: string, content: string) -> boolean
 export type Hasher = (content: string) -> string
 export type Log = (line: string) -> ()
 export type PathResolver = (instance: Instance) -> (string?, ScriptKind?)
@@ -58,6 +66,13 @@ type Entry = {
 	-- a copy of the value at the time it was enqueued and bails out if the
 	-- entry's gen has advanced (meaning another fire superseded it).
 	gen: number,
+	-- Content/hash of the most recent non-echo user edit that has NOT yet
+	-- been forwarded to the daemon. Captured synchronously when the Source
+	-- signal fires (before the debounce) so the trailing-edge send can report
+	-- the user's actual edit even if the Applier overwrote `Source` with
+	-- daemon content inside the 200ms window (A3). Cleared when the debounce
+	-- fires. Also read by `peekPending` so the Applier can avoid clobbering.
+	pendingContent: string?,
 }
 
 type Options = {
@@ -203,6 +218,7 @@ function SourceWatcher.track(self: SourceWatcher, path: string, instance: Instan
 		nameConnection = nil :: any,
 		ancestryConnection = nil :: any,
 		gen = 0,
+		pendingContent = nil,
 	}
 	self.byPath[path] = entry
 	self.byInstance[instance] = entry
@@ -276,12 +292,22 @@ function SourceWatcher.track(self: SourceWatcher, path: string, instance: Instan
 			-- emitted (if applicable) and the syncPath helper logged.
 			return
 		end
-		local syncHash = self.hash(current)
-		if self.isEcho(livePath, syncHash) then
-			-- Our own write; Applier already seeded `recentlyApplied` with this
-			-- hash, so the change is a no-op from the sync perspective.
+		-- A12: hand the raw Source to `isEcho`. It rejects on byte length
+		-- before hashing, so a keystroke that changes the length (the common
+		-- case) costs no SHA-256 here; the hash now lives in the debounce.
+		-- REGRESSION(A12): this drop MUST stay before `gen += 1`. An Applier
+		-- echo has to leave a pending user-edit debounce untouched — bumping
+		-- gen on an echo would supersede (and silently discard) that edit.
+		if self.isEcho(livePath, current) then
+			-- Our own write; Applier already seeded `recentlyApplied`, so the
+			-- change is a no-op from the sync perspective.
 			return
 		end
+		-- REGRESSION(A3): capture the user's edit synchronously, before the
+		-- debounce. If a daemon FileChanged overwrites Source with disk content
+		-- inside the window, the trailing send still reports THIS captured
+		-- value instead of the clobbered one — the user's edit is never lost.
+		entry.pendingContent = current
 
 		entry.gen += 1
 		local myGen = entry.gen
@@ -290,6 +316,9 @@ function SourceWatcher.track(self: SourceWatcher, path: string, instance: Instan
 				-- Superseded by a later signal fire or by untrack.
 				return
 			end
+			local capturedContent = entry.pendingContent
+			-- Consume the capture; a later edit re-captures a fresh one.
+			entry.pendingContent = nil
 			local latest = readSource(instance)
 			if latest == nil then
 				return
@@ -298,15 +327,28 @@ function SourceWatcher.track(self: SourceWatcher, path: string, instance: Instan
 			if finalPath == nil then
 				return
 			end
-			local finalHash = self.hash(latest)
-			-- Re-check: the daemon may have pushed a FileChanged during the
-			-- 200ms window; if our current Source already matches what the
-			-- Applier last wrote, there is nothing new to report.
-			if self.isEcho(finalPath, finalHash) then
+			-- Re-check on the raw Source (A12: isEcho byte-length-rejects before
+			-- hashing). If the current Source is NOT our own echo it is a genuine
+			-- user state (incl. an undo/redo during the window) — send it. B10: log
+			-- only after the send actually succeeds (or is buffered).
+			if not self.isEcho(finalPath, latest) then
+				local latestHash = self.hash(latest)
+				if self.onEdit(finalPath, latest, latestHash) then
+					self.log(`-> file_changed {finalPath}`)
+				end
 				return
 			end
-			self.log(`-> file_changed {finalPath}`)
-			self.onEdit(finalPath, latest, finalHash)
+			-- REGRESSION(A3): the current Source matches a recent Applier write
+			-- (echo) — a daemon FileChanged clobbered the user edit inside the
+			-- window. Forward the CAPTURED edit (hashed lazily here, never on the
+			-- keystroke path) so it reaches the daemon and surfaces as a conflict
+			-- instead of vanishing silently.
+			if capturedContent ~= nil and not self.isEcho(finalPath, capturedContent) then
+				local capturedHash = self.hash(capturedContent)
+				if self.onEdit(finalPath, capturedContent, capturedHash) then
+					self.log(`-> file_changed {finalPath} (recovered pre-clobber edit)`)
+				end
+			end
 		end)
 	end)
 end
@@ -319,6 +361,22 @@ function SourceWatcher.untrack(self: SourceWatcher, path: string)
 	disconnectAll(entry)
 	self.byPath[path] = nil
 	self.byInstance[entry.instance] = nil
+end
+
+-- Returns the pending, not-yet-forwarded user edit captured for `path` at the
+-- last Source-change signal, or (nil, nil) when none is buffered. The Applier
+-- consults this before overwriting Source so a daemon FileChanged landing
+-- inside the debounce window doesn't silently clobber the user's in-flight
+-- edit (A3).
+function SourceWatcher.peekPending(self: SourceWatcher, path: string): (string?, string?)
+	local entry = self.byPath[path]
+	if entry == nil then
+		return nil, nil
+	end
+	local content = entry.pendingContent
+	-- Hash lazily (not on the keystroke path — A12): peekPending is only
+	-- called when a daemon FileChanged arrives for this path.
+	return content, if content ~= nil then self.hash(content) else nil
 end
 
 function SourceWatcher.destroy(self: SourceWatcher)

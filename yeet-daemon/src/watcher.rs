@@ -19,6 +19,12 @@ pub enum FileEvent {
     Touched(PathBuf),
     /// The path disappeared (remove or rename-away).
     Removed(PathBuf),
+    /// The watcher backend reported an error or dropped notifications — e.g.
+    /// a `ReadDirectoryChangesW` buffer overflow during a storm (git
+    /// checkout, bulk `wally install`). Individual events were lost, so the
+    /// daemon re-scans the whole tracked tree and reconciles instead of
+    /// silently desyncing until the next reconnect (AUDITORIA-YEET.md M19).
+    Rescan,
 }
 
 // TODO: when notify reports a directory removal (EventKind::Remove of a
@@ -69,14 +75,24 @@ fn debounce_loop(
     loop {
         match raw_rx.recv_timeout(TICK) {
             Ok(Ok(event)) => {
-                let kind = PendingKind::from(&event.kind);
+                // Per-path kind, not one kind for the whole event: a
+                // `RenameMode::Both` event carries `[from, to]` and the two
+                // ends have opposite kinds (AUDITORIA-YEET.md M18).
                 let now = Instant::now();
-                for path in event.paths {
+                let kinds = pending_kinds_for(&event.kind, &event.paths);
+                for (path, kind) in event.paths.into_iter().zip(kinds) {
                     pending.insert(path, (kind, now));
                 }
             }
             Ok(Err(e)) => {
-                tracing::error!(error = %e, "notify error");
+                // A backend error means notifications may have been dropped
+                // (buffer overflow, watch-handle churn). Ask the daemon to
+                // re-scan and reconcile so it converges instead of silently
+                // desyncing until the next reconnect (AUDITORIA-YEET.md M19).
+                tracing::error!(error = %e, "notify backend error; scheduling full rescan");
+                if tx.blocking_send(FileEvent::Rescan).is_err() {
+                    return;
+                }
             }
             Err(std_mpsc::RecvTimeoutError::Timeout) => {}
             Err(std_mpsc::RecvTimeoutError::Disconnected) => return,
@@ -133,13 +149,47 @@ impl From<&EventKind> for PendingKind {
     }
 }
 
+/// Computes a `PendingKind` per path in a raw notify event. Most event kinds
+/// map every path to the same kind, but rename events don't:
+///
+/// - `RenameMode::Both` carries `[from, to]` in a *single* event (macOS
+///   FSEvents and some Linux inotify coalescing). The `from` end is a removal
+///   and the `to` end a touch. The previous code applied one kind to every
+///   path in `event.paths`, so on those backends the old path's removal was
+///   dropped and the moved instance duplicated/orphaned (AUDITORIA-YEET.md
+///   M18). Windows/Linux that split renames into `From`+`To` events are
+///   unaffected — each arrives as its own single-path event.
+/// - `RenameMode::Any` / `Other` don't say which side each path is, so we
+///   resolve each by probing the disk: present ⇒ `Touched`, gone ⇒ `Removed`.
+fn pending_kinds_for(kind: &EventKind, paths: &[PathBuf]) -> Vec<PendingKind> {
+    match kind {
+        EventKind::Modify(ModifyKind::Name(RenameMode::Both)) if paths.len() == 2 => {
+            vec![PendingKind::Removed, PendingKind::Touched]
+        }
+        EventKind::Modify(ModifyKind::Name(RenameMode::Any | RenameMode::Other)) => paths
+            .iter()
+            .map(|p| {
+                if p.exists() {
+                    PendingKind::Touched
+                } else {
+                    PendingKind::Removed
+                }
+            })
+            .collect(),
+        other => {
+            let k = PendingKind::from(other);
+            vec![k; paths.len()]
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     //! Watcher integration: spins up a real `notify` backend on a temp
     //! directory and asserts the debounced event stream that downstream
     //! `handle_fs_event` consumes.
 
-    use super::{spawn, FileEvent, PendingKind};
+    use super::{debounce_loop, pending_kinds_for, spawn, FileEvent, PendingKind};
     use notify::EventKind;
     use std::time::Duration;
     use tokio::sync::mpsc;
@@ -172,6 +222,77 @@ mod tests {
             PendingKind::from(&EventKind::Other),
             PendingKind::Ignored
         ));
+    }
+
+    // ─── M18: RenameMode::Both / Any must not collapse both paths ────────
+
+    #[test]
+    fn rename_both_splits_into_removed_from_and_touched_to() {
+        use notify::event::{ModifyKind, RenameMode};
+        use std::path::PathBuf;
+        // A single `Both` event carries `[from, to]`. The old path is a
+        // removal, the new path a touch — mapping both to one kind (the old
+        // behavior) dropped the old path's removal on macOS/FSEvents.
+        let from = PathBuf::from("/proj/src/Old.luau");
+        let to = PathBuf::from("/proj/src/New.luau");
+        let kinds = pending_kinds_for(
+            &EventKind::Modify(ModifyKind::Name(RenameMode::Both)),
+            &[from, to],
+        );
+        assert!(
+            matches!(kinds.as_slice(), [PendingKind::Removed, PendingKind::Touched]),
+            "Both [from,to] must map to [Removed, Touched]; got {kinds:?}"
+        );
+    }
+
+    #[test]
+    fn rename_any_resolves_each_path_by_stat() {
+        use notify::event::{ModifyKind, RenameMode};
+        // `Any`/`Other` don't label the endpoints, so we probe disk: the
+        // surviving path is a Touch, the vanished one a Removal.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let present = dir.path().join("present.luau");
+        std::fs::write(&present, b"x").expect("write");
+        let gone = dir.path().join("gone.luau");
+        let kinds = pending_kinds_for(
+            &EventKind::Modify(ModifyKind::Name(RenameMode::Any)),
+            &[present, gone],
+        );
+        assert!(matches!(kinds[0], PendingKind::Touched), "present path ⇒ Touched");
+        assert!(matches!(kinds[1], PendingKind::Removed), "missing path ⇒ Removed");
+    }
+
+    #[test]
+    fn plain_events_apply_one_kind_to_every_path() {
+        use std::path::PathBuf;
+        // Non-rename events keep the old semantics: one kind for all paths.
+        let kinds = pending_kinds_for(
+            &EventKind::Create(notify::event::CreateKind::File),
+            &[PathBuf::from("/a.luau"), PathBuf::from("/b.luau")],
+        );
+        assert!(kinds.iter().all(|k| matches!(k, PendingKind::Touched)));
+        assert_eq!(kinds.len(), 2);
+    }
+
+    // ─── M19: a backend error must schedule a rescan, not just log ───────
+
+    #[test]
+    fn backend_error_schedules_a_rescan() {
+        use std::sync::mpsc as std_mpsc;
+        let (raw_tx, raw_rx) = std_mpsc::channel::<notify::Result<notify::Event>>();
+        let (tx, mut rx) = mpsc::channel::<FileEvent>(8);
+        // Feed a backend error, then drop the raw sender so the debounce loop
+        // exits after handling it.
+        raw_tx
+            .send(Err(notify::Error::generic("simulated backend overflow")))
+            .expect("send backend error");
+        drop(raw_tx);
+        let handle = std::thread::spawn(move || debounce_loop(raw_rx, tx));
+        handle.join().expect("debounce thread joins");
+        match rx.try_recv() {
+            Ok(FileEvent::Rescan) => {}
+            other => panic!("expected a scheduled FileEvent::Rescan, got {other:?}"),
+        }
     }
 
     /// Spins up the watcher against a fresh tempdir and returns the tempdir

@@ -5,7 +5,7 @@ import * as path from "node:path";
 import * as vscode from "vscode";
 import { createProject } from "./create";
 import { openProject } from "./openProject";
-import { YeetControlChannel } from "./websocket";
+import { type OutboundFrame, YeetControlChannel } from "./websocket";
 
 const DAEMON_PORT = 34872;
 const KILL_GRACE_MS = 2000;
@@ -19,7 +19,7 @@ const KILL_GRACE_MS = 2000;
 // warning naming both versions; sync continues to operate (semver
 // minor compat usually holds), but the user knows what to fix when
 // behavior gets weird.
-const EXPECTED_DAEMON_VERSION = "0.4.1";
+const EXPECTED_DAEMON_VERSION = "0.5.0";
 // How long the pre-spawn TCP probe waits for `connect` to settle
 // before declaring the port unbound. Short enough that startDaemon
 // stays responsive; long enough to catch a daemon whose accept
@@ -105,6 +105,15 @@ export function activate(context: vscode.ExtensionContext): void {
 	);
 }
 
+// Pure: maps the command-facing direction to the wire frame. Pulled out of
+// runBulkSync so the type-to-direction mapping is checkable on its own,
+// independent of the send/log/warn side effects around it.
+function buildBulkSyncRequest(direction: "from-studio" | "from-ide"): OutboundFrame {
+	return direction === "from-studio"
+		? { type: "bulk_sync_from_studio_request" }
+		: { type: "bulk_sync_from_ide_request" };
+}
+
 async function runBulkSync(direction: "from-studio" | "from-ide"): Promise<void> {
 	if (channel === undefined || daemon === undefined) {
 		const label = direction === "from-studio" ? "Sync From Studio" : "Sync From Ide";
@@ -113,12 +122,18 @@ async function runBulkSync(direction: "from-studio" | "from-ide"): Promise<void>
 		);
 		return;
 	}
-	if (direction === "from-studio") {
-		channel.send({ type: "bulk_sync_from_studio_request" });
-		output?.appendLine("[yeet] sent bulk_sync_from_studio_request");
+	const request = buildBulkSyncRequest(direction);
+	// `send` already warns the user when it drops a frame (disconnected
+	// socket), but it can't know here whether the *attempt* succeeded —
+	// only the caller can decide whether "sent" is true. Previously this
+	// logged "sent" unconditionally, which was actively misleading when
+	// the daemon was unreachable and the frame never left the process.
+	if (channel.send(request)) {
+		output?.appendLine(`[yeet] sent ${request.type}`);
 	} else {
-		channel.send({ type: "bulk_sync_from_ide_request" });
-		output?.appendLine("[yeet] sent bulk_sync_from_ide_request");
+		void vscode.window.showWarningMessage(
+			"Yeet: bulk sync request was not sent — the daemon control channel is disconnected.",
+		);
 	}
 }
 
@@ -357,6 +372,20 @@ function probeDaemonAlive(): Promise<boolean> {
 }
 
 async function startDaemonInner(): Promise<void> {
+	// A daemon crash leaves the previous control channel's reconnect
+	// loop running: `child.on("exit")` only clears `daemon`, and the
+	// clean-stop path (`killDaemon`) isn't in play here since nobody
+	// asked the daemon to stop. Without this, restarting after a crash
+	// constructs a second `YeetControlChannel` at the end of this
+	// function while the first one is still alive and reconnecting —
+	// both connect with `role=extension`, the daemon keeps only the
+	// latest, and the loser reconnects immediately, producing a ~1s
+	// ping-pong forever. Disposing unconditionally is safe: `dispose()`
+	// is idempotent and a no-op if the channel was never assigned.
+	if (channel !== undefined) {
+		channel.dispose();
+		channel = undefined;
+	}
 	// Short-circuit if a daemon already answers on the expected
 	// port. Re-use it instead of trying to spawn a duplicate that
 	// would fail to bind. The control channel's connect+hello will
@@ -524,11 +553,52 @@ async function startDaemonInner(): Promise<void> {
 	// (RUST_LOG=trace) doesn't spam the warning toast.
 	let daemonVersionChecked = false;
 
+	// Sniffs the daemon's startup version banner from a single stdout
+	// line and surfaces a non-modal warning if it doesn't match what
+	// this extension was built against. `line` must already have ANSI
+	// escapes stripped by the caller (see the stdout handler below) —
+	// `tracing` emits them whenever it detects a TTY-like stream, and
+	// RUST_LOG_STYLE=always forces them even over a pipe, which
+	// otherwise hides the quoted version inside
+	// `yeet-daemon starting version="x.y.z"` from this regex. Latched
+	// via `daemonVersionChecked` so a noisy daemon (RUST_LOG=trace)
+	// doesn't spam the warning toast.
+	function checkDaemonVersion(line: string): void {
+		if (daemonVersionChecked) {
+			return;
+		}
+		const versionMatch = line.match(/yeet-daemon starting.*version="([^"]+)"/);
+		if (versionMatch === null) {
+			return;
+		}
+		daemonVersionChecked = true;
+		const actual = versionMatch[1];
+		if (actual === undefined) {
+			return;
+		}
+		if (actual !== EXPECTED_DAEMON_VERSION) {
+			output?.appendLine(
+				`[yeet] daemon version mismatch: extension expects ${EXPECTED_DAEMON_VERSION}, daemon reports ${actual}`,
+			);
+			void vscode.window.showWarningMessage(
+				`Yeet daemon version mismatch: extension v${EXPECTED_DAEMON_VERSION}, daemon v${actual}. `
+					+ `Sync may misbehave on protocol-level changes. `
+					+ `Rebuild the daemon (cargo build --release) or clear `
+					+ `the yeet.daemonPath setting to use the bundled binary.`,
+			);
+		} else {
+			output?.appendLine(`[yeet] daemon version ${actual} matches extension`);
+		}
+	}
+
 	// Scrape stdout for the daemon's `yeet-auth-token: <hex>` line so
-	// we don't have to read `<root>/.yeet/auth-token` ourselves. The
-	// daemon emits this exactly once during bootstrap; subsequent
-	// stdout content is normal log output. We also copy everything to
-	// the output channel so the user sees it.
+	// we don't have to read `<root>/.yeet/auth-token` ourselves, and for
+	// the startup version banner (see `checkDaemonVersion`). Both live
+	// on stdout: `tracing`'s default formatter writes there, and only
+	// genuine `warn!`/`error!` records go to stderr. The daemon emits
+	// the token line exactly once during bootstrap; subsequent stdout
+	// content is normal log output. We also copy everything to the
+	// output channel so the user sees it.
 	let stdoutCarry = "";
 	child.stdout?.on("data", (chunk: Buffer) => {
 		const text = chunk.toString("utf8");
@@ -540,7 +610,11 @@ async function startDaemonInner(): Promise<void> {
 		}
 		const lines = stdoutCarry.slice(0, newlineIdx).split("\n");
 		stdoutCarry = stdoutCarry.slice(newlineIdx + 1);
-		for (const line of lines) {
+		for (const rawLine of lines) {
+			// Strip ANSI color escapes before matching either regex
+			// below — see `checkDaemonVersion` for why they'd otherwise
+			// hide the version banner from its match.
+			const line = rawLine.replace(/\x1b\[[0-9;]*m/g, "");
 			const match = line.match(/^yeet-auth-token:\s*([0-9a-fA-F]+)\s*$/);
 			if (match !== null) {
 				const token = match[1];
@@ -557,6 +631,7 @@ async function startDaemonInner(): Promise<void> {
 					}
 				}
 			}
+			checkDaemonVersion(line);
 		}
 	});
 	child.stderr?.on("data", (chunk: Buffer) => {
@@ -572,36 +647,6 @@ async function startDaemonInner(): Promise<void> {
 			stderrBuf.push(line);
 			if (stderrBuf.length > 20) {
 				stderrBuf.shift();
-			}
-			// Sniff the daemon's startup version banner exactly once and
-			// surface a non-modal warning if it doesn't match what this
-			// extension was built against. Tolerates ANSI color escapes
-			// (tracing emits them on TTYs; pipes typically suppress them
-			// but RUST_LOG_STYLE=always overrides). The regex matches the
-			// quoted version inside `yeet-daemon starting version="x.y.z"`.
-			if (!daemonVersionChecked) {
-				const versionMatch = line.match(
-					/yeet-daemon starting.*version="([^"]+)"/,
-				);
-				if (versionMatch !== null) {
-					daemonVersionChecked = true;
-					const actual = versionMatch[1];
-					if (actual !== undefined && actual !== EXPECTED_DAEMON_VERSION) {
-						output?.appendLine(
-							`[yeet] daemon version mismatch: extension expects ${EXPECTED_DAEMON_VERSION}, daemon reports ${actual}`,
-						);
-						void vscode.window.showWarningMessage(
-							`Yeet daemon version mismatch: extension v${EXPECTED_DAEMON_VERSION}, daemon v${actual}. `
-								+ `Sync may misbehave on protocol-level changes. `
-								+ `Rebuild the daemon (cargo build --release) or clear `
-								+ `the yeet.daemonPath setting to use the bundled binary.`,
-						);
-					} else if (actual === EXPECTED_DAEMON_VERSION) {
-						output?.appendLine(
-							`[yeet] daemon version ${actual} matches extension`,
-						);
-					}
-				}
 			}
 		}
 	});
@@ -620,6 +665,20 @@ async function startDaemonInner(): Promise<void> {
 		// SIGTERM means we asked it to stop; anything else is unexpected.
 		const clean = code === 0 || signal === "SIGTERM";
 		setStatus(clean ? "stopped" : "crashed");
+
+		// Crash path: the clean-stop path (`killDaemon`) already
+		// disposes `channel` before signaling the child, so by the time
+		// a clean exit reaches here `channel` is already undefined and
+		// this is a no-op. An unexpected exit skips that teardown, so
+		// without this the control channel is left connected (or
+		// reconnecting) against a daemon that's gone — dispose it now
+		// so a subsequent `Yeet: Start` doesn't inherit an orphaned
+		// channel racing the fresh one for the daemon's single-slot
+		// extension connection.
+		if (!clean && channel !== undefined) {
+			channel.dispose();
+			channel = undefined;
+		}
 
 		// If the daemon died within ~2s of spawn AND we asked it to run
 		// (not a SIGTERM from killDaemon), surface a modal with the

@@ -64,11 +64,14 @@ export type Untracked = {
 	studio_content: string,
 }
 
+-- `untracked` is deliberately NOT part of the build result: it is discovered
+-- read-only via `TreeBuilder.findUntracked`, which the caller runs OUTSIDE the
+-- ChangeHistoryService recording so its yields don't hold the recording open
+-- across frames (M9).
 export type BuildResult = {
 	fileToInstance: { [string]: Instance },
 	mappings: Mappings,
 	divergent: { Divergent },
-	untracked: { Untracked },
 }
 
 local function classFor(kind: ScriptKind): string
@@ -266,14 +269,34 @@ local function bestMapping(snap: FileSnapshot, mappings: Mappings): (string?, In
 	return bestKey, bestInst
 end
 
+-- Honors a nested-project `$path` mount whose package module maps directly onto
+-- the mapping Instance itself (AUDITORIA-YEET.md A10 `wally-1`): a Wally package
+-- `default.project.json` (`{name, tree:{$path:"src"}}`) makes the package folder
+-- THE ModuleScript. When the mapped Instance is already a `LuaSourceContainer`
+-- we set its `Source` (reporting a divergence rather than clobbering, exactly as
+-- the leaf path does). A `Folder`/service mount can't be re-classed here, so it
+-- returns nil and the snapshot is dropped — unchanged from before A10.
+local function materializeAtMount(parent: Instance, snap: FileSnapshot): (Instance?, string?)
+	if not parent:IsA("LuaSourceContainer") then
+		return nil, nil
+	end
+	local existingSource = (parent :: LuaSourceContainer).Source
+	if existingSource ~= snap.content then
+		return parent, existingSource
+	end
+	;(parent :: LuaSourceContainer).Source = snap.content
+	return parent, nil
+end
+
 -- Materializes a single file snapshot as an Instance in the tree, returning the
 -- resulting Script-ish Instance and the `Source` that was present before we
 -- touched it (nil when the instance was fresh). Intermediate directory
 -- components become Folders, except those promoted by an `init.[ext]` sibling
--- to a Script of the matching kind. Returns nil + nil when the file falls
--- outside every `$path` mapping or when the path shape isn't representable
--- (e.g. an `init.luau` directly at a mount point — there is no parent
--- directory to promote).
+-- to a Script of the matching kind. A file landing directly on a `$path` mount
+-- whose Instance is already a script sets that Instance's Source in place
+-- (nested-project package mount, A10). Returns nil + nil when the file falls
+-- outside every `$path` mapping or lands on a mount that is a Folder/service
+-- (which can't be re-classed here).
 local function materializeFile(
 	snap: FileSnapshot,
 	mappings: Mappings
@@ -285,9 +308,10 @@ local function materializeFile(
 	local relPath = if snap.path == mapPath then "" else snap.path:sub(#mapPath + 2)
 	local parts = splitPath(relPath)
 	if #parts == 0 then
-		-- `$path` pointing directly at a single file: the Instance at this
-		-- node *is* the script. Out of scope for Phase 1.
-		return nil, nil
+		-- `$path` pointing directly at a single file/module: the Instance at
+		-- this node *is* the script (a nested-project package folder that
+		-- became the ModuleScript, A10). Honor it in place when it's a script.
+		return materializeAtMount(parent, snap)
 	end
 
 	local fileName = parts[#parts]
@@ -296,10 +320,11 @@ local function materializeFile(
 	if promotedKind ~= nil then
 		-- `init.[ext]` promotes its parent directory into a script of
 		-- `promotedKind`. With only one component (the init file itself) the
-		-- mapping root would be the target — services / `$path` mounts can't
-		-- be re-classed, so we drop the snapshot.
+		-- package module maps onto the mapping Instance itself — a nested-project
+		-- mount (A10). Promote in place when it's already a script; a
+		-- service / Folder `$path` mount can't be re-classed, so it still drops.
 		if #parts < 2 then
-			return nil, nil
+			return materializeAtMount(parent, snap)
 		end
 		local container: Instance = parent
 		for i = 1, #parts - 2 do
@@ -388,25 +413,45 @@ end
 -- These are "created in Studio while the daemon was off" scripts; without
 -- reporting them the bulk sync preview only sees disk-side files and the
 -- user's new `SystemTest` (or whatever) stays invisible.
-local function findUntracked(
+--
+-- Read-only. The bootstrap caller runs this OUTSIDE its ChangeHistoryService
+-- recording (M9) so the yields below never hold a recording open across
+-- frames. Yields every YIELD_EVERY descendants — the same cadence as
+-- `discover` — so a place with thousands of instances doesn't freeze the main
+-- thread while the daemon is being bootstrapped.
+function TreeBuilder.findUntracked(
 	mappings: Mappings,
 	fileToInstance: { [string]: Instance }
 ): { Untracked }
 	local out: { Untracked } = {}
+	local YIELD_EVERY = 200
+	local processed = 0
 	for mapPath, parent in pairs(mappings) do
 		for _, desc in parent:GetDescendants() do
+			processed += 1
+			if processed % YIELD_EVERY == 0 then
+				task.wait()
+			end
 			if not desc:IsA("LuaSourceContainer") then
 				continue
 			end
-			-- Chain from parent's direct child down to `desc`.
+			-- Chain from parent's direct child down to `desc`: append leaf→root
+			-- then reverse in place (was O(depth^2) via insert-at-1; A11).
 			local chain: { string } = {}
 			local cursor: Instance? = desc
 			while cursor ~= nil and cursor ~= parent do
-				table.insert(chain, 1, cursor.Name)
+				table.insert(chain, cursor.Name)
 				cursor = cursor.Parent
 			end
 			if cursor ~= parent or #chain == 0 then
 				continue
+			end
+			local left = 1
+			local right = #chain
+			while left < right do
+				chain[left], chain[right] = chain[right], chain[left]
+				left += 1
+				right -= 1
 			end
 			local leafName, kind, promote = fileNameFor(desc)
 			if promote then
@@ -475,12 +520,10 @@ function TreeBuilder.build(project: Project, snapshots: { FileSnapshot }): Build
 			end
 		end
 	end
-	local untracked = findUntracked(mappings, fileToInstance)
 	return {
 		fileToInstance = fileToInstance,
 		mappings = mappings,
 		divergent = divergent,
-		untracked = untracked,
 	}
 end
 
@@ -498,14 +541,28 @@ local function computePath(
 	if not desc:IsA("LuaSourceContainer") then
 		return nil, nil
 	end
+	-- Collect names leaf→root by appending (O(1) each) and reverse in place.
+	-- The old `table.insert(chain, 1, ...)` shifted the whole array on every
+	-- ancestor, so a deep instance was O(depth^2); when a large moved/deleted
+	-- subtree drives this once per descendant that quadratic dominates (A11).
+	-- REGRESSION(A11): the reversed chain is byte-identical to what the old
+	-- prepend produced — root first, `desc` last — so the emitted path is
+	-- unchanged.
 	local chain: { string } = {}
 	local cursor: Instance? = desc
 	while cursor ~= nil and cursor ~= mapParent do
-		table.insert(chain, 1, cursor.Name)
+		table.insert(chain, cursor.Name)
 		cursor = cursor.Parent
 	end
 	if cursor ~= mapParent or #chain == 0 then
 		return nil, nil
+	end
+	local left = 1
+	local right = #chain
+	while left < right do
+		chain[left], chain[right] = chain[right], chain[left]
+		left += 1
+		right -= 1
 	end
 	local leafName, kind, promote = fileNameFor(desc)
 	if promote then

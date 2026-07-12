@@ -269,6 +269,22 @@ pub enum ClientMsg {
     /// stack noticed yet". Carrying a sequence number lets the plugin
     /// detect out-of-order or duplicated pongs in chaotic conditions.
     Ping { seq: u64 },
+    /// Apply-ACK (AUDITORIA-YEET.md A4 / M14 `resil-2`): the plugin confirms it
+    /// SUCCESSFULLY applied a daemon-pushed `FileChanged`/`FileCreated`/
+    /// `FileDeleted` to the Studio `DataModel`. The daemon only advances
+    /// `tree_base`/`tree_studio` for the Studio direction once this arrives —
+    /// before the ACK it merely holds the change in `pending_applies`. `sha256`
+    /// echoes the sha of the applied content so a stale ACK (for a push that
+    /// has since been superseded) fails the match and is ignored; for a delete
+    /// the plugin sends the empty string (there is no content to hash).
+    FileApplied { path: String, sha256: String },
+    /// Apply-NAK (A4): the plugin could NOT apply a daemon-pushed change —
+    /// `TryBeginRecording` returned nil (user dragging a handle / another
+    /// recording open) or the target instance could not be resolved. The
+    /// daemon drops the pending apply and surfaces a `SyncError` for the path;
+    /// `tree_base` is deliberately left at the old value so the next reconcile
+    /// re-detects the divergence instead of silently believing Studio synced.
+    FileApplyFailed { path: String, reason: String },
 }
 
 /// One row in the preview dock: a path that currently differs between
