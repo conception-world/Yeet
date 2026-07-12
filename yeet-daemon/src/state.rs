@@ -164,11 +164,17 @@ pub struct ProjectState {
     /// by the studio-side mutation handlers to reject incoming `FileChanged`
     /// / `FileRenamed` with `SyncErrorKind::NameCollisionPending`.
     pub pending_collisions: HashSet<String>,
-    /// Recently observed filesystem removes, indexed by `sha256` of the
-    /// content that disappeared. When a `Touched` event later carries the
-    /// same hash, the pair is promoted to a `FileRenamed` instead of a
-    /// destructive Delete+Create — preserves Studio-side state
-    /// (attributes, tags, non-script children) across IDE-side renames.
+    /// Recently observed filesystem removes, indexed by **path** (not by
+    /// `sha256` of the content — see AUDITORIA-YEET.md finding A1). Keying
+    /// by content hash let two same-content deletes clobber each other's
+    /// entry (losing one deletion) and let unrelated delete+create pairs
+    /// of identical content pair up as a false rename. Each removal now
+    /// owns its own slot and reconciles independently by its own path.
+    /// When a `Touched` event later carries a matching `entry.sha256`
+    /// (subject to the watcher-4 / move-2 guards in `handle_fs_event`),
+    /// the pair is promoted to a `FileRenamed` instead of a destructive
+    /// Delete+Create — preserves Studio-side state (attributes, tags,
+    /// non-script children) across IDE-side renames.
     pub fs_removed_pending: HashMap<String, FsRemovedPending>,
 }
 

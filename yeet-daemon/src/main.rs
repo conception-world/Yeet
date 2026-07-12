@@ -496,8 +496,43 @@ async fn handle_fs_event(
             // never trip it, but tight enough that the Modify(From) +
             // Modify(To) pair the OS emits for a rename always lands
             // inside it.
-            if let Some(pending) = guard.fs_removed_pending.remove(&sha) {
-                let old_path = pending.path.clone();
+            //
+            // `fs_removed_pending` is keyed by path now (AUDITORIA-YEET.md
+            // A1), so pairing means scanning for an entry whose content
+            // sha matches — guarded by two checks before it's promoted to
+            // a rename:
+            //   - watcher-4: only pair when `rel` (the new path) was NOT
+            //     already a tracked file (`prev_hash.is_none()`). If it
+            //     was, this Touched is an edit of a pre-existing file, not
+            //     a rename target — pairing would clobber its identity
+            //     (attributes/tags) with the deleted file's.
+            //   - move-2: never pair a removed entry with empty content.
+            //     Unrelated delete+create of empty stub files must stay
+            //     an independent delete+create, not leak the deleted
+            //     file's meta_attributes onto an unrelated new file.
+            // When several pending entries share the sha, prefer the one
+            // whose basename (file stem) matches the new path, else the
+            // oldest by `since`.
+            let rename_pick = if prev_hash.is_none() {
+                let new_stem = Path::new(&rel).file_stem().and_then(|s| s.to_str());
+                guard
+                    .fs_removed_pending
+                    .values()
+                    .filter(|p| p.entry.sha256 == sha && !p.entry.content.is_empty())
+                    .min_by_key(|p| {
+                        let same_stem =
+                            Path::new(&p.path).file_stem().and_then(|s| s.to_str()) == new_stem;
+                        (!same_stem, p.since)
+                    })
+                    .map(|p| p.path.clone())
+            } else {
+                None
+            };
+            if let Some(old_path) = rename_pick {
+                let pending = guard
+                    .fs_removed_pending
+                    .remove(&old_path)
+                    .expect("rename_pick was just read from fs_removed_pending");
                 let new_path = rel.clone();
                 let kind_resolved = pending.entry.kind; // preserve the original kind, matches `kind` here too
                 let _ = kind_resolved;
@@ -596,7 +631,7 @@ async fn handle_fs_event(
                 }
             }
             // Capture the entry BEFORE forgetting it so a later Touched
-            // with the same sha can promote the pair to a FileRenamed.
+            // with a matching sha can promote the pair to a FileRenamed.
             let rel = match guard.relative(&abs) {
                 Some(r) => r,
                 None => {
@@ -609,11 +644,14 @@ async fn handle_fs_event(
                 return Ok(());
             };
             let entry_meta = guard.meta_for(&rel);
-            let sha = entry.sha256.clone();
             guard.tree_fs.remove(&rel);
             guard.meta.remove(&rel);
+            // Keyed by path (AUDITORIA-YEET.md A1) — every removal gets its
+            // own slot, so two same-content deletes in the same window can
+            // no longer clobber each other. `entry.sha256` is what a later
+            // Touched matches against for rename pairing.
             guard.fs_removed_pending.insert(
-                sha.clone(),
+                rel.clone(),
                 FsRemovedPending {
                     path: rel.clone(),
                     entry,
@@ -625,17 +663,18 @@ async fn handle_fs_event(
             // Defer the actual reconcile (which would emit FileDeleted to
             // Studio + drop the tree_base entry) until the pairing window
             // expires. If a matching Touched lands inside the window, it
-            // consumes `fs_removed_pending[sha]` and the rename is emitted
-            // as a single `FileRenamed` instead.
+            // consumes `fs_removed_pending[rel]` and the rename is emitted
+            // as a single `FileRenamed` instead. Removing by its own path
+            // means this reconcile is independent of any other pending
+            // removal, even one with identical content.
             let state2 = state.clone();
             let bcast_tx2 = bcast_tx.clone();
-            let sha2 = sha.clone();
             let rel2 = rel.clone();
             tokio::spawn(async move {
                 tokio::time::sleep(FS_RENAME_PAIR_TTL).await;
                 let still_pending = {
                     let mut guard = state2.write().await;
-                    guard.fs_removed_pending.remove(&sha2).is_some()
+                    guard.fs_removed_pending.remove(&rel2).is_some()
                 };
                 if still_pending {
                     if let Err(e) = reconcile_path(&state2, &rel2, &bcast_tx2).await {
@@ -5875,5 +5914,276 @@ mod bulk_tests {
             "ide_keeps",
             "KeepIde should overwrite tree_studio"
         );
+    }
+}
+
+#[cfg(test)]
+mod fs_removed_pending_tests {
+    //! Direct tests of `handle_fs_event`'s `fs_removed_pending` flow — the
+    //! fix for AUDITORIA-YEET.md A1 (plus the move-2 and watcher-4 guards).
+    //! Mirrors the `bulk_tests` harness style: tempdir-backed project,
+    //! bootstrap, fire raw `FileEvent`s, inspect broadcasts + tree state.
+
+    use super::{handle_fs_event, FS_RENAME_PAIR_TTL};
+    use std::sync::Arc;
+    use std::time::Duration;
+    use tokio::sync::{broadcast, RwLock};
+    use yeet_daemon::project::Project;
+    use yeet_daemon::protocol::ServerMsg;
+    use yeet_daemon::state::{ProjectState, SharedState};
+    use yeet_daemon::watcher::FileEvent;
+
+    /// A test environment: temp project root, daemon state, broadcast bus.
+    /// Drop order matters — `_root` must outlive `state` (which holds paths
+    /// relative to it), so the tempdir guard is the last field.
+    struct Env {
+        state: SharedState,
+        bcast_tx: broadcast::Sender<Arc<ServerMsg>>,
+        _root: tempfile::TempDir,
+    }
+
+    /// Builds a project with a single `src` mount under `ServerScriptService`,
+    /// writes `disk_files` to disk so `rescan_fs` ingests them, and
+    /// bootstraps `ProjectState`. `bootstrap` alone leaves `tree_studio`
+    /// empty (it only fills in once the plugin reports a snapshot), so this
+    /// also seeds `tree_studio` from `tree_fs` to model an already-synced
+    /// project — matching the audit's repro, which starts from files
+    /// already synced to Studio.
+    async fn make_env(disk_files: &[(&str, &str)]) -> Env {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let root = dir.path();
+        let project_json = r#"{
+            "name": "FsRemovedPendingTest",
+            "tree": {
+                "$className": "DataModel",
+                "ServerScriptService": {
+                    "$className": "ServerScriptService",
+                    "$path": "src"
+                }
+            }
+        }"#;
+        std::fs::write(root.join("default.project.json"), project_json).expect("write project");
+        std::fs::create_dir(root.join("src")).expect("mkdir src");
+        for (rel, content) in disk_files {
+            let abs = root.join(rel);
+            if let Some(p) = abs.parent() {
+                std::fs::create_dir_all(p).expect("mkdir -p");
+            }
+            std::fs::write(&abs, content).expect("write file");
+        }
+        let project = Project::load(&root.join("default.project.json")).expect("load project");
+        let state_inner =
+            ProjectState::bootstrap(root, project, false, false).expect("bootstrap");
+        let state: SharedState = Arc::new(RwLock::new(state_inner));
+        {
+            let mut guard = state.write().await;
+            guard.tree_studio = guard.tree_fs.clone();
+        }
+        let (bcast_tx, _) = broadcast::channel(64);
+        Env {
+            state,
+            bcast_tx,
+            _root: dir,
+        }
+    }
+
+    fn root_of(env: &Env) -> std::path::PathBuf {
+        env._root.path().to_path_buf()
+    }
+
+    /// Drains everything currently in `rx` with a short timeout. Tests use
+    /// this after triggering fs events to inspect what got broadcast.
+    async fn drain(rx: &mut broadcast::Receiver<Arc<ServerMsg>>) -> Vec<ServerMsg> {
+        let mut out = Vec::new();
+        loop {
+            match tokio::time::timeout(Duration::from_millis(20), rx.recv()).await {
+                Ok(Ok(m)) => out.push((*m).clone()),
+                _ => break,
+            }
+        }
+        out
+    }
+
+    /// Sleeps past the rename-pairing TTL so any deferred reconcile task
+    /// spawned by a `Removed` event (see `handle_fs_event`) has run.
+    async fn wait_out_pairing_window() {
+        tokio::time::sleep(FS_RENAME_PAIR_TTL + Duration::from_millis(400)).await;
+    }
+
+    // ─── A1 core: two same-content deletes must NOT clobber each other ───
+
+    #[tokio::test]
+    async fn two_identical_content_deletes_within_window_both_propagate() {
+        let env = make_env(&[("src/A.luau", "return {}"), ("src/B.luau", "return {}")]).await;
+        let mut rx = env.bcast_tx.subscribe();
+        let root = root_of(&env);
+
+        std::fs::remove_file(root.join("src/A.luau")).expect("rm A");
+        handle_fs_event(
+            &env.state,
+            FileEvent::Removed(root.join("src/A.luau")),
+            &env.bcast_tx,
+        )
+        .await
+        .expect("handle removed A");
+        std::fs::remove_file(root.join("src/B.luau")).expect("rm B");
+        handle_fs_event(
+            &env.state,
+            FileEvent::Removed(root.join("src/B.luau")),
+            &env.bcast_tx,
+        )
+        .await
+        .expect("handle removed B");
+
+        wait_out_pairing_window().await;
+        let msgs = drain(&mut rx).await;
+
+        let deleted_a = msgs
+            .iter()
+            .any(|m| matches!(m, ServerMsg::FileDeleted { path } if path == "src/A.luau"));
+        let deleted_b = msgs
+            .iter()
+            .any(|m| matches!(m, ServerMsg::FileDeleted { path } if path == "src/B.luau"));
+        assert!(deleted_a, "expected FileDeleted for A; got {msgs:?}");
+        assert!(
+            deleted_b,
+            "expected FileDeleted for B too (lost under sha-keying); got {msgs:?}"
+        );
+
+        let guard = env.state.read().await;
+        assert!(
+            !guard.tree_base.contains_key("src/A.luau"),
+            "A must not linger as a phantom in tree_base"
+        );
+        assert!(
+            !guard.tree_base.contains_key("src/B.luau"),
+            "B must not linger as a phantom in tree_base"
+        );
+        assert!(!guard.tree_studio.contains_key("src/A.luau"));
+        assert!(!guard.tree_studio.contains_key("src/B.luau"));
+    }
+
+    // ─── watcher-4: Touched on a PRE-EXISTING file must not pair ─────────
+
+    #[tokio::test]
+    async fn remove_a_then_touch_preexisting_b_with_as_content_is_not_a_rename() {
+        let env = make_env(&[
+            ("src/A.luau", "local A = 1\nreturn A\n"),
+            ("src/B.luau", "local B = 2\nreturn B\n"),
+        ])
+        .await;
+        let mut rx = env.bcast_tx.subscribe();
+        let root = root_of(&env);
+
+        std::fs::remove_file(root.join("src/A.luau")).expect("rm A");
+        handle_fs_event(
+            &env.state,
+            FileEvent::Removed(root.join("src/A.luau")),
+            &env.bcast_tx,
+        )
+        .await
+        .expect("handle removed A");
+
+        // Overwrite pre-existing B with A's old content within the window.
+        std::fs::write(root.join("src/B.luau"), "local A = 1\nreturn A\n").expect("overwrite B");
+        handle_fs_event(
+            &env.state,
+            FileEvent::Touched(root.join("src/B.luau")),
+            &env.bcast_tx,
+        )
+        .await
+        .expect("handle touched B");
+
+        wait_out_pairing_window().await;
+        let msgs = drain(&mut rx).await;
+
+        let renamed = msgs
+            .iter()
+            .any(|m| matches!(m, ServerMsg::FileRenamed { .. }));
+        assert!(
+            !renamed,
+            "must NOT pair as a rename when B pre-existed; got {msgs:?}"
+        );
+
+        let deleted_a = msgs
+            .iter()
+            .any(|m| matches!(m, ServerMsg::FileDeleted { path } if path == "src/A.luau"));
+        assert!(
+            deleted_a,
+            "expected an independent FileDeleted for A; got {msgs:?}"
+        );
+
+        let changed_b = msgs.iter().any(|m| {
+            matches!(m, ServerMsg::FileChanged { path, content, .. }
+                if path == "src/B.luau" && content == "local A = 1\nreturn A\n")
+        });
+        assert!(
+            changed_b,
+            "expected a normal FileChanged for B; got {msgs:?}"
+        );
+
+        let guard = env.state.read().await;
+        assert_eq!(
+            guard
+                .tree_studio
+                .get("src/B.luau")
+                .map(|e| e.content.as_str()),
+            Some("local A = 1\nreturn A\n"),
+            "B's identity must be its own, not clobbered by A's rename"
+        );
+    }
+
+    // ─── Regression: a genuine single rename must still pair ─────────────
+
+    #[tokio::test]
+    async fn single_rename_still_pairs_as_filerenamed() {
+        let env = make_env(&[("src/Old.luau", "hello")]).await;
+        let mut rx = env.bcast_tx.subscribe();
+        let root = root_of(&env);
+
+        std::fs::remove_file(root.join("src/Old.luau")).expect("rm Old");
+        handle_fs_event(
+            &env.state,
+            FileEvent::Removed(root.join("src/Old.luau")),
+            &env.bcast_tx,
+        )
+        .await
+        .expect("handle removed Old");
+
+        std::fs::write(root.join("src/New.luau"), "hello").expect("write New");
+        handle_fs_event(
+            &env.state,
+            FileEvent::Touched(root.join("src/New.luau")),
+            &env.bcast_tx,
+        )
+        .await
+        .expect("handle touched New");
+
+        wait_out_pairing_window().await;
+        let msgs = drain(&mut rx).await;
+
+        let renames: Vec<_> = msgs
+            .iter()
+            .filter(|m| {
+                matches!(m, ServerMsg::FileRenamed { old_path, new_path, .. }
+                    if old_path == "src/Old.luau" && new_path == "src/New.luau")
+            })
+            .collect();
+        assert_eq!(
+            renames.len(),
+            1,
+            "expected exactly one FileRenamed; got {msgs:?}"
+        );
+
+        let stray_delete = msgs
+            .iter()
+            .any(|m| matches!(m, ServerMsg::FileDeleted { path } if path == "src/Old.luau"));
+        assert!(
+            !stray_delete,
+            "rename must not ALSO emit a stray FileDeleted; got {msgs:?}"
+        );
+
+        let guard = env.state.read().await;
+        assert!(!guard.fs_removed_pending.contains_key("src/Old.luau"));
     }
 }
