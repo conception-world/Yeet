@@ -286,6 +286,11 @@ async fn main() -> Result<()> {
     let sessions: Arc<Mutex<SyncbackSessions>> = Arc::new(Mutex::new(SyncbackSessions::default()));
 
     let bind_addr = args.bind.as_deref().unwrap_or(BIND_ADDR);
+    // When bound to loopback (the default), enforce a loopback `Host` header
+    // on the WS upgrade as extra anti-rebinding defence. A non-loopback bind
+    // (only reachable via `--allow-remote`) legitimately sees remote Hosts,
+    // so the check is disabled there.
+    let enforce_loopback_host = is_loopback_bind_addr(bind_addr);
     let listener = TcpListener::bind(bind_addr)
         .await
         .with_context(|| format!("bind {bind_addr}"))?;
@@ -298,7 +303,7 @@ async fn main() -> Result<()> {
     info!(addr = %actual_addr, "yeet-daemon listening");
 
     tokio::select! {
-        res = accept_loop(listener, state, sessions, bcast_tx) => res,
+        res = accept_loop(listener, state, sessions, bcast_tx, enforce_loopback_host) => res,
         res = tokio::signal::ctrl_c() => {
             res.context("install ctrl+c handler")?;
             info!("shutdown: ctrl+c received");
@@ -3194,6 +3199,7 @@ async fn accept_loop(
     state: SharedState,
     sessions: Arc<Mutex<SyncbackSessions>>,
     bcast_tx: broadcast::Sender<Arc<ServerMsg>>,
+    enforce_loopback_host: bool,
 ) -> Result<()> {
     // Counter of currently-open WebSocket connections. Bounded by
     // `MAX_CONCURRENT_CONNECTIONS` to prevent a malicious local client
@@ -3241,11 +3247,95 @@ async fn accept_loop(
             // `guard` lives for the lifetime of this task; the counter
             // is decremented on every exit path via Drop.
             let _guard = guard;
-            if let Err(e) = handle_connection(stream, peer, state, sessions, bcast_tx).await {
+            if let Err(e) =
+                handle_connection(stream, peer, state, sessions, bcast_tx, enforce_loopback_host)
+                    .await
+            {
                 error!(%peer, error = ?e, "connection closed with error");
             }
         });
     }
+}
+
+/// Strips the `:port` (or `]:port` for a bracketed IPv6 literal) from a
+/// `host[:port]` authority, returning just the host. IPv6 literals keep their
+/// brackets so `host_is_loopback` can strip them uniformly.
+fn split_host(authority: &str) -> &str {
+    if let Some(close) = authority.find(']') {
+        // Bracketed IPv6 literal: the host is `[..]`; drop any trailing `:port`.
+        return &authority[..=close];
+    }
+    match authority.rsplit_once(':') {
+        Some((host, _port)) => host,
+        None => authority,
+    }
+}
+
+/// True iff `host` (no port; IPv6 may be bracketed) is a loopback host: the
+/// literal `localhost`, or an IP that parses into the loopback range
+/// (127.0.0.0/8 or ::1). Parsing as an IP is what defeats DNS-rebinding
+/// look-alikes — `127.0.0.1.evil.com` and `localhost.evil.com` are neither
+/// `localhost` nor a valid loopback IP, so they fail.
+fn host_is_loopback(host: &str) -> bool {
+    if host.eq_ignore_ascii_case("localhost") {
+        return true;
+    }
+    let bare = host
+        .strip_prefix('[')
+        .and_then(|s| s.strip_suffix(']'))
+        .unwrap_or(host);
+    bare.parse::<std::net::IpAddr>()
+        .map(|ip| ip.is_loopback())
+        .unwrap_or(false)
+}
+
+/// Origin allowlist for the WS upgrade (AUDITORIA-YEET.md M24). An absent /
+/// empty / `null` Origin passes — native clients (the Studio plugin) send no
+/// browser Origin. A present http(s) Origin passes ONLY when its host is an
+/// exact loopback host; every other http(s) Origin (any routable or look-alike
+/// host, e.g. `localhost.evil.com`) is rejected. A non-http(s) Origin
+/// (`file://`, an app scheme) passes — it is not a browser page on a routable
+/// host. The old code used `host.starts_with("localhost")`/`"127."`, which
+/// accepted rebinding look-alikes.
+fn origin_is_allowed(origin: &str) -> bool {
+    let origin = origin.trim();
+    if origin.is_empty() || origin.eq_ignore_ascii_case("null") {
+        return true;
+    }
+    let lower = origin.to_ascii_lowercase();
+    let rest = match lower
+        .strip_prefix("http://")
+        .or_else(|| lower.strip_prefix("https://"))
+    {
+        Some(rest) => rest,
+        None => return true,
+    };
+    let authority = rest
+        .split(|c| c == '/' || c == '?' || c == '#')
+        .next()
+        .unwrap_or("");
+    // Drop any userinfo (`user:pass@host`).
+    let hostport = authority.rsplit('@').next().unwrap_or(authority);
+    host_is_loopback(split_host(hostport))
+}
+
+/// Validates the WS upgrade `Host` header is loopback — defence against a
+/// DNS-rebound name reaching a loopback-bound daemon. An absent/empty Host
+/// passes (the Origin check is the primary gate and an absent Host is not a
+/// rebinding vector). Only enforced when the daemon is bound to loopback;
+/// `--allow-remote` deliberately opts out.
+fn host_header_is_loopback(host: Option<&str>) -> bool {
+    match host.map(str::trim) {
+        None | Some("") => true,
+        Some(h) => host_is_loopback(split_host(h)),
+    }
+}
+
+/// True iff a `--bind` address targets a loopback interface only. Gates the
+/// `--allow-remote` requirement (B13) and decides whether the loopback `Host`
+/// header check (M24) is enforced.
+fn is_loopback_bind_addr(addr: &str) -> bool {
+    host_is_loopback(split_host(addr.trim()))
 }
 
 async fn handle_connection(
@@ -3254,6 +3344,7 @@ async fn handle_connection(
     state: SharedState,
     sessions: Arc<Mutex<SyncbackSessions>>,
     bcast_tx: broadcast::Sender<Arc<ServerMsg>>,
+    enforce_loopback_host: bool,
 ) -> Result<()> {
     // Pin the frame/message cap explicitly. `WS_MAX_FRAME_BYTES` is set
     // tighter than tungstenite's defaults to bound peak attacker-
@@ -3266,60 +3357,45 @@ async fn handle_connection(
         max_message_size: Some(WS_MAX_MESSAGE_BYTES),
         ..WebSocketConfig::default()
     };
-    // Origin header allowlist. Browsers ALWAYS attach `Origin: <page>`
-    // when opening a WebSocket; the assumption was that a native
-    // client (Roblox Studio's HttpService, Node's `ws`, curl, custom
-    // CLI tools) wouldn't. In practice Studio DOES send an Origin
-    // header on its WebStreamClient — exact value depends on Studio
-    // build — so a blanket "reject any Origin" was too aggressive
-    // and broke the very plugin we're trying to authenticate.
+    // Origin header allowlist. Browsers ALWAYS attach `Origin: <page>` when
+    // opening a WebSocket; native clients (Roblox Studio's WebStreamClient,
+    // the extension, curl) send either no Origin, `null`, or a non-http(s)
+    // scheme — all of which pass. A present http(s) Origin passes ONLY when
+    // its host is an EXACT loopback host (`origin_is_allowed`): the realistic
+    // DNS-rebinding attack lands on a rebound name like `localhost.evil.com`
+    // whose Origin host is not loopback, so it is rejected. The old code
+    // matched hosts by prefix (`starts_with("localhost")`), which let
+    // `localhost.evil.com` through.
     //
-    // The narrower rule: reject ONLY origins that are unambiguously
-    // browser pages on a public HTTP(S) host. `loopback.localhost`,
-    // `127.0.0.1`, IPv6 loopback, and `null` (file:// origins,
-    // sandboxed iframes, Studio's plugin scheme) all PASS. The
-    // realistic browser-driven attack (random web page on the
-    // internet hijacking the daemon via DNS rebinding) lands on a
-    // rebound name like `evil.com` resolving to 127.0.0.1, where
-    // the page's Origin is still `https://evil.com` — that case is
-    // still rejected. Trade-off: a malicious local web page hosted
-    // at http://localhost can still connect, but anyone running an
-    // attacker-controlled localhost server already has process-level
-    // access to bypass the auth gate by other means.
-    let origin_check = |req: &Request, response: Response| -> Result<Response, ErrorResponse> {
-        let origin_header = req.headers().get("origin");
-        let origin_str = match origin_header {
-            Some(v) => v.to_str().unwrap_or(""),
-            None => "",
-        };
+    // When bound to loopback we additionally require the `Host` header to be
+    // loopback — a rebound name shows up there too. This is skipped under
+    // `--allow-remote`, where a non-loopback Host is expected.
+    let origin_check = move |req: &Request, response: Response| -> Result<Response, ErrorResponse> {
+        let origin_str = req
+            .headers()
+            .get("origin")
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or("");
         // Always log so future debugging has visibility into what
         // Studio / extensions / ad-hoc clients send.
         info!(origin = %origin_str, "ws upgrade origin");
-        if origin_str.is_empty() || origin_str == "null" {
-            return Ok(response);
-        }
-        // Strip scheme to look at the host part. We accept anything
-        // that doesn't look like an externally-routable HTTP(S) URL.
-        let lower = origin_str.to_ascii_lowercase();
-        let host_part = lower
-            .strip_prefix("http://")
-            .or_else(|| lower.strip_prefix("https://"))
-            .unwrap_or(&lower);
-        let host = host_part.split('/').next().unwrap_or("");
-        let is_loopback = host.starts_with("localhost")
-            || host.starts_with("127.")
-            || host.starts_with("[::1]")
-            || host.starts_with("[::ffff:127.")
-            || host.starts_with("0.0.0.0");
-        let is_http_scheme =
-            lower.starts_with("http://") || lower.starts_with("https://");
-        if is_http_scheme && !is_loopback {
-            let body = format!(
-                "yeet-daemon: refusing remote-host browser origin ({origin_str})"
-            );
+        if !origin_is_allowed(origin_str) {
+            let body = format!("yeet-daemon: refusing non-loopback browser origin ({origin_str})");
             let mut err = ErrorResponse::new(Some(body));
             *err.status_mut() = StatusCode::FORBIDDEN;
             return Err(err);
+        }
+        if enforce_loopback_host {
+            let host_hdr = req.headers().get("host").and_then(|v| v.to_str().ok());
+            if !host_header_is_loopback(host_hdr) {
+                let body = format!(
+                    "yeet-daemon: refusing non-loopback Host header ({})",
+                    host_hdr.unwrap_or("")
+                );
+                let mut err = ErrorResponse::new(Some(body));
+                *err.status_mut() = StatusCode::FORBIDDEN;
+                return Err(err);
+            }
         }
         Ok(response)
     };
@@ -6469,5 +6545,75 @@ mod security_tests {
         assert!(syncback_overwrite_ok(empty.path(), SyncbackMode::NewProject).is_ok());
         let missing = empty.path().join("does-not-exist-yet");
         assert!(syncback_overwrite_ok(&missing, SyncbackMode::NewProject).is_ok());
+    }
+
+    // ─── M24: Origin / Host exact-loopback matching (DNS rebinding) ───────
+    use super::{host_header_is_loopback, is_loopback_bind_addr, origin_is_allowed};
+
+    #[test]
+    fn origin_absent_or_non_browser_is_allowed() {
+        // The Studio plugin sends no browser Origin; these must all pass.
+        assert!(origin_is_allowed(""));
+        assert!(origin_is_allowed("null"));
+        assert!(origin_is_allowed("NULL"));
+        // Non-http(s) scheme (file://, app scheme) is not a routable browser
+        // page — passes.
+        assert!(origin_is_allowed("file://"));
+        assert!(origin_is_allowed("roblox-studio://plugin"));
+    }
+
+    #[test]
+    fn origin_exact_loopback_hosts_pass() {
+        for ok in [
+            "http://localhost",
+            "http://localhost:34872",
+            "https://localhost",
+            "http://127.0.0.1",
+            "http://127.0.0.1:34872",
+            "http://[::1]",
+            "http://[::1]:34872",
+            "http://user:pass@localhost:34872",
+        ] {
+            assert!(origin_is_allowed(ok), "should accept {ok}");
+        }
+    }
+
+    #[test]
+    fn origin_rebinding_lookalikes_are_rejected() {
+        // The M24 bug: `starts_with("localhost")` / `"127."` accepted these.
+        for bad in [
+            "http://localhost.evil.com",
+            "http://localhost.evil.com:34872",
+            "http://127.0.0.1.evil.com",
+            "http://localhostx",
+            "http://evil.com",
+            "https://evil.com:34872",
+            "http://0.0.0.0",
+            "http://169.254.0.1",
+        ] {
+            assert!(!origin_is_allowed(bad), "should reject {bad}");
+        }
+    }
+
+    #[test]
+    fn host_header_loopback_matching() {
+        assert!(host_header_is_loopback(None));
+        assert!(host_header_is_loopback(Some("")));
+        assert!(host_header_is_loopback(Some("127.0.0.1:34872")));
+        assert!(host_header_is_loopback(Some("localhost:34872")));
+        assert!(host_header_is_loopback(Some("[::1]:34872")));
+        assert!(!host_header_is_loopback(Some("localhost.evil.com:34872")));
+        assert!(!host_header_is_loopback(Some("evil.com")));
+        assert!(!host_header_is_loopback(Some("192.168.1.5:34872")));
+    }
+
+    #[test]
+    fn loopback_bind_addr_matching() {
+        assert!(is_loopback_bind_addr("127.0.0.1:34872"));
+        assert!(is_loopback_bind_addr("127.0.0.1:0"));
+        assert!(is_loopback_bind_addr("localhost:34872"));
+        assert!(is_loopback_bind_addr("[::1]:0"));
+        assert!(!is_loopback_bind_addr("0.0.0.0:34872"));
+        assert!(!is_loopback_bind_addr("192.168.1.5:34872"));
     }
 }
