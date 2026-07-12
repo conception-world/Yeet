@@ -174,7 +174,7 @@ pub fn materialize(session: SyncbackSession, total_seq: u32) -> Result<SyncbackS
     let root_ordered = order_children(&root_children, ctx.instances);
 
     let src_dir = session.opts.target_path.join("src");
-    std::fs::create_dir_all(&src_dir)
+    std::fs::create_dir_all(extended_path(&src_dir))
         .with_context(|| format!("mkdir {}", src_dir.display()))?;
 
     for service_id in root_ordered {
@@ -184,7 +184,7 @@ pub fn materialize(session: SyncbackSession, total_seq: u32) -> Result<SyncbackS
         }
         let sanitized = sanitize_name(&service.name);
         let service_dir = src_dir.join(&sanitized);
-        std::fs::create_dir_all(&service_dir)
+        std::fs::create_dir_all(extended_path(&service_dir))
             .with_context(|| format!("mkdir {}", service_dir.display()))?;
         if has_custom_props(service) {
             ctx.stats.warnings.push(format!(
@@ -406,7 +406,7 @@ fn write_instance(
         }
         (Some(kind), false) => {
             let dir_path = parent_dir.join(&name);
-            std::fs::create_dir_all(&dir_path)
+            std::fs::create_dir_all(extended_path(&dir_path))
                 .with_context(|| format!("mkdir {}", dir_path.display()))?;
             let init_name = format!("init{}.luau", script_suffix(kind));
             let init_path = dir_path.join(&init_name);
@@ -421,7 +421,7 @@ fn write_instance(
         }
         (None, has_no_children) => {
             let dir_path = parent_dir.join(&name);
-            std::fs::create_dir_all(&dir_path)
+            std::fs::create_dir_all(extended_path(&dir_path))
                 .with_context(|| format!("mkdir {}", dir_path.display()))?;
             let display_name = (inst.name != name).then(|| inst.name.clone());
             if has_custom_props(inst) || has_no_children || display_name.is_some() {
@@ -789,9 +789,44 @@ fn property_to_json(prop: &SerializedProperty) -> serde_json::Value {
 
 // ─── Atomic write ─────────────────────────────────────────────────────────
 
+/// On Windows, rewrites an absolute disk/UNC path to its extended-length
+/// `\\?\` verbatim form so `std::fs` (not long-path-aware by default) can
+/// create files and directories whose full path exceeds the legacy ~260-char
+/// MAX_PATH — routine under a deep OneDrive root (M23 / path-5). Verbatim
+/// paths disable normalization, so `/` is flipped to `\`. No-op for paths that
+/// are already verbatim, non-disk, or relative, and on non-Windows targets.
+#[cfg(windows)]
+fn extended_path(path: &Path) -> PathBuf {
+    use std::path::{Component, Prefix};
+    match path.components().next() {
+        Some(Component::Prefix(prefix)) => match prefix.kind() {
+            Prefix::VerbatimDisk(_) | Prefix::Verbatim(_) | Prefix::VerbatimUNC(_, _) => {
+                path.to_path_buf()
+            }
+            Prefix::Disk(_) => {
+                let s = path.to_string_lossy().replace('/', "\\");
+                PathBuf::from(format!(r"\\?\{s}"))
+            }
+            Prefix::UNC(_, _) => {
+                // \\server\share\… -> \\?\UNC\server\share\…
+                let s = path.to_string_lossy().replace('/', "\\");
+                PathBuf::from(format!(r"\\?\UNC\{}", s.trim_start_matches('\\')))
+            }
+            Prefix::DeviceNS(_) => path.to_path_buf(),
+        },
+        // Relative / rootless paths can't overflow on their own; leave them.
+        _ => path.to_path_buf(),
+    }
+}
+
+#[cfg(not(windows))]
+fn extended_path(path: &Path) -> PathBuf {
+    path.to_path_buf()
+}
+
 fn atomic_write(path: &Path, bytes: &[u8]) -> Result<()> {
     if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent)
+        std::fs::create_dir_all(extended_path(parent))
             .with_context(|| format!("mkdir {}", parent.display()))?;
     }
     let tmp = {
@@ -799,8 +834,9 @@ fn atomic_write(path: &Path, bytes: &[u8]) -> Result<()> {
         os.push(".tmp");
         PathBuf::from(os)
     };
-    std::fs::write(&tmp, bytes).with_context(|| format!("write {}", tmp.display()))?;
-    std::fs::rename(&tmp, path)
+    std::fs::write(extended_path(&tmp), bytes)
+        .with_context(|| format!("write {}", tmp.display()))?;
+    std::fs::rename(extended_path(&tmp), extended_path(path))
         .with_context(|| format!("rename {} -> {}", tmp.display(), path.display()))?;
     Ok(())
 }
@@ -1340,5 +1376,70 @@ mod tests {
             "expected a skip warning, got: {:?}",
             ctx.stats.warnings
         );
+    }
+
+    // ─── M23: long-path (MAX_PATH) handling under a deep root (path-5) ────
+
+    #[cfg(windows)]
+    #[test]
+    fn extended_path_verbatimizes_windows_disk_paths() {
+        assert_eq!(
+            extended_path(Path::new(r"C:\a\b")),
+            PathBuf::from(r"\\?\C:\a\b")
+        );
+        // Forward slashes are flipped (verbatim paths don't normalize).
+        assert_eq!(
+            extended_path(Path::new("C:/a/b")),
+            PathBuf::from(r"\\?\C:\a\b")
+        );
+        // Already-verbatim paths are left untouched.
+        assert_eq!(
+            extended_path(Path::new(r"\\?\C:\a\b")),
+            PathBuf::from(r"\\?\C:\a\b")
+        );
+        // Relative paths can't overflow on their own; unchanged.
+        assert_eq!(extended_path(Path::new(r"a\b")), PathBuf::from(r"a\b"));
+    }
+
+    #[cfg(not(windows))]
+    #[test]
+    fn extended_path_is_identity_off_windows() {
+        assert_eq!(extended_path(Path::new("/a/b/c")), PathBuf::from("/a/b/c"));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn write_children_handles_paths_over_max_path() {
+        // A tree deep enough that the full path exceeds ~260 chars must still
+        // materialize. Without the `\\?\` rewrite, std::fs aborts mid-write.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let opts = test_opts(dir.path().to_path_buf());
+        let mut instances = HashMap::new();
+        let mut children: HashMap<u64, Vec<u64>> = HashMap::new();
+        let seg = "verylongsegmentnamethatpadsthepath_"; // 35 chars
+        let depth: u64 = 8;
+        let mut parent = 0u64;
+        for i in 1..=depth {
+            instances.insert(i, inst(i, Some(parent), "Folder", &format!("{seg}{i:02}")));
+            children.entry(parent).or_default().push(i);
+            parent = i;
+        }
+        let leaf_id = depth + 1;
+        instances.insert(
+            leaf_id,
+            script_inst(leaf_id, Some(parent), "Deep", "return 'deep'\n"),
+        );
+        children.entry(parent).or_default().push(leaf_id);
+
+        let mut ctx = WriteContext {
+            opts: &opts,
+            instances: &instances,
+            children: &children,
+            stats: SyncbackStats::default(),
+            tree_base: Tree::new(),
+        };
+        write_children(0, dir.path(), "src", &mut ctx)
+            .expect("deep write must not fail on MAX_PATH");
+        assert_eq!(ctx.stats.scripts_written, 1);
     }
 }
