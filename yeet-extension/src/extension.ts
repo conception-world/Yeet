@@ -357,6 +357,20 @@ function probeDaemonAlive(): Promise<boolean> {
 }
 
 async function startDaemonInner(): Promise<void> {
+	// A daemon crash leaves the previous control channel's reconnect
+	// loop running: `child.on("exit")` only clears `daemon`, and the
+	// clean-stop path (`killDaemon`) isn't in play here since nobody
+	// asked the daemon to stop. Without this, restarting after a crash
+	// constructs a second `YeetControlChannel` at the end of this
+	// function while the first one is still alive and reconnecting —
+	// both connect with `role=extension`, the daemon keeps only the
+	// latest, and the loser reconnects immediately, producing a ~1s
+	// ping-pong forever. Disposing unconditionally is safe: `dispose()`
+	// is idempotent and a no-op if the channel was never assigned.
+	if (channel !== undefined) {
+		channel.dispose();
+		channel = undefined;
+	}
 	// Short-circuit if a daemon already answers on the expected
 	// port. Re-use it instead of trying to spawn a duplicate that
 	// would fail to bind. The control channel's connect+hello will
@@ -620,6 +634,20 @@ async function startDaemonInner(): Promise<void> {
 		// SIGTERM means we asked it to stop; anything else is unexpected.
 		const clean = code === 0 || signal === "SIGTERM";
 		setStatus(clean ? "stopped" : "crashed");
+
+		// Crash path: the clean-stop path (`killDaemon`) already
+		// disposes `channel` before signaling the child, so by the time
+		// a clean exit reaches here `channel` is already undefined and
+		// this is a no-op. An unexpected exit skips that teardown, so
+		// without this the control channel is left connected (or
+		// reconnecting) against a daemon that's gone — dispose it now
+		// so a subsequent `Yeet: Start` doesn't inherit an orphaned
+		// channel racing the fresh one for the daemon's single-slot
+		// extension connection.
+		if (!clean && channel !== undefined) {
+			channel.dispose();
+			channel = undefined;
+		}
 
 		// If the daemon died within ~2s of spawn AND we asked it to run
 		// (not a SIGTERM from killDaemon), surface a modal with the
