@@ -1,4 +1,4 @@
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeSet, HashMap, HashSet};
 use std::io::Write as _;
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
@@ -427,6 +427,8 @@ async fn handle_fs_event(
     // three-way source merge.
     let abs_for_meta = match &event {
         FileEvent::Touched(p) | FileEvent::Removed(p) => p.clone(),
+        // Backend error/overflow: re-scan the whole tree and reconcile.
+        FileEvent::Rescan => return handle_rescan(state, bcast_tx).await,
     };
     if is_meta_file(&abs_for_meta) {
         return handle_meta_event(state, event, bcast_tx).await;
@@ -472,6 +474,16 @@ async fn handle_fs_event(
 
     let path = match event {
         FileEvent::Touched(abs) => {
+            // A directory Touched is the signal for a folder rename/move: on
+            // Windows a folder rename emits only a dir-level rename pair with
+            // NO per-child events, so the moved subtree would otherwise
+            // desync until the daemon restarts (AUDITORIA-YEET.md A7). Try to
+            // pair it as a directory rename (re-key subtree + per-child
+            // FileRenamed); if it isn't one, `handle_dir_touched` drops it,
+            // matching the previous not-a-file behavior.
+            if abs.is_dir() {
+                return handle_dir_touched(state, &abs, bcast_tx).await;
+            }
             // Each early return here would otherwise silently swallow the
             // event with no signal to the user, making "files don't appear
             // in Studio" undebuggable. Log every drop with the path and the
@@ -491,16 +503,12 @@ async fn handle_fs_event(
                 debug!(path = %rel, "fs drop: path is not under any $path mapping in default.project.json");
                 return Ok(());
             }
-            // Drop watcher echoes from a daemon-initiated `fs::rename`. The
-            // matching Remove(old) + Touched(new) pair is one-shot so the
-            // second `consume_rename_echo` call returns false naturally.
-            {
-                let mut guard = state.write().await;
-                if guard.consume_rename_echo(&rel) {
-                    debug!(path = %rel, "fs drop: suppressed echo of daemon rename");
-                    return Ok(());
-                }
-            }
+            // No path-based echo suppression here (AUDITORIA-YEET.md M17):
+            // the daemon's own rename echo is already dropped safely by the
+            // content-hash check below (`prev_hash == sha`) and the
+            // untracked-path check on the removal side. A path-based guard
+            // that ran before the hash check could instead swallow a REAL
+            // user edit to a just-renamed file inside the TTL window.
             let file_name = abs
                 .file_name()
                 .and_then(|s| s.to_str())
@@ -595,7 +603,6 @@ async fn handle_fs_event(
                 // event per child, so each child rename is handled on its
                 // own; the top-level rename only needs to move the script
                 // entry itself.
-                guard.note_rename_echo(old_path.clone(), new_path.clone());
                 persist_base(&guard)?;
                 let root = guard.root.clone();
                 let session_id = guard.session_id.clone();
@@ -661,13 +668,10 @@ async fn handle_fs_event(
         }
         FileEvent::Removed(abs) => {
             let mut guard = state.write().await;
-            let rel_for_echo = guard.relative(&abs);
-            if let Some(rel) = rel_for_echo.as_deref() {
-                if guard.consume_rename_echo(rel) {
-                    debug!(path = %rel, "fs drop: suppressed echo of daemon rename (removal side)");
-                    return Ok(());
-                }
-            }
+            // No path-based echo suppression (AUDITORIA-YEET.md M17): a
+            // daemon-initiated rename removes the old key from `tree_fs`
+            // first, so the watcher's Remove(old) lands on the untracked-path
+            // check below and is dropped there without a TTL guard.
             // Capture the entry BEFORE forgetting it so a later Touched
             // with a matching sha can promote the pair to a FileRenamed.
             let rel = match guard.relative(&abs) {
@@ -722,10 +726,276 @@ async fn handle_fs_event(
             });
             return Ok(());
         }
+        // `Rescan` is intercepted at the top of the function; this arm only
+        // satisfies match exhaustiveness.
+        FileEvent::Rescan => return Ok(()),
     };
 
     // From here on we're holding nothing; re-acquire to run the merge step.
     reconcile_path(state, &path, bcast_tx).await
+}
+
+/// Recovers from a watcher backend error/overflow (AUDITORIA-YEET.md M19):
+/// re-reads the entire tracked tree from disk, then reconciles every path
+/// whose state could have changed while notifications were being dropped.
+/// Heavier than a single-path reconcile, but a backend error is rare (a
+/// storm — git checkout, bulk `wally install`) and the alternative is a
+/// silent desync that only heals on the next reconnect.
+async fn handle_rescan(
+    state: &SharedState,
+    bcast_tx: &broadcast::Sender<Arc<ServerMsg>>,
+) -> Result<()> {
+    warn!("watcher backend error: re-scanning tracked tree and reconciling");
+    let paths: Vec<String> = {
+        let mut guard = state.write().await;
+        // Union the paths from BEFORE and AFTER the rescan: files that
+        // vanished during the storm survive only in base/studio, while ones
+        // that appeared or changed show up in the freshly rebuilt tree_fs.
+        let mut union: BTreeSet<String> = BTreeSet::new();
+        union.extend(guard.tree_fs.keys().cloned());
+        union.extend(guard.tree_studio.keys().cloned());
+        union.extend(guard.tree_base.keys().cloned());
+        guard.rescan_fs()?;
+        union.extend(guard.tree_fs.keys().cloned());
+        union.into_iter().collect()
+    };
+    for path in paths {
+        if let Err(e) = reconcile_path(state, &path, bcast_tx).await {
+            warn!(path = %path, error = ?e, "rescan reconcile failed");
+        }
+    }
+    Ok(())
+}
+
+/// A tracked source file found on disk under a directory being fingerprinted
+/// for rename detection: its forward-slashed sub-path relative to that
+/// directory plus its normalized-content sha256.
+struct DirScanFile {
+    subpath: String,
+    sha256: String,
+}
+
+/// Walks `dir_abs` recursively and returns every classifiable Roblox source
+/// file (skipping `.meta.json` sidecars and anything that doesn't classify),
+/// each with its sub-path relative to `dir_abs` and its normalized-content
+/// sha256. Used to fingerprint a directory's contents so a folder rename can
+/// be matched against a tracked `tree_fs` subtree.
+fn scan_dir_source_files(dir_abs: &Path) -> Vec<DirScanFile> {
+    let mut out = Vec::new();
+    for entry in walkdir::WalkDir::new(dir_abs).follow_links(false) {
+        let Ok(entry) = entry else { continue };
+        if !entry.file_type().is_file() {
+            continue;
+        }
+        let path = entry.path();
+        if is_meta_file(path) {
+            continue;
+        }
+        let Some(file_name) = path.file_name().and_then(|s| s.to_str()) else {
+            continue;
+        };
+        if classify(file_name).is_none() {
+            continue;
+        }
+        let Ok(rel) = path.strip_prefix(dir_abs) else {
+            continue;
+        };
+        let mut subpath = String::new();
+        for (i, comp) in rel.components().enumerate() {
+            let Some(part) = comp.as_os_str().to_str() else {
+                subpath.clear();
+                break;
+            };
+            if i > 0 {
+                subpath.push('/');
+            }
+            subpath.push_str(part);
+        }
+        if subpath.is_empty() {
+            continue;
+        }
+        let Ok(raw) = std::fs::read_to_string(path) else {
+            continue;
+        };
+        let (content, _meta) = normalize_from_disk(&raw);
+        out.push(DirScanFile {
+            subpath,
+            sha256: sha256_hex(content.as_bytes()),
+        });
+    }
+    out
+}
+
+/// Finds a tracked directory subtree that was renamed *to* `new_dir_rel`.
+/// A candidate old directory qualifies when (a) it is not `new_dir_rel`
+/// itself, (b) its on-disk path no longer exists — a rename removes the old
+/// dir, whereas a copy leaves it in place so copies never false-match — and
+/// (c) the `(sub-path, sha256)` signature of its `tree_fs` entries exactly
+/// equals `disk_sig` (the signature of the files now on disk under the new
+/// dir).
+///
+/// Candidates are derived from the directory prefixes present in `tree_fs`,
+/// so pairing works whether the old dir's `Removed` event was processed
+/// before or after this `Touched` — a directory `Removed` is a harmless
+/// no-op that leaves the subtree entries in `tree_fs`.
+fn find_dir_rename_source(
+    guard: &ProjectState,
+    new_dir_rel: &str,
+    disk_sig: &BTreeSet<(String, String)>,
+) -> Option<String> {
+    // Every ancestor directory prefix that appears in tree_fs is a candidate.
+    let mut candidates: BTreeSet<String> = BTreeSet::new();
+    for key in guard.tree_fs.keys() {
+        let mut start = 0usize;
+        while let Some(rel_pos) = key[start..].find('/') {
+            let end = start + rel_pos;
+            candidates.insert(key[..end].to_owned());
+            start = end + 1;
+        }
+    }
+    for cand in candidates {
+        if cand == new_dir_rel {
+            continue;
+        }
+        // A rename removes the old directory; a copy leaves it on disk.
+        if guard.root.join(&cand).exists() {
+            continue;
+        }
+        let prefix = format!("{cand}/");
+        let sig: BTreeSet<(String, String)> = guard
+            .tree_fs
+            .iter()
+            .filter(|(k, _)| k.starts_with(&prefix))
+            .map(|(k, e)| (k[prefix.len()..].to_owned(), e.sha256.clone()))
+            .collect();
+        if !sig.is_empty() && &sig == disk_sig {
+            return Some(cand);
+        }
+    }
+    None
+}
+
+/// Handles a `Touched` event whose path is a directory. On Windows a folder
+/// rename/move surfaces as a single dir-level rename pair with no per-child
+/// events, so the moved subtree would otherwise desync (AUDITORIA-YEET.md
+/// A7). We detect the rename by matching the new directory's on-disk source
+/// files against a tracked `tree_fs` subtree whose old directory has
+/// disappeared, then re-key every affected `tree_fs`/`tree_base`/
+/// `tree_studio`/`meta`/`meta_attributes` entry by prefix (the disk-side
+/// analog of `handle_studio_renamed`'s DirToDir re-key) and emit a per-child
+/// `FileRenamed` so Studio-side instance state (attributes, tags, non-script
+/// children) survives the move.
+///
+/// When the directory doesn't match a rename source it is dropped: brand-new
+/// directories arrive with their own per-file `Touched` events, which the
+/// normal file path already handles.
+async fn handle_dir_touched(
+    state: &SharedState,
+    new_dir_abs: &Path,
+    bcast_tx: &broadcast::Sender<Arc<ServerMsg>>,
+) -> Result<()> {
+    let new_dir_rel = {
+        let guard = state.read().await;
+        let Some(rel) = guard.relative(new_dir_abs) else {
+            return Ok(());
+        };
+        if !guard.is_under_mapping(&rel) {
+            return Ok(());
+        }
+        rel
+    };
+    // Fingerprint the source files now living under the new directory.
+    let disk = scan_dir_source_files(new_dir_abs);
+    if disk.is_empty() {
+        return Ok(());
+    }
+    let disk_sig: BTreeSet<(String, String)> = disk
+        .iter()
+        .map(|f| (f.subpath.clone(), f.sha256.clone()))
+        .collect();
+
+    let mut guard = state.write().await;
+    let Some(old_dir_rel) = find_dir_rename_source(&guard, &new_dir_rel, &disk_sig) else {
+        // Not attributable to a rename — drop (new dirs come with per-file
+        // events). Leaving `tree_fs` untouched preserves the old behavior.
+        return Ok(());
+    };
+
+    let old_prefix = format!("{old_dir_rel}/");
+    let new_prefix = format!("{new_dir_rel}/");
+    // Snapshot the per-child renames before re-keying so we can broadcast a
+    // FileRenamed for each. Content/sha/kind come from the tracked entry,
+    // which by construction (the signature match) equals what is on disk.
+    let mut children: Vec<(String, String, TreeEntry)> = Vec::new();
+    let old_keys: Vec<String> = guard
+        .tree_fs
+        .keys()
+        .filter(|k| k.starts_with(&old_prefix))
+        .cloned()
+        .collect();
+    for old_key in old_keys {
+        let suffix = &old_key[old_prefix.len()..];
+        let new_key = format!("{new_prefix}{suffix}");
+        if let Some(entry) = guard.tree_fs.get(&old_key).cloned() {
+            children.push((old_key, new_key, entry));
+        }
+    }
+
+    rekey_tree(&mut guard.tree_fs, &old_prefix, &new_prefix);
+    rekey_tree(&mut guard.tree_base, &old_prefix, &new_prefix);
+    rekey_tree(&mut guard.tree_studio, &old_prefix, &new_prefix);
+    rekey_meta(&mut guard.meta, &old_prefix, &new_prefix);
+    rekey_meta_attributes(&mut guard.meta_attributes, &old_prefix, &new_prefix);
+    // Re-key any collision flags so a paused path follows the rename.
+    let moved_collisions: Vec<String> = guard
+        .pending_collisions
+        .iter()
+        .filter(|p| p.starts_with(&old_prefix))
+        .cloned()
+        .collect();
+    for old_c in moved_collisions {
+        guard.pending_collisions.remove(&old_c);
+        let suffix = old_c[old_prefix.len()..].to_owned();
+        guard.pending_collisions.insert(format!("{new_prefix}{suffix}"));
+    }
+    persist_base(&guard)?;
+    let root = guard.root.clone();
+    let session_id = guard.session_id.clone();
+    drop(guard);
+
+    info!(
+        old_dir = %old_dir_rel,
+        new_dir = %new_dir_rel,
+        children = children.len(),
+        "fs directory rename detected; re-keyed subtree and emitting per-child FileRenamed"
+    );
+    for (old_key, new_key, entry) in children {
+        audit::record(
+            &root,
+            &audit::Entry {
+                ts: audit::now_rfc3339(),
+                kind: audit::Kind::FsRename,
+                path: &new_key,
+                sha_before: Some(&old_key),
+                sha_after: Some(&entry.sha256),
+                session_id: &session_id,
+                note: Some("ide-side directory rename (A7)"),
+            },
+        );
+        broadcast_server_msg(
+            state,
+            bcast_tx,
+            ServerMsg::FileRenamed {
+                old_path: old_key,
+                new_path: new_key,
+                content: entry.content,
+                sha256: entry.sha256,
+                kind: entry.kind,
+            },
+        )
+        .await;
+    }
+    Ok(())
 }
 
 /// Handles a `.meta.json` create/change/delete. Emits `AttributesChanged`
@@ -784,6 +1054,9 @@ async fn handle_meta_event(
             )
             .await;
         }
+        // Rescan is intercepted in `handle_fs_event`; it never reaches the
+        // meta-file router.
+        FileEvent::Rescan => {}
     }
     Ok(())
 }
@@ -2479,7 +2752,6 @@ async fn handle_studio_renamed(
         guard.meta.insert(new_path.clone(), meta);
     }
 
-    guard.note_rename_echo(old_path.clone(), new_path.clone());
     let collision_cleared =
         guard.pending_collisions.remove(&old_path) | guard.pending_collisions.remove(&new_path);
     if let Err(e) = persist_base(&guard) {
@@ -6537,6 +6809,264 @@ mod fs_removed_pending_tests {
 
         let guard = env.state.read().await;
         assert!(!guard.fs_removed_pending.contains_key("src/Old.luau"));
+    }
+
+    // ─── M17: a real edit to a just-renamed file must not be swallowed ───
+
+    #[tokio::test]
+    async fn real_edit_after_rename_is_not_swallowed_as_echo() {
+        let env = make_env(&[("src/Old.luau", "hello")]).await;
+        let mut rx = env.bcast_tx.subscribe();
+        let root = root_of(&env);
+
+        // Rename Old -> New (pairs into a FileRenamed; pre-M17 this armed the
+        // path-based rename-echo guard for `src/New.luau`).
+        std::fs::remove_file(root.join("src/Old.luau")).expect("rm Old");
+        handle_fs_event(
+            &env.state,
+            FileEvent::Removed(root.join("src/Old.luau")),
+            &env.bcast_tx,
+        )
+        .await
+        .expect("handle removed Old");
+        std::fs::write(root.join("src/New.luau"), "hello").expect("write New");
+        handle_fs_event(
+            &env.state,
+            FileEvent::Touched(root.join("src/New.luau")),
+            &env.bcast_tx,
+        )
+        .await
+        .expect("handle touched New");
+
+        // A genuine user edit to the freshly-renamed file, well inside the old
+        // 500ms echo TTL. Pre-M17 `consume_rename_echo` dropped this silently.
+        std::fs::write(root.join("src/New.luau"), "hello world").expect("edit New");
+        handle_fs_event(
+            &env.state,
+            FileEvent::Touched(root.join("src/New.luau")),
+            &env.bcast_tx,
+        )
+        .await
+        .expect("handle edit New");
+
+        let msgs = drain(&mut rx).await;
+        let changed = msgs.iter().any(|m| {
+            matches!(m, ServerMsg::FileChanged { path, content, .. }
+                if path == "src/New.luau" && content == "hello world")
+        });
+        assert!(
+            changed,
+            "real edit to a just-renamed file must propagate, not be swallowed; got {msgs:?}"
+        );
+
+        let guard = env.state.read().await;
+        assert_eq!(
+            guard.tree_fs.get("src/New.luau").map(|e| e.content.as_str()),
+            Some("hello world")
+        );
+    }
+
+    // ─── A7: renaming a directory on disk re-keys the subtree ────────────
+
+    #[tokio::test]
+    async fn directory_rename_removed_then_touched_emits_per_child_filerenamed() {
+        let env = make_env(&[("src/Foo/Bar.luau", "return 1\n")]).await;
+        let mut rx = env.bcast_tx.subscribe();
+        let root = root_of(&env);
+
+        // Windows emits only a dir-level rename pair (Removed(Foo) +
+        // Touched(Baz)) with no per-child events — deliver them in that order.
+        std::fs::rename(root.join("src/Foo"), root.join("src/Baz")).expect("rename dir");
+        handle_fs_event(
+            &env.state,
+            FileEvent::Removed(root.join("src/Foo")),
+            &env.bcast_tx,
+        )
+        .await
+        .expect("handle removed dir");
+        handle_fs_event(
+            &env.state,
+            FileEvent::Touched(root.join("src/Baz")),
+            &env.bcast_tx,
+        )
+        .await
+        .expect("handle touched dir");
+
+        let msgs = drain(&mut rx).await;
+        let renamed = msgs.iter().any(|m| {
+            matches!(m, ServerMsg::FileRenamed { old_path, new_path, .. }
+                if old_path == "src/Foo/Bar.luau" && new_path == "src/Baz/Bar.luau")
+        });
+        assert!(renamed, "expected FileRenamed for the moved child; got {msgs:?}");
+
+        let guard = env.state.read().await;
+        assert!(
+            !guard.tree_fs.contains_key("src/Foo/Bar.luau"),
+            "old key must not linger in tree_fs"
+        );
+        assert!(guard.tree_fs.contains_key("src/Baz/Bar.luau"));
+        assert!(!guard.tree_studio.contains_key("src/Foo/Bar.luau"));
+        assert!(guard.tree_studio.contains_key("src/Baz/Bar.luau"));
+        assert!(!guard.tree_base.contains_key("src/Foo/Bar.luau"));
+        assert!(guard.tree_base.contains_key("src/Baz/Bar.luau"));
+    }
+
+    #[tokio::test]
+    async fn directory_rename_touched_before_removed_still_pairs() {
+        let env = make_env(&[("src/Foo/Bar.luau", "return 1\n")]).await;
+        let mut rx = env.bcast_tx.subscribe();
+        let root = root_of(&env);
+
+        std::fs::rename(root.join("src/Foo"), root.join("src/Baz")).expect("rename dir");
+        // Reverse order: the To event lands before the From event (HashMap
+        // flush order is non-deterministic, so both orders must work).
+        handle_fs_event(
+            &env.state,
+            FileEvent::Touched(root.join("src/Baz")),
+            &env.bcast_tx,
+        )
+        .await
+        .expect("handle touched dir");
+        handle_fs_event(
+            &env.state,
+            FileEvent::Removed(root.join("src/Foo")),
+            &env.bcast_tx,
+        )
+        .await
+        .expect("handle removed dir");
+
+        let msgs = drain(&mut rx).await;
+        let renames: Vec<_> = msgs
+            .iter()
+            .filter(|m| {
+                matches!(m, ServerMsg::FileRenamed { old_path, new_path, .. }
+                    if old_path == "src/Foo/Bar.luau" && new_path == "src/Baz/Bar.luau")
+            })
+            .collect();
+        assert_eq!(
+            renames.len(),
+            1,
+            "expected exactly one FileRenamed; got {msgs:?}"
+        );
+
+        let guard = env.state.read().await;
+        assert!(!guard.tree_fs.contains_key("src/Foo/Bar.luau"));
+        assert!(guard.tree_fs.contains_key("src/Baz/Bar.luau"));
+    }
+
+    #[tokio::test]
+    async fn directory_rename_rekeys_nested_subtree() {
+        let env = make_env(&[
+            ("src/Foo/init.luau", "return {}\n"),
+            ("src/Foo/Sub/Deep.luau", "return 2\n"),
+        ])
+        .await;
+        let mut rx = env.bcast_tx.subscribe();
+        let root = root_of(&env);
+
+        std::fs::rename(root.join("src/Foo"), root.join("src/Baz")).expect("rename dir");
+        handle_fs_event(
+            &env.state,
+            FileEvent::Removed(root.join("src/Foo")),
+            &env.bcast_tx,
+        )
+        .await
+        .expect("handle removed dir");
+        handle_fs_event(
+            &env.state,
+            FileEvent::Touched(root.join("src/Baz")),
+            &env.bcast_tx,
+        )
+        .await
+        .expect("handle touched dir");
+
+        let msgs = drain(&mut rx).await;
+        let renamed_deep = msgs.iter().any(|m| {
+            matches!(m, ServerMsg::FileRenamed { old_path, new_path, .. }
+                if old_path == "src/Foo/Sub/Deep.luau" && new_path == "src/Baz/Sub/Deep.luau")
+        });
+        let renamed_init = msgs.iter().any(|m| {
+            matches!(m, ServerMsg::FileRenamed { old_path, new_path, .. }
+                if old_path == "src/Foo/init.luau" && new_path == "src/Baz/init.luau")
+        });
+        assert!(renamed_deep, "nested child must be re-keyed; got {msgs:?}");
+        assert!(renamed_init, "init child must be re-keyed; got {msgs:?}");
+
+        let guard = env.state.read().await;
+        assert!(guard.tree_fs.contains_key("src/Baz/Sub/Deep.luau"));
+        assert!(guard.tree_fs.contains_key("src/Baz/init.luau"));
+        assert!(!guard.tree_fs.contains_key("src/Foo/Sub/Deep.luau"));
+        assert!(!guard.tree_fs.contains_key("src/Foo/init.luau"));
+    }
+
+    #[tokio::test]
+    async fn directory_copy_does_not_false_match_as_rename() {
+        // A copy leaves the original dir in place; the daemon must not treat
+        // the new dir as a rename of the still-present one.
+        let env = make_env(&[("src/Foo/Bar.luau", "return 1\n")]).await;
+        let mut rx = env.bcast_tx.subscribe();
+        let root = root_of(&env);
+
+        std::fs::create_dir_all(root.join("src/Baz")).expect("mkdir Baz");
+        std::fs::copy(
+            root.join("src/Foo/Bar.luau"),
+            root.join("src/Baz/Bar.luau"),
+        )
+        .expect("copy file");
+        handle_fs_event(
+            &env.state,
+            FileEvent::Touched(root.join("src/Baz")),
+            &env.bcast_tx,
+        )
+        .await
+        .expect("handle touched dir");
+
+        let msgs = drain(&mut rx).await;
+        let renamed = msgs.iter().any(|m| matches!(m, ServerMsg::FileRenamed { .. }));
+        assert!(
+            !renamed,
+            "a copy (original still present) must not pair as a rename; got {msgs:?}"
+        );
+
+        let guard = env.state.read().await;
+        assert!(
+            guard.tree_fs.contains_key("src/Foo/Bar.luau"),
+            "original entry must stay put"
+        );
+    }
+
+    // ─── M19: a Rescan reconciles changes the backend dropped ────────────
+
+    #[tokio::test]
+    async fn rescan_event_reconciles_a_missed_disk_change() {
+        let env = make_env(&[("src/A.luau", "return 1\n")]).await;
+        let mut rx = env.bcast_tx.subscribe();
+        let root = root_of(&env);
+
+        // Simulate a notification the backend dropped during a storm: change
+        // the file on disk but never deliver its individual Touched event.
+        std::fs::write(root.join("src/A.luau"), "return 2\n").expect("edit A");
+
+        // The backend error surfaces to the daemon as a Rescan.
+        handle_fs_event(&env.state, FileEvent::Rescan, &env.bcast_tx)
+            .await
+            .expect("handle rescan");
+
+        let msgs = drain(&mut rx).await;
+        let changed = msgs.iter().any(|m| {
+            matches!(m, ServerMsg::FileChanged { path, content, .. }
+                if path == "src/A.luau" && content == "return 2\n")
+        });
+        assert!(
+            changed,
+            "rescan must reconcile the change the backend dropped; got {msgs:?}"
+        );
+
+        let guard = env.state.read().await;
+        assert_eq!(
+            guard.tree_fs.get("src/A.luau").map(|e| e.content.as_str()),
+            Some("return 2\n")
+        );
     }
 }
 
