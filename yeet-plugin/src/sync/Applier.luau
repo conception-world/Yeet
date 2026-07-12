@@ -140,6 +140,19 @@ type BootstrapSnapshotHook = (
 	snapshot: { { path: string, kind: ScriptKind, content: string, sha256: string } }
 ) -> ()
 
+-- A4/M14 apply-ACK: fired after a daemon-pushed change is SUCCESSFULLY applied
+-- to the DataModel (withRecording succeeded, instance resolved). The Widget
+-- forwards it to the daemon as `file_applied { path, sha256 }` so the daemon can
+-- finally advance tree_base for that push. `sha256` echoes the applied content's
+-- sha; for a delete it is the empty string (there is no content to hash).
+type ApplyConfirmHook = (path: string, sha256: string) -> ()
+-- A4/M14 apply-NAK: fired when a daemon-pushed change could NOT be applied
+-- (`TryBeginRecording` returned nil, or the target instance could not be
+-- resolved). Forwarded as `file_apply_failed { path, reason }` so the daemon
+-- drops the pending push and re-detects the divergence instead of silently
+-- believing Studio synced — the exact `swallow-1` failure this closes.
+type ApplyFailedHook = (path: string, reason: string) -> ()
+
 local Applier = {}
 Applier.__index = Applier
 
@@ -241,6 +254,12 @@ type self = {
 	-- fires synchronously mid-materialize, BEFORE `fileToInstance[path]` is
 	-- set, so the intended dedup (`existing == desc`) was bypassed.
 	applyingDaemonCreate: boolean,
+	-- A4/M14 apply-ACK hooks. Set by the Widget; called by the apply* handlers
+	-- after each daemon-driven mutation so the daemon learns whether the push
+	-- actually landed in the DataModel (ACK) or failed (NAK). Absent in
+	-- minimal/test wirings, in which case the notify helpers are no-ops.
+	onApplied: ApplyConfirmHook?,
+	onApplyFailed: ApplyFailedHook?,
 }
 
 export type Applier = typeof(setmetatable({} :: self, Applier))
@@ -277,6 +296,8 @@ function Applier.new(log: Log): Applier
 		pendingEditProbe = nil :: ((path: string) -> (string?, string?))?,
 		liveConnections = {} :: { RBXScriptConnection },
 		applyingDaemonCreate = false,
+		onApplied = nil :: ApplyConfirmHook?,
+		onApplyFailed = nil :: ApplyFailedHook?,
 	}, Applier)
 end
 
@@ -300,6 +321,17 @@ function Applier.setPendingEditProbe(
 	probe: ((path: string) -> (string?, string?))?
 )
 	self.pendingEditProbe = probe
+end
+
+-- A4/M14: wire the apply-ACK/NAK hooks. The Widget passes senders that emit
+-- `file_applied` / `file_apply_failed` on the daemon connection.
+function Applier.setApplyHooks(
+	self: Applier,
+	onApplied: ApplyConfirmHook?,
+	onApplyFailed: ApplyFailedHook?
+)
+	self.onApplied = onApplied
+	self.onApplyFailed = onApplyFailed
 end
 
 function Applier.setTrackHooks(self: Applier, onTracked: TrackHook, onUntracked: UntrackHook)
@@ -787,6 +819,25 @@ local function applyProjectOpened(self: Applier, msg: any)
 	end
 end
 
+-- A4/M14 apply-ACK/NAK notifiers. No-ops when the hook is unset (minimal/test
+-- wirings), so the apply* handlers can call them unconditionally. `notifyApplied`
+-- confirms the DataModel now holds the pushed content (sha echoes it; empty for
+-- a delete); `notifyApplyFailed` reports that the push did NOT land so the daemon
+-- leaves tree_base put and re-detects the divergence.
+local function notifyApplied(self: Applier, path: string, sha256: string)
+	local hook = self.onApplied
+	if hook ~= nil then
+		hook(path, sha256)
+	end
+end
+
+local function notifyApplyFailed(self: Applier, path: string, reason: string)
+	local hook = self.onApplyFailed
+	if hook ~= nil then
+		hook(path, reason)
+	end
+end
+
 local function applyFileCreated(self: Applier, msg: any)
 	if not self.bootstrapped then
 		self.log(`ignored FileCreated before bootstrap: {msg.path}`)
@@ -817,13 +868,16 @@ local function applyFileCreated(self: Applier, msg: any)
 	self.applyingDaemonCreate = prevApplying
 	if not ok then
 		self.log(`create failed {snap.path}: {err}`)
+		notifyApplyFailed(self, snap.path, `create failed: {err}`)
 		return
 	end
 	if created ~= nil then
 		registerTracked(self, snap.path, created, snap.sha256, #snap.content)
 		self.log(`+ {snap.path}`)
+		notifyApplied(self, snap.path, snap.sha256)
 	else
 		self.log(`skipped (no mapping): {snap.path}`)
+		notifyApplyFailed(self, snap.path, "no $path mapping resolves this path")
 	end
 end
 
@@ -836,7 +890,10 @@ local function applyFileChanged(self: Applier, msg: any)
 	if inst == nil then
 		-- Unknown path: we can't re-materialize without the `kind` field,
 		-- which FileChanged doesn't carry. Logged so the mismatch surfaces.
+		-- A4: NAK so the daemon does NOT believe this synced — this is the
+		-- `fileToInstance[path]==nil` swallow the finding is about.
 		self.log(`~ {msg.path} (unknown; skipped)`)
+		notifyApplyFailed(self, msg.path, "no tracked instance for path")
 		return
 	end
 	-- Validate the cached reference is still live and still the right kind
@@ -855,6 +912,9 @@ local function applyFileChanged(self: Applier, msg: any)
 		)
 		self.fileToInstance[msg.path] = nil
 		forgetEcho(self, msg.path)
+		-- A4: the write did NOT land — NAK so the daemon re-detects and re-pushes
+		-- (a FileCreated re-materializes the instance) instead of assuming synced.
+		notifyApplyFailed(self, msg.path, "stale instance reference; awaiting re-materialize")
 		return
 	end
 	local content: string = msg.content
@@ -872,6 +932,11 @@ local function applyFileChanged(self: Applier, msg: any)
 		local _, pendingHash = probe(msg.path)
 		if pendingHash ~= nil and pendingHash ~= hash then
 			self.log(`~ {msg.path} (local edit pending; not overwriting — daemon will reconcile)`)
+			-- A4/A3: we deliberately did NOT apply, to protect the user's
+			-- in-flight edit. NAK so the daemon drops its pending push (base
+			-- stays put); the SourceWatcher's captured edit then flows up and
+			-- the daemon surfaces the real divergence as a conflict.
+			notifyApplyFailed(self, msg.path, "local Studio edit pending; deferring to conflict reconcile")
 			return
 		end
 	end
@@ -884,8 +949,10 @@ local function applyFileChanged(self: Applier, msg: any)
 	end)
 	if ok then
 		self.log(`~ {msg.path}`)
+		notifyApplied(self, msg.path, hash)
 	else
 		self.log(`change failed {msg.path}: {err}`)
+		notifyApplyFailed(self, msg.path, `change failed: {err}`)
 	end
 end
 
@@ -895,7 +962,10 @@ local function applyFileDeleted(self: Applier, msg: any)
 	end
 	local inst = self.fileToInstance[msg.path]
 	if inst == nil then
+		-- A4: the instance is already absent, so the delete the daemon asked for
+		-- is trivially satisfied — ACK (empty sha) so it doesn't wait forever.
 		self.log(`- {msg.path} (unknown)`)
+		notifyApplied(self, msg.path, "")
 		return
 	end
 	local hook = self.onUntracked
@@ -910,8 +980,10 @@ local function applyFileDeleted(self: Applier, msg: any)
 	end)
 	if ok then
 		self.log(`- {msg.path}`)
+		notifyApplied(self, msg.path, "")
 	else
 		self.log(`delete failed {msg.path}: {err}`)
+		notifyApplyFailed(self, msg.path, `delete failed: {err}`)
 	end
 end
 
@@ -1055,6 +1127,7 @@ local function applyFileRenamed(self: Applier, msg: any)
 	end)
 	if not ok then
 		self.log(`rename failed {oldPath}->{newPath}: {err}`)
+		notifyApplyFailed(self, newPath, `rename failed: {err}`)
 		return
 	end
 	if self.fileToInstance[oldPath] == inst then
@@ -1066,6 +1139,7 @@ local function applyFileRenamed(self: Applier, msg: any)
 	self.pendingCollisions[oldPath] = nil
 	self.pendingCollisions[newPath] = nil
 	self.log(`> {oldPath} -> {newPath}`)
+	notifyApplied(self, newPath, hash)
 end
 
 -- Records (or clears) a name-collision warning broadcast by the daemon.
@@ -1132,8 +1206,14 @@ local function applyAttributesChanged(self: Applier, msg: any)
 	if ok then
 		self.appliedAttributes[path] = nextSet
 		self.log(`= attributes: {path}`)
+		-- A4: attribute pushes are not gated daemon-side (no pending_applies
+		-- entry), so this ACK is a no-op there today — but we send it for a
+		-- uniform apply contract and forward-compatibility. Empty sha: an
+		-- attribute change carries no file content to hash.
+		notifyApplied(self, path, "")
 	else
 		self.log(`attributes_changed failed {path}: {err}`)
+		notifyApplyFailed(self, path, `attributes apply failed: {err}`)
 	end
 end
 

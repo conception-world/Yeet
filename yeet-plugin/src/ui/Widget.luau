@@ -155,6 +155,11 @@ type ApplierHandle = {
     self: ApplierHandle,
     probe: ((path: string) -> (string?, string?))?
   ) -> (),
+  setApplyHooks: (
+    self: ApplierHandle,
+    onApplied: ((path: string, sha256: string) -> ())?,
+    onApplyFailed: ((path: string, reason: string) -> ())?
+  ) -> (),
   reset: (self: ApplierHandle) -> (),
 }
 type SourceWatcherHandle = {
@@ -1008,6 +1013,33 @@ function Widget._onConnectPressed(self: Widget)
   -- Studio edit before it overwrites Source with daemon content.
   applier:setPendingEditProbe(function(path: string)
     return sourceWatcher:peekPending(path)
+  end)
+  -- A4/M14 apply-ACK: confirm (or report the failure of) each daemon-driven
+  -- apply so the daemon only advances tree_base once Studio actually holds the
+  -- change. These fire once per applied frame; on a torn-down connection we skip
+  -- quietly (the daemon's apply-ACK timeout covers a genuinely lost
+  -- confirmation) rather than spamming the log.
+  applier:setApplyHooks(function(path: string, sha256: string)
+    local current = self.connection
+    if current == nil then
+      return
+    end
+    current:send({
+      type = "file_applied",
+      path = path,
+      sha256 = sha256,
+    })
+  end, function(path: string, reason: string)
+    local current = self.connection
+    if current == nil then
+      return
+    end
+    current:send({
+      type = "file_apply_failed",
+      path = path,
+      reason = reason,
+    })
+    self:_appendLog(`!! apply failed: {path} ({reason})`)
   end)
   applier:setConflictDispatcher(function(conflicts)
     self.resolver:enqueue(conflicts)
