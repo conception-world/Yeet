@@ -774,6 +774,67 @@ local function applyFileDeleted(self: Applier, msg: any)
 	end
 end
 
+-- Directory portion of a project-relative path (everything before the last
+-- `/`; "" when there is no slash). Used only as the cheap gate deciding
+-- whether a rename changed the containing directory — the precise target
+-- parent is resolved by `resolveRenameContainer`.
+local function dirPortion(path: string): string
+	return path:match("^(.*)/[^/]*$") or ""
+end
+
+-- Resolves the Instance that should PARENT a script living at `path`,
+-- creating intermediate Folders as needed. Mirrors materializeFile's
+-- container walk (which TreeBuilder doesn't export): pick the longest
+-- `$path`-prefix mapping, then walk the directory components, dropping the
+-- trailing component(s) that identify the file itself — 1 for a leaf, 2 for
+-- an `init.[ext]` promotion (dir-name + init file). Returns nil when `path`
+-- is outside every mapping or the shape can't be represented (e.g. an
+-- `init.luau` directly at a mount point, which has no parent directory).
+local function resolveRenameContainer(self: Applier, path: string): Instance?
+	local bestKey: string? = nil
+	local bestParent: Instance? = nil
+	local bestLen = -1
+	for mapPath, parent in pairs(self.mappings) do
+		local isExact = path == mapPath
+		local isDescendant = string.sub(path, 1, #mapPath + 1) == (mapPath .. "/")
+		if (isExact or isDescendant) and #mapPath > bestLen then
+			bestKey = mapPath
+			bestParent = parent
+			bestLen = #mapPath
+		end
+	end
+	if bestKey == nil or bestParent == nil then
+		return nil
+	end
+	local relPath = if path == bestKey then "" else string.sub(path, #bestKey + 2)
+	local parts: { string } = {}
+	for part in string.gmatch(relPath, "[^/]+") do
+		table.insert(parts, part)
+	end
+	if #parts == 0 then
+		return nil
+	end
+	local dropTail = if TreeBuilder.isInitFilename(path) then 2 else 1
+	local containerParts = #parts - dropTail
+	if containerParts < 0 then
+		return nil
+	end
+	local container: Instance = bestParent
+	for i = 1, containerParts do
+		local childName = parts[i]
+		local existing = container:FindFirstChild(childName)
+		if existing ~= nil then
+			container = existing
+		else
+			local fresh = Instance.new("Folder")
+			fresh.Name = childName
+			fresh.Parent = container
+			container = fresh
+		end
+	end
+	return container
+end
+
 -- Applies a daemon-originated rename (echo from another client, or the
 -- handshake's offline-rename heuristic) to the live DataModel. Renames
 -- the instance, re-parents it if the directory portion of the path
@@ -820,9 +881,31 @@ local function applyFileRenamed(self: Applier, msg: any)
 	end
 	seatEcho(self, newPath, hash)
 	local newName = TreeBuilder.basenameFor(newPath)
+	local oldDir = dirPortion(oldPath)
+	local newDir = dirPortion(newPath)
 	local ok, err = withRecording("YeetFileRenamed", function()
 		if newName ~= "" and (inst :: any).Name ~= newName then
 			(inst :: any).Name = newName
+		end
+		-- REGRESSION(A8): a move between directories (even with an unchanged
+		-- basename) must re-parent the instance, not merely touch Name/Source.
+		-- Without this the instance stays under the OLD container while
+		-- disk/tree point at the new one, and a later FileChanged writes into
+		-- the mis-parented node. Gate on the directory portion so pure
+		-- in-place renames skip the (folder-creating) container walk.
+		if oldDir ~= newDir then
+			local target = resolveRenameContainer(self, newPath)
+			if target == nil then
+				self.log(`rename: no container resolved for {newPath}; parent left unchanged`)
+			elseif target == inst or target:IsDescendantOf(inst) then
+				-- Degenerate: newPath's directory chain resolves through the
+				-- instance being moved (e.g. Foo.luau -> Foo/Bar.luau).
+				-- Re-parenting into itself/its subtree would throw; leave the
+				-- parent and let the next reconcile settle the shape.
+				self.log(`rename: {newPath} container is the moved instance; parent left unchanged`)
+			elseif inst.Parent ~= target then
+				(inst :: any).Parent = target
+			end
 		end
 		local currentSource = (inst :: LuaSourceContainer).Source
 		if currentSource ~= content then
