@@ -1305,7 +1305,7 @@ function Widget._onConnectPressed(self: Widget)
         -- in lockstep with breaking protocol changes so the daemon can
         -- refuse old plugins instead of silently misinterpreting their
         -- frames.
-        version = "0.4.1",
+        version = "0.5.0",
         studio_snapshot = {},
         request_bootstrap_preview = true,
       }
