@@ -498,14 +498,28 @@ local function computePath(
 	if not desc:IsA("LuaSourceContainer") then
 		return nil, nil
 	end
+	-- Collect names leaf→root by appending (O(1) each) and reverse in place.
+	-- The old `table.insert(chain, 1, ...)` shifted the whole array on every
+	-- ancestor, so a deep instance was O(depth^2); when a large moved/deleted
+	-- subtree drives this once per descendant that quadratic dominates (A11).
+	-- REGRESSION(A11): the reversed chain is byte-identical to what the old
+	-- prepend produced — root first, `desc` last — so the emitted path is
+	-- unchanged.
 	local chain: { string } = {}
 	local cursor: Instance? = desc
 	while cursor ~= nil and cursor ~= mapParent do
-		table.insert(chain, 1, cursor.Name)
+		table.insert(chain, cursor.Name)
 		cursor = cursor.Parent
 	end
 	if cursor ~= mapParent or #chain == 0 then
 		return nil, nil
+	end
+	local left = 1
+	local right = #chain
+	while left < right do
+		chain[left], chain[right] = chain[right], chain[left]
+		left += 1
+		right -= 1
 	end
 	local leafName, kind, promote = fileNameFor(desc)
 	if promote then

@@ -1151,6 +1151,11 @@ local function detectPromotionChain(self: Applier, mapPath: string, mapParent: I
 	end
 end
 
+-- Yield cadence for the demotion scan so a place with thousands of tracked
+-- scripts doesn't block a whole frame recomputing paths (A11). Matches the
+-- spirit of `TreeBuilder.discover`'s per-descendant yield.
+local DEMOTION_SCAN_YIELD_EVERY = 500
+
 -- After the tree settles following a `DescendantRemoving`, scan every
 -- tracked `LuaSourceContainer` under this mapping and recompute its
 -- path. Any cached path that no longer matches the recomputed one is a
@@ -1161,56 +1166,89 @@ end
 -- when the handler runs. For non-script descendants (RemoteEvent,
 -- Folder, Model, etc.) Studio frequently dispatches the ancestor signal
 -- only after `Parent` has already been set to `nil`, leaving us with
--- no anchor to walk up from. Iterating the tracked map is O(scripts in
--- mapping) per delete event, but deletes are human-frequency (not hot
--- path), so the cost is invisible in practice.
-local function detectDemotionChain(self: Applier, mapPath: string, mapParent: Instance, removed: Instance)
-	local _ = removed -- kept for callsite symmetry; deferred scan iterates the tracked map
+-- no anchor to walk up from.
+local function runDemotionScan(self: Applier, mapPath: string, mapParent: Instance)
+	-- Snapshot the keys first so we can iterate while the rename
+	-- callbacks mutate `instanceToPath`/`fileToInstance` in lockstep.
+	local candidates: { Instance } = {}
+	for instance in pairs(self.instanceToPath) do
+		table.insert(candidates, instance)
+	end
+	local processed = 0
+	for _, instance in ipairs(candidates) do
+		processed += 1
+		if processed % DEMOTION_SCAN_YIELD_EVERY == 0 then
+			task.wait()
+		end
+		local cached = self.instanceToPath[instance]
+		if cached == nil then
+			continue
+		end
+		-- REGRESSION(M8): skip non-scripts before `computePath`. instanceToPath
+		-- only ever holds LuaSourceContainers, so this is defensive, but it
+		-- keeps the guaranteed non-script skip on the recompute path.
+		if not instance:IsA("LuaSourceContainer") then
+			continue
+		end
+		if instance ~= mapParent and not instance:IsDescendantOf(mapParent) then
+			continue
+		end
+		local newPath, kind = TreeBuilder.computePath(mapPath, mapParent, instance)
+		if newPath == nil or kind == nil then
+			continue
+		end
+		if cached == newPath then
+			continue
+		end
+		local ok, src = pcall(function()
+			return (instance :: LuaSourceContainer).Source
+		end)
+		if not ok then
+			self.log(`rename detect: read Source failed for {instance.Name}`)
+			continue
+		end
+		local sha = Sha256.hex(src)
+		local hook = self.onStudioRenamed
+		if hook ~= nil then
+			hook(cached, newPath, kind, src, sha)
+		end
+		if self.fileToInstance[cached] == instance then
+			self.fileToInstance[cached] = nil
+		end
+		self.fileToInstance[newPath] = instance
+		self.instanceToPath[instance] = newPath
+		forgetEcho(self, cached)
+		seatEcho(self, newPath, sha, #src)
+	end
+end
+
+-- Coalesces demotion scans: moving or deleting a subtree fires one
+-- `DescendantRemoving` per descendant, and each used to `task.defer` its own
+-- full O(tracked-scripts) scan — N events × O(M) scans froze Studio (A11/M8).
+-- Now the first event of a burst schedules a SINGLE deferred scan and the
+-- rest are dropped. `state.pending` clears at the START of the deferred body
+-- so events arriving during the scan's yields queue a fresh follow-up instead
+-- of being lost.
+--
+-- REGRESSION(A11): the emitted renames are unchanged. Each scan is a full
+-- idempotent recompute of the settled tree; the old per-event scheduling had
+-- only the first post-burst scan observe a changed shape and emit — later
+-- scans found the cache already updated and no-op'd. Coalescing keeps exactly
+-- that one emitting scan.
+type ScanState = { pending: boolean }
+local function scheduleDemotionScan(
+	self: Applier,
+	state: ScanState,
+	mapPath: string,
+	mapParent: Instance
+)
+	if state.pending then
+		return
+	end
+	state.pending = true
 	task.defer(function()
-		-- Snapshot the keys first so we can iterate while the rename
-		-- callbacks mutate `instanceToPath`/`fileToInstance` in lockstep.
-		local candidates: { Instance } = {}
-		for instance in pairs(self.instanceToPath) do
-			table.insert(candidates, instance)
-		end
-		for _, instance in ipairs(candidates) do
-			local cached = self.instanceToPath[instance]
-			if cached == nil then
-				continue
-			end
-			if not instance:IsA("LuaSourceContainer") then
-				continue
-			end
-			if instance ~= mapParent and not instance:IsDescendantOf(mapParent) then
-				continue
-			end
-			local newPath, kind = TreeBuilder.computePath(mapPath, mapParent, instance)
-			if newPath == nil or kind == nil then
-				continue
-			end
-			if cached == newPath then
-				continue
-			end
-			local ok, src = pcall(function()
-				return (instance :: LuaSourceContainer).Source
-			end)
-			if not ok then
-				self.log(`rename detect: read Source failed for {instance.Name}`)
-				continue
-			end
-			local sha = Sha256.hex(src)
-			local hook = self.onStudioRenamed
-			if hook ~= nil then
-				hook(cached, newPath, kind, src, sha)
-			end
-			if self.fileToInstance[cached] == instance then
-				self.fileToInstance[cached] = nil
-			end
-			self.fileToInstance[newPath] = instance
-			self.instanceToPath[instance] = newPath
-			forgetEcho(self, cached)
-			seatEcho(self, newPath, sha, #src)
-		end
+		state.pending = false
+		runDemotionScan(self, mapPath, mapParent)
 	end)
 end
 
@@ -1222,6 +1260,9 @@ function Applier.startLiveWatcher(self: Applier)
 	table.clear(self.liveConnections)
 
 	for mapPath, mapParent in pairs(self.mappings) do
+		-- One coalescing flag per mapping: a burst of `DescendantRemoving`
+		-- events schedules a single demotion scan instead of one each (A11).
+		local demotionScan: ScanState = { pending = false }
 		local addedConn = mapParent.DescendantAdded:Connect(function(desc: Instance)
 			-- Promotion: a non-script child landing under a tracked script
 			-- moves the script's path from leaf to container. Run this
@@ -1292,9 +1333,12 @@ function Applier.startLiveWatcher(self: Applier)
 		table.insert(self.liveConnections, addedConn)
 
 		local removingConn = mapParent.DescendantRemoving:Connect(function(desc: Instance)
-			-- Defer the check so `desc.Parent:GetChildren()` reflects the
-			-- post-removal state. Demotion fires from there.
-			detectDemotionChain(self, mapPath, mapParent, desc)
+			-- Coalesced: a burst of removals schedules ONE deferred scan (the
+			-- scan reads the settled tree). `desc` is unused — Roblox may
+			-- already have nil'd its Parent, which is why the scan brute-forces
+			-- the tracked map instead of walking up from `desc`.
+			local _ = desc
+			scheduleDemotionScan(self, demotionScan, mapPath, mapParent)
 		end)
 		table.insert(self.liveConnections, removingConn)
 	end
