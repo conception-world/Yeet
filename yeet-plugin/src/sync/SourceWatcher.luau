@@ -58,6 +58,14 @@ type Entry = {
 	-- a copy of the value at the time it was enqueued and bails out if the
 	-- entry's gen has advanced (meaning another fire superseded it).
 	gen: number,
+	-- Content/hash of the most recent non-echo user edit that has NOT yet
+	-- been forwarded to the daemon. Captured synchronously when the Source
+	-- signal fires (before the debounce) so the trailing-edge send can report
+	-- the user's actual edit even if the Applier overwrote `Source` with
+	-- daemon content inside the 200ms window (A3). Cleared when the debounce
+	-- fires. Also read by `peekPending` so the Applier can avoid clobbering.
+	pendingContent: string?,
+	pendingHash: string?,
 }
 
 type Options = {
@@ -203,6 +211,8 @@ function SourceWatcher.track(self: SourceWatcher, path: string, instance: Instan
 		nameConnection = nil :: any,
 		ancestryConnection = nil :: any,
 		gen = 0,
+		pendingContent = nil,
+		pendingHash = nil,
 	}
 	self.byPath[path] = entry
 	self.byInstance[instance] = entry
@@ -282,6 +292,12 @@ function SourceWatcher.track(self: SourceWatcher, path: string, instance: Instan
 			-- hash, so the change is a no-op from the sync perspective.
 			return
 		end
+		-- REGRESSION(A3): capture the user's edit synchronously, before the
+		-- debounce. If a daemon FileChanged overwrites Source with disk content
+		-- inside the window, the trailing send still reports THIS captured
+		-- value instead of the clobbered one — the user's edit is never lost.
+		entry.pendingContent = current
+		entry.pendingHash = syncHash
 
 		entry.gen += 1
 		local myGen = entry.gen
@@ -290,6 +306,11 @@ function SourceWatcher.track(self: SourceWatcher, path: string, instance: Instan
 				-- Superseded by a later signal fire or by untrack.
 				return
 			end
+			local capturedContent = entry.pendingContent
+			local capturedHash = entry.pendingHash
+			-- Consume the capture; a later edit re-captures a fresh one.
+			entry.pendingContent = nil
+			entry.pendingHash = nil
 			local latest = readSource(instance)
 			if latest == nil then
 				return
@@ -298,15 +319,25 @@ function SourceWatcher.track(self: SourceWatcher, path: string, instance: Instan
 			if finalPath == nil then
 				return
 			end
-			local finalHash = self.hash(latest)
-			-- Re-check: the daemon may have pushed a FileChanged during the
-			-- 200ms window; if our current Source already matches what the
-			-- Applier last wrote, there is nothing new to report.
-			if self.isEcho(finalPath, finalHash) then
+			local latestHash = self.hash(latest)
+			if not self.isEcho(finalPath, latestHash) then
+				-- Common path: the current Source is a genuine (non-echo) user
+				-- state — send it. Correctly reflects an undo/redo the user made
+				-- during the debounce window.
+				self.log(`-> file_changed {finalPath}`)
+				self.onEdit(finalPath, latest, latestHash)
 				return
 			end
-			self.log(`-> file_changed {finalPath}`)
-			self.onEdit(finalPath, latest, finalHash)
+			-- REGRESSION(A3): the current Source matches a recent Applier write
+			-- (echo) — a daemon FileChanged clobbered the user's edit inside the
+			-- window. Forward the CAPTURED edit so it reaches the daemon
+			-- (surfacing as a conflict) instead of vanishing silently.
+			if capturedContent ~= nil and capturedHash ~= nil
+				and not self.isEcho(finalPath, capturedHash)
+			then
+				self.log(`-> file_changed {finalPath} (recovered pre-clobber edit)`)
+				self.onEdit(finalPath, capturedContent, capturedHash)
+			end
 		end)
 	end)
 end
@@ -319,6 +350,19 @@ function SourceWatcher.untrack(self: SourceWatcher, path: string)
 	disconnectAll(entry)
 	self.byPath[path] = nil
 	self.byInstance[entry.instance] = nil
+end
+
+-- Returns the pending, not-yet-forwarded user edit captured for `path` at the
+-- last Source-change signal, or (nil, nil) when none is buffered. The Applier
+-- consults this before overwriting Source so a daemon FileChanged landing
+-- inside the debounce window doesn't silently clobber the user's in-flight
+-- edit (A3).
+function SourceWatcher.peekPending(self: SourceWatcher, path: string): (string?, string?)
+	local entry = self.byPath[path]
+	if entry == nil then
+		return nil, nil
+	end
+	return entry.pendingContent, entry.pendingHash
 end
 
 function SourceWatcher.destroy(self: SourceWatcher)

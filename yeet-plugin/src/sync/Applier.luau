@@ -220,6 +220,11 @@ type self = {
 	-- cached one; the Widget tears the connection down. Optional: absent in
 	-- minimal/test wirings, where the loud log line is the only signal.
 	onProjectRootMismatch: ((expected: string, got: string) -> ())?,
+	-- Injected by the Widget: queries the SourceWatcher for a pending,
+	-- not-yet-sent Studio edit at `path`, returning (content, hash) or nil.
+	-- applyFileChanged consults it so a daemon FileChanged doesn't silently
+	-- clobber an in-flight user edit (A3).
+	pendingEditProbe: ((path: string) -> (string?, string?))?,
 	-- `DescendantAdded` listeners rooted on each `$path` mapping parent.
 	-- Kept so `reset()` can disconnect them alongside the rest of the
 	-- bootstrap-owned state.
@@ -257,6 +262,7 @@ function Applier.new(log: Log): Applier
 		onBootstrapSnapshot = nil :: BootstrapSnapshotHook?,
 		projectRoot = nil :: string?,
 		onProjectRootMismatch = nil :: ((expected: string, got: string) -> ())?,
+		pendingEditProbe = nil :: ((path: string) -> (string?, string?))?,
 		liveConnections = {} :: { RBXScriptConnection },
 	}, Applier)
 end
@@ -274,6 +280,13 @@ function Applier.setProjectRootMismatchHook(
 	hook: ((expected: string, got: string) -> ())?
 )
 	self.onProjectRootMismatch = hook
+end
+
+function Applier.setPendingEditProbe(
+	self: Applier,
+	probe: ((path: string) -> (string?, string?))?
+)
+	self.pendingEditProbe = probe
 end
 
 function Applier.setTrackHooks(self: Applier, onTracked: TrackHook, onUntracked: UntrackHook)
@@ -780,6 +793,22 @@ local function applyFileChanged(self: Applier, msg: any)
 	end
 	local content: string = msg.content
 	local hash: string = msg.sha256
+	-- REGRESSION(A3): before overwriting Source, check for a local,
+	-- not-yet-sent Studio edit. If one exists and differs from the daemon's
+	-- content, overwriting would silently clobber the user's edit (a lost
+	-- update with no conflict dialog). Skip the write and let the
+	-- SourceWatcher's captured edit flow to the daemon, which then surfaces
+	-- the divergence as a conflict. An equal-hash pending is the same content,
+	-- so we fall through and apply (a harmless no-op that keeps the echo
+	-- bookkeeping seeded).
+	local probe = self.pendingEditProbe
+	if probe ~= nil then
+		local _, pendingHash = probe(msg.path)
+		if pendingHash ~= nil and pendingHash ~= hash then
+			self.log(`~ {msg.path} (local edit pending; not overwriting — daemon will reconcile)`)
+			return
+		end
+	end
 	-- Seat the hash BEFORE the assignment: `GetPropertyChangedSignal` fires
 	-- synchronously during the write, and the watcher will read
 	-- `recentlyApplied` inside that callback.

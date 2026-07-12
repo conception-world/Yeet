@@ -151,11 +151,16 @@ type ApplierHandle = {
     self: ApplierHandle,
     hook: ((expected: string, got: string) -> ())?
   ) -> (),
+  setPendingEditProbe: (
+    self: ApplierHandle,
+    probe: ((path: string) -> (string?, string?))?
+  ) -> (),
   reset: (self: ApplierHandle) -> (),
 }
 type SourceWatcherHandle = {
   track: (self: SourceWatcherHandle, path: string, instance: Instance) -> (),
   untrack: (self: SourceWatcherHandle, path: string) -> (),
+  peekPending: (self: SourceWatcherHandle, path: string) -> (string?, string?),
   destroy: (self: SourceWatcherHandle) -> (),
 }
 
@@ -977,6 +982,11 @@ function Widget._onConnectPressed(self: Widget)
     sourceWatcher:track(path, instance)
   end, function(path)
     sourceWatcher:untrack(path)
+  end)
+  -- A3: let the Applier consult the watcher for a pending, not-yet-sent
+  -- Studio edit before it overwrites Source with daemon content.
+  applier:setPendingEditProbe(function(path: string)
+    return sourceWatcher:peekPending(path)
   end)
   applier:setConflictDispatcher(function(conflicts)
     self.resolver:enqueue(conflicts)
