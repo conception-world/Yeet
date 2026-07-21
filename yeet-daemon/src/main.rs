@@ -576,13 +576,47 @@ async fn handle_fs_event(
     // canonical mount roots pruning protects, and `tree_fs` — after which the
     // union of the pre- and post-reload trees is reconciled so newly mapped
     // files reach Studio and unmapped ones stop being tracked.
+    //
+    // A *nested* `default.project.json` — the one every Wally package ships —
+    // takes the same path minus the project reload. Honoring it is what mounts
+    // `<pkg>/src/init.lua` AS the package ModuleScript instead of a bare Folder
+    // with a stray `src` child (A10), but `package_remaps` is only rebuilt by
+    // `rescan_fs`, and the file is not `classify`-able so the watcher used to
+    // drop it outright. A `wally install` with the daemon running therefore
+    // synced every new package in the wrong shape until the next restart.
     {
-        let project_file_rel = state.read().await.relative(&abs_for_meta);
-        if project_file_rel.as_deref() == Some(PROJECT_FILE) {
+        let (is_root_project_file, is_nested_project_file) = {
+            let guard = state.read().await;
+            let named_like_a_project = abs_for_meta
+                .file_name()
+                .and_then(|n| n.to_str())
+                .is_some_and(|n| n.eq_ignore_ascii_case(PROJECT_FILE));
+            if named_like_a_project {
+                let rel = guard.relative(&abs_for_meta);
+                let is_root = rel.as_deref() == Some(PROJECT_FILE);
+                // A nested one only matters inside a mount; anything else is an
+                // unrelated file that happens to share the name.
+                let is_nested =
+                    !is_root && rel.is_some_and(|rel| guard.is_under_mapping(&rel));
+                (is_root, is_nested)
+            } else {
+                (false, false)
+            }
+        };
+        if is_root_project_file || is_nested_project_file {
             let (reloaded, mounts, added) = {
                 let mut guard = state.write().await;
                 let before: BTreeSet<String> = guard.tree_fs.keys().cloned().collect();
-                let reloaded = guard.reload_project()?;
+                let reloaded = if is_root_project_file {
+                    guard.reload_project()?
+                } else {
+                    // The project itself is unchanged; only the package layout
+                    // moved. `rescan_fs` rebuilds `package_remaps` first, which
+                    // is the whole point.
+                    guard.rescan_fs()?;
+                    guard.mark_sourcemap_dirty();
+                    true
+                };
                 let after: BTreeSet<String> = guard.tree_fs.keys().cloned().collect();
 
                 // Files whose mount disappeared are *unmapped*, not deleted:
@@ -8245,6 +8279,84 @@ mod project_reload_tests {
                 .iter()
                 .any(|m| matches!(m, ServerMsg::FileDeleted { path } if path.starts_with("src/server"))),
             "removing a $path is a config edit, not a destructive one; got {msgs:?}"
+        );
+    }
+
+    /// `wally install` while the daemon runs. A package ships its own nested
+    /// `default.project.json` (`{name, tree:{$path:"src"}}`), and honoring it is
+    /// what makes `<pkg>/src/init.lua` mount AS the package ModuleScript instead
+    /// of leaving a bare Folder with a stray `src` child — the A10 breakage.
+    /// `package_remaps` is only rebuilt by `rescan_fs`, and a nested project
+    /// file is not `classify`-able so the watcher dropped it outright. The
+    /// package therefore synced in the wrong shape until the next daemon
+    /// restart, and `require(Packages.X)` hit a Folder at runtime.
+    #[tokio::test]
+    async fn nested_package_project_file_rebuilds_remaps() {
+        let env = make_env().await;
+        let root = env.state.read().await.root.clone();
+
+        let pkg = root.join("src/shared/Packages/_Index/roblox_signal@2.0.0/signal");
+        std::fs::create_dir_all(pkg.join("src")).expect("mkdir pkg");
+        std::fs::write(pkg.join("src/init.lua"), "return {}\n").expect("write init");
+        std::fs::write(
+            pkg.join(PROJECT_FILE),
+            r#"{"name":"signal","tree":{"$path":"src"}}"#,
+        )
+        .expect("write nested project");
+
+        // Map the tree that now contains the package.
+        std::fs::write(
+            root.join(PROJECT_FILE),
+            r#"{"name":"Reload","tree":{"$className":"DataModel","ReplicatedStorage":{"$path":"src/shared"}}}"#,
+        )
+        .expect("rewrite project");
+        handle_fs_event(
+            &env.state,
+            FileEvent::Touched(root.join(PROJECT_FILE)),
+            &env.bcast_tx,
+        )
+        .await
+        .expect("handle root project change");
+
+        let collapsed = "src/shared/Packages/_Index/roblox_signal@2.0.0/signal/init.lua";
+        assert!(
+            env.state.read().await.tree_fs.contains_key(collapsed),
+            "a package present at reload time must collapse onto the package name"
+        );
+
+        // Now the real scenario: a SECOND package appears with the daemon
+        // already running, announced only by its own nested project file.
+        let pkg2 = root.join("src/shared/Packages/_Index/roblox_promise@4.0.0/promise");
+        std::fs::create_dir_all(pkg2.join("src")).expect("mkdir pkg2");
+        std::fs::write(pkg2.join("src/init.lua"), "return 1\n").expect("write init2");
+        let nested2 = pkg2.join(PROJECT_FILE);
+        std::fs::write(&nested2, r#"{"name":"promise","tree":{"$path":"src"}}"#)
+            .expect("write nested project 2");
+        handle_fs_event(&env.state, FileEvent::Touched(nested2), &env.bcast_tx)
+            .await
+            .expect("handle nested project change");
+
+        let guard = env.state.read().await;
+        let collapsed2 = "src/shared/Packages/_Index/roblox_promise@4.0.0/promise/init.lua";
+        assert!(
+            guard.tree_fs.contains_key(collapsed2),
+            "a package installed mid-session must collapse too; keys were {:?}",
+            guard
+                .tree_fs
+                .keys()
+                .filter(|k| k.contains("promise"))
+                .collect::<Vec<_>>()
+        );
+        assert!(
+            !guard
+                .tree_fs
+                .keys()
+                .any(|k| k.contains("promise/src/")),
+            "the package's own $path segment must not survive as an instance path"
+        );
+        assert!(
+            guard.tree_fs.contains_key(collapsed),
+            "the package that was already there must survive the rebuild"
         );
     }
 
