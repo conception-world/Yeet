@@ -53,12 +53,20 @@ export async function createProject(output: vscode.OutputChannel): Promise<void>
 	}
 
 	const projectFile = path.join(folder, "default.project.json");
-	if (fs.existsSync(projectFile)) {
+	const sourcemapFile = path.join(folder, "sourcemap.json");
+	// Both files are rewritten from the scaffold below, so both are at risk —
+	// the modal has to name whichever ones actually exist, and each gets a
+	// `.bak` before being replaced.
+	const doomed = [projectFile, sourcemapFile].filter((f) => fs.existsSync(f));
+	if (doomed.length > 0) {
+		const names = doomed.map((f) => path.basename(f)).join(" and ");
 		const choice = await vscode.window.showWarningMessage(
-			"default.project.json already exists in this folder. Overwriting replaces the " +
-				"entire tree with the yeet.createTemplate scaffold — any custom mounts (Packages, " +
-				"extra services, hand-edited $path entries, etc.) not in that template will be lost. " +
-				"The current file will be backed up as default.project.json.bak first.",
+			`${names} already exist${doomed.length === 1 ? "s" : ""} in this folder. ` +
+				"Yeet: Create replaces the entire tree with the yeet.createTemplate scaffold — " +
+				"any custom mounts (Packages, extra services, hand-edited $path entries, etc.) " +
+				"not in that template will be lost. " +
+				`The current file${doomed.length === 1 ? "" : "s"} will be backed up as ` +
+				`${doomed.map((f) => `${path.basename(f)}.bak`).join(" and ")} first.`,
 			{ modal: true },
 			"Overwrite",
 			"Cancel",
@@ -67,7 +75,9 @@ export async function createProject(output: vscode.OutputChannel): Promise<void>
 			output.appendLine("[yeet:create] cancelled (project already exists)");
 			return;
 		}
-		backupExistingProjectFile(projectFile, output);
+		for (const file of doomed) {
+			backupExistingFile(file, output);
+		}
 	}
 
 	const cfg = vscode.workspace.getConfiguration("yeet");
@@ -116,22 +126,19 @@ export async function createProject(output: vscode.OutputChannel): Promise<void>
 	);
 }
 
-/// Preserves the pre-overwrite `default.project.json` as a sibling `.bak`
-/// file so a user who confirmed the overwrite modal without fully reading it
-/// can still recover custom mounts (Packages, extra services) by hand. Best
-/// effort: a failed backup is logged but does not block the overwrite, since
-/// the user already confirmed the modal's warning about data loss.
-function backupExistingProjectFile(
-	projectFile: string,
-	output: vscode.OutputChannel,
-): void {
-	const backupFile = `${projectFile}.bak`;
+/// Preserves a file about to be overwritten as a sibling `.bak` so a user who
+/// confirmed the modal without fully reading it can still recover custom
+/// mounts (Packages, extra services) by hand. Best effort: a failed backup is
+/// logged but does not block the overwrite, since the user already confirmed
+/// the modal's warning about data loss.
+function backupExistingFile(file: string, output: vscode.OutputChannel): void {
+	const backupFile = `${file}.bak`;
 	try {
-		fs.copyFileSync(projectFile, backupFile);
-		output.appendLine(`[yeet:create] backed up existing project file to ${backupFile}`);
+		fs.copyFileSync(file, backupFile);
+		output.appendLine(`[yeet:create] backed up ${path.basename(file)} to ${backupFile}`);
 	} catch (err) {
 		const message = err instanceof Error ? err.message : String(err);
-		output.appendLine(`[yeet:create] failed to back up ${projectFile}: ${message}`);
+		output.appendLine(`[yeet:create] failed to back up ${file}: ${message}`);
 	}
 }
 
@@ -285,10 +292,16 @@ function writeInitialSourcemap(
 
 /// Recursively converts a `default.project.json` tree's instance children into
 /// sourcemap nodes. `$`-prefixed keys (`$className`, `$path`, ...) are metadata,
-/// not instances, so they're skipped. A node's className comes from its
-/// `$className` when set, else the instance name itself — services' ClassName
-/// equals their name, so this is correct for the scaffold's KNOWN_SERVICES.
-function treeToSourcemapChildren(node: TreeNode): SourcemapNode[] {
+/// not instances, so they're skipped.
+///
+/// className resolution mirrors the daemon's `ensure_segment_chain` exactly:
+/// an explicit `$className` wins; otherwise a direct child of the DataModel
+/// keeps its own name (a service's ClassName equals its name) and anything
+/// deeper defaults to `Folder`. Using name-as-className at every depth — as
+/// this did — disagreed with the daemon, so a hand-written nested node was
+/// written one way by `Yeet: Create` and then flipped the moment the daemon
+/// regenerated the file.
+function treeToSourcemapChildren(node: TreeNode, depth = 0): SourcemapNode[] {
 	const children: SourcemapNode[] = [];
 	for (const [key, value] of Object.entries(node)) {
 		if (key.startsWith("$")) {
@@ -297,12 +310,13 @@ function treeToSourcemapChildren(node: TreeNode): SourcemapNode[] {
 		if (typeof value !== "object" || value === null) {
 			continue;
 		}
-		const className = typeof value.$className === "string" ? value.$className : key;
+		const className =
+			typeof value.$className === "string" ? value.$className : depth === 0 ? key : "Folder";
 		children.push({
 			name: key,
 			className,
 			filePaths: [],
-			children: treeToSourcemapChildren(value),
+			children: treeToSourcemapChildren(value, depth + 1),
 		});
 	}
 	return children;
@@ -324,6 +338,11 @@ function writeGitignore(folder: string, output: vscode.OutputChannel): void {
 		"ServerPackages/",
 		"DevPackages/",
 		"node_modules/",
+		// Regenerated by the daemon on every structural change (each file
+		// added, removed, or renamed rewrites it), so committing it produces
+		// churn and merge conflicts for a file no human edits.
+		"sourcemap.json",
+		"*.bak",
 	];
 	if (fs.existsSync(file)) {
 		const existing = fs.readFileSync(file, "utf8");
