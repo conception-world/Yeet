@@ -758,6 +758,17 @@ async fn handle_fs_event(
             let entry_meta = guard.meta_for(&rel);
             guard.tree_fs.remove(&rel);
             guard.meta.remove(&rel);
+            // The path is gone from `tree_fs` — the very map the sourcemap is
+            // built from — so its shape changed and the file must be rewritten.
+            // Marking here rather than in the deferred reconcile below is what
+            // covers the common editor-delete case: with no plugin connected
+            // `tree_studio` is empty, the reconcile resolves to `AdoptBase`
+            // (or `Noop`), and neither arm broadcasts a `FileDeleted` or marks
+            // dirty — so the deleted script lingered in `sourcemap.json` until
+            // some unrelated change happened to evict it. A removal that turns
+            // out to be half of a rename re-inserts the new key and marks again;
+            // the writer's `structure_signature` guard collapses the pair.
+            guard.mark_sourcemap_dirty();
             // Keyed by path (AUDITORIA-YEET.md A1) — every removal gets its
             // own slot, so two same-content deletes in the same window can
             // no longer clobber each other. `entry.sha256` is what a later

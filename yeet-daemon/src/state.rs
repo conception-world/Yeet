@@ -640,7 +640,47 @@ impl ProjectState {
     /// so `tree_fs`/`tree_base`/`tree_studio` and the watcher all key a package
     /// file by the same instance-shaped path.
     pub fn relative(&self, abs: &Path) -> Option<String> {
-        Some(self.collapse_package_path(self.rel_raw(abs)?))
+        let rel = self.canonicalize_mount_case(self.rel_raw(abs)?);
+        Some(self.collapse_package_path(rel))
+    }
+
+    /// Rewrites a raw project-relative path's mount prefix to the casing
+    /// `default.project.json` declares, leaving every deeper segment untouched.
+    ///
+    /// Windows and macOS filesystems are case-preserving but case-insensitive,
+    /// so the same physical directory reaches us spelled two ways: the boot scan
+    /// walks `root.join($path)` and therefore yields the *project's* casing,
+    /// while every watcher event carries the *disk's*. Keying `tree_fs` by both
+    /// meant one file occupied two slots, and the lookups that must find an
+    /// existing entry silently missed — a delete of a boot-scanned file was
+    /// dropped as "removal of untracked path", so it never reached Studio and
+    /// never left `sourcemap.json`. `is_under_mapping` already folds case for
+    /// the same reason; this makes the key itself canonical so every consumer
+    /// agrees without each having to fold on its own.
+    ///
+    /// Only the prefix is normalized: `filePaths` in the sourcemap and every
+    /// disk write below the mount need the real on-disk casing.
+    fn canonicalize_mount_case(&self, rel: String) -> String {
+        for (_, dir) in self.project.path_mappings() {
+            let dir = dir.to_string_lossy().replace('\\', "/");
+            let dir = dir.trim_end_matches('/');
+            if dir.is_empty() || dir == "." {
+                continue;
+            }
+            if rel.eq_ignore_ascii_case(dir) {
+                return dir.to_owned();
+            }
+            // The separator check also guarantees `dir.len()` is a char
+            // boundary — `/` is ASCII, never a UTF-8 continuation byte — and
+            // keeps a mount `src` from claiming a sibling `srcextra`.
+            if rel.len() > dir.len()
+                && rel.as_bytes()[dir.len()] == b'/'
+                && rel[..dir.len()].eq_ignore_ascii_case(dir)
+            {
+                return format!("{dir}{}", &rel[dir.len()..]);
+            }
+        }
+        rel
     }
 
     /// Disk→instance half of a `PackageRemap`: rewrites a raw project-relative
@@ -884,6 +924,80 @@ fn persist_session_id(root: &Path, id: &str) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// On Windows / macOS the on-disk mount directory may be spelled `Src/`
+    /// while `default.project.json` declares `"src"` — a rename in Explorer or a
+    /// branch checkout is enough. The boot scan walks `root.join("src")`, so its
+    /// keys carry the *project's* casing; every watcher event arrives with the
+    /// *disk's*. Without canonicalization the same physical file gets two
+    /// different keys, and the lookups that must find an existing entry —
+    /// notably the `FileEvent::Removed` handler's `tree_fs.get(&rel)` — miss:
+    /// the delete is dropped as "removal of untracked path", never reaches
+    /// Studio, and never leaves `sourcemap.json`.
+    #[test]
+    fn relative_canonicalizes_mount_casing() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let root = dir.path();
+        std::fs::write(
+            root.join("default.project.json"),
+            r#"{"name":"T","tree":{"ReplicatedStorage":{"$path":"src/shared"}}}"#,
+        )
+        .expect("write project");
+        std::fs::create_dir_all(root.join("Src/shared")).expect("mkdir Src/shared");
+        std::fs::write(root.join("Src/shared/Config.luau"), "return {}\n").expect("write");
+
+        let project = Project::load(&root.join("default.project.json")).expect("load project");
+        let state = ProjectState::bootstrap(root, project, false, false).expect("bootstrap");
+
+        assert_eq!(
+            state.relative(&root.join("Src/shared/Config.luau")).as_deref(),
+            Some("src/shared/Config.luau"),
+            "a disk-cased path must key by the project's declared mount casing"
+        );
+        assert_eq!(
+            state.relative(&root.join("src/shared/Config.luau")).as_deref(),
+            Some("src/shared/Config.luau"),
+            "the project-cased path must be unchanged"
+        );
+        assert!(
+            state.tree_fs.contains_key("src/shared/Config.luau"),
+            "the scanned tree must use the same canonical key the watcher will produce"
+        );
+        assert_eq!(
+            state.tree_fs.len(),
+            1,
+            "one physical file must never occupy two keys"
+        );
+    }
+
+    /// Canonicalization must not rewrite a path that merely shares a prefix with
+    /// a mount, and must leave everything below the mount byte-for-byte alone —
+    /// `filePaths` and disk writes depend on the real casing of those segments.
+    #[test]
+    fn relative_preserves_casing_below_and_outside_mounts() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let root = dir.path();
+        std::fs::write(
+            root.join("default.project.json"),
+            r#"{"name":"T","tree":{"ReplicatedStorage":{"$path":"src"}}}"#,
+        )
+        .expect("write project");
+        std::fs::create_dir_all(root.join("src")).expect("mkdir src");
+
+        let project = Project::load(&root.join("default.project.json")).expect("load project");
+        let state = ProjectState::bootstrap(root, project, false, false).expect("bootstrap");
+
+        assert_eq!(
+            state.relative(&root.join("SRC/Deep/MixedCase.luau")).as_deref(),
+            Some("src/Deep/MixedCase.luau"),
+            "only the mount prefix is canonicalized; deeper segments keep disk casing"
+        );
+        assert_eq!(
+            state.relative(&root.join("srcextra/Foo.luau")).as_deref(),
+            Some("srcextra/Foo.luau"),
+            "a sibling sharing the mount's prefix must not be rewritten"
+        );
+    }
 
     // ─── A10 (wally-1): honor nested `default.project.json` ───────────────────
 

@@ -2,7 +2,8 @@ use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Deserializer, Serialize};
+use serde_json::Value;
 
 /// Rojo-compatible project file (subset sufficient for Phase 1).
 ///
@@ -16,7 +17,7 @@ pub struct Project {
     pub tree: TreeNode,
 }
 
-#[derive(Debug, Clone, Deserialize, Serialize, Default)]
+#[derive(Debug, Clone, Serialize, Default)]
 pub struct TreeNode {
     #[serde(rename = "$className", skip_serializing_if = "Option::is_none")]
     pub class_name: Option<String>,
@@ -25,7 +26,7 @@ pub struct TreeNode {
     pub path: Option<String>,
 
     #[serde(rename = "$properties", default, skip_serializing_if = "serde_json::Map::is_empty")]
-    pub properties: serde_json::Map<String, serde_json::Value>,
+    pub properties: serde_json::Map<String, Value>,
 
     #[serde(
         rename = "$ignoreUnknownInstances",
@@ -36,6 +37,98 @@ pub struct TreeNode {
     /// Any non-`$`-prefixed key becomes a child instance by name.
     #[serde(flatten)]
     pub children: BTreeMap<String, TreeNode>,
+}
+
+/// Hand-written so unmodelled `$`-prefixed keys are *skipped* rather than
+/// captured. The derived impl used `#[serde(flatten)]` for `children`, and serde
+/// applies no name filter to a flatten target: a project carrying any Rojo key
+/// Yeet does not model (`$attributes`, `$tags`, `$id`, `$keepUnknowns`, …) was
+/// deserialized with that key as a *child instance*. Two failure modes followed
+/// from the same line — a scalar or array value failed the whole load
+/// (`invalid type: sequence, expected struct TreeNode`, and `Project::load`'s
+/// error propagates out of `main` before the daemon ever binds), while an
+/// all-object `$attributes` parsed *successfully* and injected a phantom
+/// instance literally named `$attributes` into the tree and the sourcemap.
+///
+/// Malformed values for the four keys Yeet *does* model still error — silently
+/// ignoring a typo'd `$className` would be worse than refusing to start.
+impl<'de> Deserialize<'de> for TreeNode {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> std::result::Result<Self, D::Error> {
+        let value = Value::deserialize(deserializer)?;
+        Self::from_value(value).map_err(serde::de::Error::custom)
+    }
+}
+
+impl TreeNode {
+    fn from_value(value: Value) -> std::result::Result<Self, String> {
+        let Value::Object(map) = value else {
+            return Err(format!("project tree node must be an object, got `{value}`"));
+        };
+        let mut node = Self::default();
+        for (key, value) in map {
+            match key.as_str() {
+                "$className" => {
+                    node.class_name = Some(
+                        value
+                            .as_str()
+                            .ok_or_else(|| format!("$className must be a string, got `{value}`"))?
+                            .to_owned(),
+                    );
+                }
+                "$path" => node.path = Some(parse_path(&value)?),
+                "$properties" => {
+                    let Value::Object(properties) = value else {
+                        return Err("$properties must be an object".to_owned());
+                    };
+                    node.properties = properties;
+                }
+                "$ignoreUnknownInstances" => {
+                    node.ignore_unknown_instances = Some(value.as_bool().ok_or_else(|| {
+                        format!("$ignoreUnknownInstances must be a boolean, got `{value}`")
+                    })?);
+                }
+                _ if key.starts_with('$') => {
+                    tracing::debug!(key = %key, "ignoring unsupported Rojo project key");
+                }
+                _ => {
+                    let child = Self::from_value(value)
+                        .map_err(|e| format!("in child instance `{key}`: {e}"))?;
+                    node.children.insert(key, child);
+                }
+            }
+        }
+        Ok(node)
+    }
+}
+
+/// Rojo accepts `$path` either as a plain string or as an object
+/// (`{"optional": "src"}`) that suppresses its "path does not exist" error.
+/// Both name the same directory, so both resolve to the same `String` here —
+/// a missing directory is already handled downstream (`rescan_fs` warns and
+/// skips, `state.rs`).
+fn parse_path(value: &Value) -> std::result::Result<String, String> {
+    match value {
+        Value::String(path) => Ok(path.clone()),
+        Value::Object(map) => map
+            .get("optional")
+            .and_then(Value::as_str)
+            .map(str::to_owned)
+            .ok_or_else(|| {
+                "$path object form must carry a string `optional` key".to_owned()
+            }),
+        other => Err(format!(
+            "$path must be a string or an object, got `{other}`"
+        )),
+    }
+}
+
+/// Strips a leading UTF-8 BOM. `PowerShell`'s `Out-File` and
+/// `Set-Content -Encoding utf8` prepend one, and `serde_json` then rejects the
+/// file with `expected value at line 1 column 1` — which, for the root project
+/// file, kills the daemon at startup. `state::read_meta_file` already applies
+/// the same guard to `.meta.json` files.
+fn strip_bom(raw: &str) -> &str {
+    raw.strip_prefix('\u{feff}').unwrap_or(raw)
 }
 
 /// The `default.project.json` filename Rojo, Argon, and Wally all use. Kept
@@ -61,7 +154,7 @@ impl Project {
     pub fn load(path: &Path) -> Result<Self> {
         let raw = std::fs::read_to_string(path)
             .with_context(|| format!("read {}", path.display()))?;
-        let project: Self = serde_json::from_str(&raw)
+        let project: Self = serde_json::from_str(strip_bom(&raw))
             .with_context(|| format!("parse {}", path.display()))?;
         Ok(project)
     }
@@ -75,7 +168,7 @@ impl Project {
     /// `None` on read/parse error or a degenerate/unsafe `$path`.
     pub fn load_nested_package(path: &Path) -> Option<NestedPackage> {
         let raw = std::fs::read_to_string(path).ok()?;
-        let project: Self = serde_json::from_str(&raw).ok()?;
+        let project: Self = serde_json::from_str(strip_bom(&raw)).ok()?;
         let src = project.tree.path.clone()?;
         // Only the minimal Wally shape: a lone `$path`, no sub-instances and no
         // class override to reconcile.
@@ -122,6 +215,111 @@ fn collect(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Every `$`-prefixed key Rojo defines but Yeet does not model must be
+    /// skipped, not parsed as a child instance. Before this, `#[serde(flatten)]`
+    /// swallowed them and the whole load failed with
+    /// `invalid type: sequence, expected struct TreeNode` — the daemon then
+    /// exited before binding, so nothing synced and no sourcemap was written.
+    #[test]
+    fn ignores_unsupported_dollar_keys() {
+        for raw in [
+            r#"{"name":"T","tree":{"$className":"DataModel","R":{"$path":"src","$tags":["a","b"]}}}"#,
+            r#"{"name":"T","tree":{"$className":"DataModel","R":{"$path":"src","$attributes":{"Speed":16}}}}"#,
+            r#"{"name":"T","tree":{"$className":"DataModel","R":{"$path":"src","$attributes":{"Env":"prod"}}}}"#,
+            r#"{"name":"T","tree":{"$className":"DataModel","R":{"$path":"src","$id":"abc"}}}"#,
+            r#"{"name":"T","tree":{"$className":"DataModel","R":{"$path":"src","$keepUnknowns":true}}}"#,
+        ] {
+            let project: Project =
+                serde_json::from_str(raw).unwrap_or_else(|e| panic!("parse {raw}: {e}"));
+            let child = project.tree.children.get("R").expect("R child present");
+            assert_eq!(child.path.as_deref(), Some("src"));
+            assert!(
+                child.children.is_empty(),
+                "a `$`-prefixed key must not become a child instance: {raw}"
+            );
+        }
+    }
+
+    /// The nastier half of the same bug: when every `$attributes` value is
+    /// itself an object, the old flatten *succeeded* and injected a phantom
+    /// instance literally named `$attributes`, which then flowed through
+    /// `path_mappings()` into the sourcemap.
+    #[test]
+    fn object_valued_attributes_do_not_inject_phantom_child() {
+        let raw = r#"{
+            "name": "T",
+            "tree": {
+                "$className": "DataModel",
+                "R": { "$path": "src", "$attributes": { "Nested": { "a": 1 } } }
+            }
+        }"#;
+        let project: Project = serde_json::from_str(raw).expect("parse");
+        let child = project.tree.children.get("R").expect("R child present");
+        assert!(
+            !child.children.contains_key("$attributes"),
+            "`$attributes` must never appear as an instance name"
+        );
+        assert!(child.children.is_empty());
+    }
+
+    /// Rojo's optional-path form suppresses its "path does not exist" error but
+    /// still names the same directory.
+    #[test]
+    fn accepts_optional_path_object_form() {
+        let raw = r#"{"name":"T","tree":{"$className":"DataModel","R":{"$path":{"optional":"src"}}}}"#;
+        let project: Project = serde_json::from_str(raw).expect("parse");
+        assert_eq!(
+            project.tree.children["R"].path.as_deref(),
+            Some("src"),
+            "the optional form must resolve to the same filesystem path"
+        );
+    }
+
+    /// A malformed value for a key Yeet *does* model still has to fail — the
+    /// skip above must not turn into a blanket "ignore everything".
+    #[test]
+    fn rejects_malformed_supported_keys() {
+        for raw in [
+            r#"{"name":"T","tree":{"$className":42}}"#,
+            r#"{"name":"T","tree":{"$ignoreUnknownInstances":"yes"}}"#,
+            r#"{"name":"T","tree":{"R":{"$path":["src"]}}}"#,
+            r#"{"name":"T","tree":{"R":{"$properties":"nope"}}}"#,
+        ] {
+            assert!(
+                serde_json::from_str::<Project>(raw).is_err(),
+                "malformed supported key must still be rejected: {raw}"
+            );
+        }
+    }
+
+    /// `PowerShell`'s `Out-File` / `Set-Content -Encoding utf8` prepend a UTF-8
+    /// BOM; `serde_json` then fails with `expected value at line 1 column 1`
+    /// and the daemon exits at startup. `state::read_meta_file` already guards
+    /// against this — the project loader did not.
+    #[test]
+    fn load_tolerates_utf8_bom() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join(PROJECT_FILE_NAME);
+        std::fs::write(
+            &path,
+            "\u{feff}{\"name\":\"T\",\"tree\":{\"$className\":\"DataModel\"}}",
+        )
+        .expect("write");
+        let project = Project::load(&path).expect("BOM-prefixed project must load");
+        assert_eq!(project.name, "T");
+    }
+
+    #[test]
+    fn load_nested_package_tolerates_utf8_bom() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join(PROJECT_FILE_NAME);
+        std::fs::write(&path, "\u{feff}{\"name\":\"roact\",\"tree\":{\"$path\":\"src\"}}")
+            .expect("write");
+        let nested = Project::load_nested_package(&path).expect("BOM-prefixed package must load");
+        assert_eq!(nested.name, "roact");
+        assert_eq!(nested.src, "src");
+    }
 
     #[test]
     fn parses_minimal_rojo_project() {

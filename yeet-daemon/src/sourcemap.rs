@@ -98,15 +98,32 @@ fn normalize_dir(p: &Path) -> String {
 /// is not inside it. An empty `dir` (root mount) returns `key` unchanged; a
 /// `key` equal to `dir` returns `""` (a `$path` pointing directly at one file).
 /// The trailing-slash guard keeps `src` from matching a sibling `srcextra`.
+///
+/// The comparison folds ASCII case, matching `ProjectState::is_under_mapping`.
+/// Tree keys carry whichever casing produced them — the project file's for the
+/// boot scan (`rescan_fs` walks `root.join($path)`), the real directory's for
+/// every watcher event — so on Windows / macOS a project declaring `"src"` over
+/// a disk folder named `Src/` yields both spellings in one tree. Matching
+/// literally dropped every watcher-sourced file on the floor here while sync
+/// itself kept working, leaving a sourcemap that silently stopped growing.
+/// Only the mount prefix is folded; the returned remainder (and therefore every
+/// `filePaths` entry) keeps its on-disk casing so the LSP can open the file.
 fn under_dir(key: &str, dir: &str) -> Option<String> {
     if dir.is_empty() {
         return Some(key.to_owned());
     }
-    if key == dir {
+    if key.eq_ignore_ascii_case(dir) {
         return Some(String::new());
     }
-    let prefix = format!("{dir}/");
-    key.strip_prefix(&prefix).map(str::to_owned)
+    // Checking the separator byte first also guarantees `dir.len()` is a char
+    // boundary: `/` is ASCII, so it can never be a UTF-8 continuation byte.
+    if key.len() > dir.len()
+        && key.as_bytes()[dir.len()] == b'/'
+        && key[..dir.len()].eq_ignore_ascii_case(dir)
+    {
+        return Some(key[dir.len() + 1..].to_owned());
+    }
+    None
 }
 
 /// Builds a Rojo-format sourcemap `Value` from the project's `$path` mounts and
@@ -491,6 +508,54 @@ mod tests {
             rs.get("children").and_then(Value::as_array).map(Vec::len),
             Some(0)
         );
+    }
+
+    /// Tree keys carry whichever casing produced them: the project file's for
+    /// the boot scan (`rescan_fs` walks `root.join($path)`), the real disk's for
+    /// every watcher event. On Windows / macOS those differ whenever the folder
+    /// on disk is `Src/` and the project declares `"src"` — a rename in Explorer
+    /// or a branch checkout is enough. The rest of the daemon already folds case
+    /// (`protocol::classify`, `ProjectState::is_under_mapping`); routing here did
+    /// not, so every watcher-created file was silently dropped from the map while
+    /// sync itself kept working.
+    #[test]
+    fn build_sourcemap_routes_case_insensitively() {
+        let project: Project = serde_json::from_str(
+            r#"{"name":"C","tree":{"$className":"DataModel","ReplicatedStorage":{"$path":"src/shared"}}}"#,
+        )
+        .expect("parse project");
+
+        let mut tree = Tree::new();
+        // Boot-scan casing (from the project file) …
+        tree.insert(
+            "src/shared/Boot.luau".to_owned(),
+            entry(ScriptKind::ModuleScript),
+        );
+        // … and watcher casing (from the real `Src\` directory on disk).
+        tree.insert(
+            "Src/shared/Watched.luau".to_owned(),
+            entry(ScriptKind::ModuleScript),
+        );
+
+        let map = build_sourcemap(&project, &tree);
+        let rs = child(&map, "ReplicatedStorage").expect("service node present");
+        assert!(child(rs, "Boot").is_some(), "boot-scan file must be mapped");
+        let watched = child(rs, "Watched").expect("watcher-cased file must be mapped too");
+        assert_eq!(
+            file_paths(watched),
+            vec!["Src/shared/Watched.luau".to_owned()],
+            "filePaths must keep the on-disk casing so the LSP can open the file"
+        );
+    }
+
+    /// `under_dir`'s trailing-slash guard has to survive the case fold: `src`
+    /// must not swallow a sibling `srcextra`.
+    #[test]
+    fn under_dir_case_folds_without_matching_siblings() {
+        assert_eq!(under_dir("Src/Foo.luau", "src"), Some("Foo.luau".to_owned()));
+        assert_eq!(under_dir("SRC", "src"), Some(String::new()));
+        assert_eq!(under_dir("srcextra/Foo.luau", "src"), None);
+        assert_eq!(under_dir("other/Foo.luau", "src"), None);
     }
 
     #[test]
