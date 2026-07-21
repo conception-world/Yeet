@@ -246,6 +246,19 @@ async fn main() -> Result<()> {
     // `require(Packages.X)`, and Wally types the moment the project opens —
     // before this Yeet never generated one and type resolution was dead on a
     // fresh setup. Best-effort: a failure here must not block the daemon.
+    // Two files that resolve to one instance name (`Foo.lua` beside `Foo.luau`,
+    // `Bar.luau` beside `Bar.server.luau`) are a project Rojo would refuse to
+    // build. Yeet syncs both, so the last apply wins in Studio while `tree_base`
+    // keeps an entry per file — a standing desync. Deciding what to *do* about
+    // it spans the plugin; naming the pair up front at least makes the fallout
+    // diagnosable instead of a mystery.
+    for (instance, files) in sourcemap::detect_name_collisions(&state_inner.tree_fs) {
+        warn!(
+            instance,
+            files = files.join(", "),
+            "multiple files resolve to one instance — Studio will keep whichever syncs last"
+        );
+    }
     if let Err(e) = sourcemap::write_sourcemap(
         &state_inner.root,
         &state_inner.project,

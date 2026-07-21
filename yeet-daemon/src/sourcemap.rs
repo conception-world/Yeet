@@ -161,22 +161,35 @@ pub fn build_sourcemap(project: &Project, tree: &Tree, remaps: &[PackageRemap]) 
         .map(|(segments, dir)| (segments, normalize_dir(&dir)))
         .collect();
 
-    // Pre-create every mount's instance chain so a service with no files yet
-    // still appears — the LSP needs the node present to resolve `game.<Service>`.
-    for (segments, _dir) in &mounts {
+    // Pre-create every instance the project *declares*, not just the ones
+    // carrying a `$path`. Rojo builds the whole declared tree — `$path` only
+    // says where a node's contents come from — so a pure container
+    // (`"Shared": {"$className": "Folder"}`, `"Lighting": {"$properties": …}`,
+    // the shapes `rojo init` emits) exists at runtime and has to resolve in the
+    // editor too. Seeding only from `path_mappings()` dropped all of them, and
+    // also left a mapped-but-empty service missing until its first file landed.
+    let mut declared: Vec<Vec<String>> = Vec::new();
+    collect_declared(&project.tree, &mut Vec::new(), &mut declared);
+    for segments in &declared {
         ensure_segment_chain(&mut root, project, segments);
     }
 
     // Route each tracked file to its best (longest matching dir) mount, then
-    // materialize it into that mount's subtree.
+    // materialize it into that mount's subtree. A tie routes to *every* mount
+    // at that length: Rojo materializes a directory into each mount that names
+    // it, so one `src/shared` reachable from both `ReplicatedStorage` and
+    // `StarterPlayerScripts` belongs in both. Picking a single winner (what
+    // `max_by_key` did — last candidate on a tie, i.e. `BTreeMap` order) left
+    // the other service empty.
     let mut keys: Vec<&str> = tree.keys().map(String::as_str).collect();
     keys.sort_unstable();
     for key in keys {
-        let best = mounts
+        let Some(best_len) = mounts
             .iter()
-            .filter_map(|(segments, dir)| under_dir(key, dir).map(|rel| (segments, dir.len(), rel)))
-            .max_by_key(|(_, dir_len, _)| *dir_len);
-        let Some((segments, _dir_len, rel)) = best else {
+            .filter(|(_, dir)| under_dir(key, dir).is_some())
+            .map(|(_, dir)| dir.len())
+            .max()
+        else {
             continue;
         };
         let file_name = key.rsplit('/').next().unwrap_or(key);
@@ -186,11 +199,79 @@ pub fn build_sourcemap(project: &Project, tree: &Tree, remaps: &[PackageRemap]) 
         // luau-lsp opens the `filePaths` string verbatim, so it has to be the
         // real path on disk — undo the package collapse the tree key carries.
         let disk_path = fs_rel_with(remaps, key);
-        let mount = ensure_segment_chain(&mut root, project, segments);
-        place_file(mount, &rel, &disk_path, &script_name, kind);
+        for (segments, dir) in &mounts {
+            if dir.len() != best_len {
+                continue;
+            }
+            let Some(rel) = under_dir(key, dir) else {
+                continue;
+            };
+            let mount = ensure_segment_chain(&mut root, project, segments);
+            place_file(mount, &rel, &disk_path, &script_name, kind);
+        }
     }
 
     root.to_json(root_name)
+}
+
+/// Collects the instance-path segments of every child the project tree
+/// declares, at any depth — the `$path`-less counterpart to
+/// `Project::path_mappings`.
+fn collect_declared(
+    node: &crate::project::TreeNode,
+    parents: &mut Vec<String>,
+    out: &mut Vec<Vec<String>>,
+) {
+    for (name, child) in &node.children {
+        parents.push(name.clone());
+        out.push(parents.clone());
+        collect_declared(child, parents, out);
+        parents.pop();
+    }
+}
+
+/// Every set of tracked files that would collapse onto a single Roblox
+/// instance, as `(instance path without extension, the colliding file keys)`.
+///
+/// `Foo.lua` and `Foo.luau` in one directory both classify as the module `Foo`;
+/// so do `Bar.luau` and `Bar.server.luau`. Rojo rejects such a project outright.
+/// Yeet instead syncs every file, and since the plugin reuses the instance it
+/// already created and overwrites `Source`, whichever apply lands last wins
+/// while `tree_base` keeps one entry per *file* — two entries describing one
+/// instance, which is a standing desync. Resolving that is a cross-component
+/// decision; reporting it is not, and a named pair is the difference between a
+/// diagnosable problem and a silent one.
+///
+/// Results are sorted by instance path, and each file list is sorted, so the
+/// warning is stable across runs.
+#[must_use]
+pub fn detect_name_collisions(tree: &Tree) -> Vec<(String, Vec<String>)> {
+    let mut by_instance: BTreeMap<String, Vec<String>> = BTreeMap::new();
+    for key in tree.keys() {
+        let (dir, file_name) = match key.rsplit_once('/') {
+            Some((dir, file)) => (dir, file),
+            None => ("", key.as_str()),
+        };
+        let Some((script_name, _kind)) = classify(file_name) else {
+            continue;
+        };
+        // `init.luau` names its *parent*, so two init files in one directory
+        // collide with each other but not with a sibling literally named `init`.
+        let instance = if dir.is_empty() {
+            script_name
+        } else {
+            format!("{dir}/{script_name}")
+        };
+        by_instance.entry(instance).or_default().push(key.clone());
+    }
+    by_instance
+        .into_iter()
+        .filter(|(_, files)| files.len() > 1)
+        .map(|(instance, mut files)| {
+            files.sort();
+            (instance, files)
+        })
+        .collect()
 }
 
 /// Walks (creating as needed) the instance chain named by `segments`, returning
@@ -627,6 +708,131 @@ mod tests {
         );
     }
 
+    /// Rojo materializes a directory into *every* mount that names it, so the
+    /// standard shared-code layout — one `src/shared` reachable from both
+    /// `ReplicatedStorage` and `StarterPlayerScripts` — puts the same modules in
+    /// both places. Routing picked a single winner via `max_by_key`, which on a
+    /// length tie keeps the *last* candidate; mounts are walked in `BTreeMap`
+    /// order, so `StarterPlayer` (S) silently beat `ReplicatedStorage` (R) and
+    /// the service the user actually requires from came out empty.
+    #[test]
+    fn build_sourcemap_routes_shared_path_to_every_tied_mount() {
+        let project: Project = serde_json::from_str(
+            r#"{
+                "name": "Shared",
+                "tree": {
+                    "$className": "DataModel",
+                    "ReplicatedStorage": { "$path": "src/shared" },
+                    "StarterPlayer": {
+                        "StarterPlayerScripts": { "$className": "StarterPlayerScripts", "$path": "src/shared" }
+                    }
+                }
+            }"#,
+        )
+        .expect("parse project");
+
+        let mut tree = Tree::new();
+        tree.insert(
+            "src/shared/Config.luau".to_owned(),
+            entry(ScriptKind::ModuleScript),
+        );
+
+        let map = build_sourcemap(&project, &tree, &[]);
+        let rs = child(&map, "ReplicatedStorage").expect("ReplicatedStorage present");
+        assert_eq!(
+            file_paths(child(rs, "Config").expect("Config under ReplicatedStorage")),
+            vec!["src/shared/Config.luau".to_owned()],
+        );
+        let sps = child(
+            child(&map, "StarterPlayer").expect("StarterPlayer present"),
+            "StarterPlayerScripts",
+        )
+        .expect("StarterPlayerScripts present");
+        assert_eq!(
+            file_paths(child(sps, "Config").expect("Config under StarterPlayerScripts")),
+            vec!["src/shared/Config.luau".to_owned()],
+            "a shared $path must materialize under every mount that names it"
+        );
+    }
+
+    /// A longer mount must still win outright — routing to *all* tied mounts
+    /// must not degrade into routing to every mount that merely contains the
+    /// file. `src/shared/ui` is more specific than `src/shared`.
+    #[test]
+    fn build_sourcemap_still_prefers_the_longest_mount() {
+        let project: Project = serde_json::from_str(
+            r#"{
+                "name": "Nested",
+                "tree": {
+                    "$className": "DataModel",
+                    "ReplicatedStorage": { "$path": "src/shared" },
+                    "StarterGui": { "$className": "StarterGui", "$path": "src/shared/ui" }
+                }
+            }"#,
+        )
+        .expect("parse project");
+
+        let mut tree = Tree::new();
+        tree.insert(
+            "src/shared/ui/Button.luau".to_owned(),
+            entry(ScriptKind::ModuleScript),
+        );
+
+        let map = build_sourcemap(&project, &tree, &[]);
+        let gui = child(&map, "StarterGui").expect("StarterGui present");
+        assert!(
+            child(gui, "Button").is_some(),
+            "the more specific mount must own the file"
+        );
+        let rs = child(&map, "ReplicatedStorage").expect("ReplicatedStorage present");
+        assert!(
+            child(rs, "ui").is_none() && child(rs, "Button").is_none(),
+            "the shorter mount must not also claim it"
+        );
+    }
+
+    /// Rojo creates every instance the project tree declares; `$path` only says
+    /// where its *contents* come from. Seeding the sourcemap exclusively from
+    /// `path_mappings()` therefore dropped every pure-container node — the
+    /// `"Shared": {"$className": "Folder"}` and `"Lighting": {"$properties": …}`
+    /// shapes `rojo init` emits — so `game.ReplicatedStorage.Shared` existed at
+    /// runtime but would not resolve in the editor.
+    #[test]
+    fn build_sourcemap_seeds_declared_nodes_without_path() {
+        let project: Project = serde_json::from_str(
+            r#"{
+                "name": "Declared",
+                "tree": {
+                    "$className": "DataModel",
+                    "Lighting": { "$properties": { "Brightness": 2 } },
+                    "ReplicatedStorage": {
+                        "$className": "ReplicatedStorage",
+                        "Shared": { "$className": "Folder" },
+                        "Mounted": { "$path": "src/shared" }
+                    }
+                }
+            }"#,
+        )
+        .expect("parse project");
+
+        let map = build_sourcemap(&project, &Tree::new(), &[]);
+        assert_eq!(
+            class_name(child(&map, "Lighting").expect("Lighting declared")),
+            Some("Lighting"),
+            "a top-level declared child keeps its name as className, like a service"
+        );
+        let rs = child(&map, "ReplicatedStorage").expect("ReplicatedStorage present");
+        assert_eq!(
+            class_name(child(rs, "Shared").expect("Shared declared")),
+            Some("Folder"),
+            "a nested declared child honors its explicit $className"
+        );
+        assert!(
+            child(rs, "Mounted").is_some(),
+            "declared-node seeding must not lose the $path mounts"
+        );
+    }
+
     /// `under_dir`'s trailing-slash guard has to survive the case fold: `src`
     /// must not swallow a sibling `srcextra`.
     #[test]
@@ -635,6 +841,60 @@ mod tests {
         assert_eq!(under_dir("SRC", "src"), Some(String::new()));
         assert_eq!(under_dir("srcextra/Foo.luau", "src"), None);
         assert_eq!(under_dir("other/Foo.luau", "src"), None);
+    }
+
+    /// `Foo.lua` and `Foo.luau` side by side both classify as the module `Foo`,
+    /// so they collapse onto one instance — Rojo rejects the project outright,
+    /// while Yeet syncs both and lets whichever ACK lands last win. The full fix
+    /// is a cross-component decision (the plugin overwrites `Source` on the
+    /// second apply and `tree_base` ends up holding two entries for one
+    /// instance); until then the daemon must at least name the pair so the
+    /// resulting desync is diagnosable instead of silent.
+    #[test]
+    fn detects_instance_name_collisions() {
+        let mut tree = Tree::new();
+        tree.insert("src/shared/Foo.lua".to_owned(), entry(ScriptKind::ModuleScript));
+        tree.insert("src/shared/Foo.luau".to_owned(), entry(ScriptKind::ModuleScript));
+        // Same name, different directory — not a collision.
+        tree.insert("src/other/Foo.luau".to_owned(), entry(ScriptKind::ModuleScript));
+        // Same stem, different kind: `Bar` vs `Bar` as Script — still one
+        // instance name in one folder, so still a collision.
+        tree.insert("src/shared/Bar.luau".to_owned(), entry(ScriptKind::ModuleScript));
+        tree.insert(
+            "src/shared/Bar.server.luau".to_owned(),
+            entry(ScriptKind::Script),
+        );
+
+        let collisions = detect_name_collisions(&tree);
+        assert_eq!(
+            collisions,
+            vec![
+                (
+                    "src/shared/Bar".to_owned(),
+                    vec![
+                        "src/shared/Bar.luau".to_owned(),
+                        "src/shared/Bar.server.luau".to_owned()
+                    ]
+                ),
+                (
+                    "src/shared/Foo".to_owned(),
+                    vec![
+                        "src/shared/Foo.lua".to_owned(),
+                        "src/shared/Foo.luau".to_owned()
+                    ]
+                ),
+            ],
+            "every set of files resolving to one instance name must be reported, sorted"
+        );
+    }
+
+    #[test]
+    fn detects_no_collisions_in_an_ordinary_tree() {
+        let mut tree = Tree::new();
+        tree.insert("src/shared/Foo.luau".to_owned(), entry(ScriptKind::ModuleScript));
+        tree.insert("src/shared/Bar.luau".to_owned(), entry(ScriptKind::ModuleScript));
+        tree.insert("src/shared/Sub/Foo.luau".to_owned(), entry(ScriptKind::ModuleScript));
+        assert!(detect_name_collisions(&tree).is_empty());
     }
 
     #[test]
