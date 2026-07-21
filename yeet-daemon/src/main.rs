@@ -250,6 +250,7 @@ async fn main() -> Result<()> {
         &state_inner.root,
         &state_inner.project,
         &state_inner.tree_fs,
+        &state_inner.package_remaps,
     ) {
         warn!(error = ?e, "failed to write initial sourcemap.json");
     }
@@ -479,7 +480,7 @@ async fn sourcemap_writer(
         }
         last_sig = sig;
         let root = guard.root.clone();
-        let value = sourcemap::build_sourcemap(&guard.project, &guard.tree_fs);
+        let value = sourcemap::build_sourcemap(&guard.project, &guard.tree_fs, &guard.package_remaps);
         drop(guard);
         if let Err(e) = sourcemap::write_value(&root, &value) {
             warn!(error = ?e, "failed to write sourcemap.json");

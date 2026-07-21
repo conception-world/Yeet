@@ -17,12 +17,12 @@
 //! package (`.../foo/src/init.lua`, collapsed to `.../foo/init.lua`) maps as the
 //! `foo` ModuleScript rather than a `Folder` with a stray `src` child.
 //!
-//! The generator is pure over `(project, tree)`; `filePaths` therefore carry the
-//! tree key verbatim. For an ordinary project the tree key equals the on-disk
-//! path, so the LSP opens the right file. For the internals of an A10-collapsed
-//! Wally package the key is the collapsed instance path (the real file keeps its
-//! `src/` segment) — the user-facing `require(Packages.<name>)` link module is a
-//! real top-level file and is unaffected.
+//! The generator is pure over `(project, tree, remaps)`. Instance *shape* comes
+//! from the tree key, but `filePaths` is put back through `state::fs_rel_with`
+//! so it names the real file on disk: for an ordinary project the two are equal,
+//! while inside an A10-collapsed Wally package the key has dropped the package's
+//! own `$path`/`src` segment and nothing exists at that path. luau-lsp opens the
+//! string verbatim, so emitting the key there resolved to nothing.
 
 use std::collections::BTreeMap;
 use std::hash::{Hash as _, Hasher as _};
@@ -34,6 +34,7 @@ use serde_json::{Value, json};
 
 use crate::project::Project;
 use crate::protocol::{ScriptKind, classify, is_init_filename};
+use crate::state::{PackageRemap, fs_rel_with};
 use crate::tree::Tree;
 
 /// Mutable node while assembling the sourcemap. Children are keyed by instance
@@ -130,8 +131,15 @@ fn under_dir(key: &str, dir: &str) -> Option<String> {
 /// the daemon's file tree. Root node is the `DataModel` (name = `project.name`,
 /// or `"game"` when empty). Each `$path` mapping seeds a service/instance chain;
 /// the files under it become the descendant Script/Folder tree.
+///
+/// `remaps` are the honored nested-package mounts (A10). Tree keys are
+/// *instance* paths, which for a Wally package elide the package's own `$path`
+/// segment — so the instance shape is built from the key, but each `filePaths`
+/// entry is put back through `state::fs_rel_with` first. Pass `&[]` when no
+/// package remaps apply (e.g. the syncback materializer, whose tree is keyed
+/// straight off the `src/<Service>` mounts it just wrote).
 #[must_use]
-pub fn build_sourcemap(project: &Project, tree: &Tree) -> Value {
+pub fn build_sourcemap(project: &Project, tree: &Tree, remaps: &[PackageRemap]) -> Value {
     let root_name = if project.name.trim().is_empty() {
         "game"
     } else {
@@ -175,8 +183,11 @@ pub fn build_sourcemap(project: &Project, tree: &Tree) -> Value {
         let Some((script_name, kind)) = classify(file_name) else {
             continue;
         };
+        // luau-lsp opens the `filePaths` string verbatim, so it has to be the
+        // real path on disk — undo the package collapse the tree key carries.
+        let disk_path = fs_rel_with(remaps, key);
         let mount = ensure_segment_chain(&mut root, project, segments);
-        place_file(mount, &rel, key, &script_name, kind);
+        place_file(mount, &rel, &disk_path, &script_name, kind);
     }
 
     root.to_json(root_name)
@@ -216,12 +227,14 @@ fn ensure_segment_chain<'a>(
     node
 }
 
-/// Materializes one file (relative path `rel` under its mount, full tree key
-/// `full_key`) into `mount`'s subtree, mirroring `TreeBuilder.materializeFile`.
+/// Materializes one file into `mount`'s subtree, mirroring
+/// `TreeBuilder.materializeFile`. The *instance shape* comes from `rel` (the
+/// tree key's path under its mount); `disk_path` is what lands in `filePaths`
+/// and is the real on-disk path, which for a Wally package differs from the key.
 fn place_file(
     mount: &mut SourceNode,
     rel: &str,
-    full_key: &str,
+    disk_path: &str,
     script_name: &str,
     kind: ScriptKind,
 ) {
@@ -231,7 +244,7 @@ fn place_file(
         // carries the source. Keep the mount's own className (a service/Folder
         // can't be re-classed into a script from here — matches TreeBuilder's
         // `materializeAtMount` for a non-script mount).
-        mount.file_paths.push(full_key.to_owned());
+        mount.file_paths.push(disk_path.to_owned());
         return;
     }
 
@@ -239,7 +252,7 @@ fn place_file(
     if is_init_filename(file_name) {
         if parts.len() == 1 {
             // `init.[ext]` directly under the mount promotes the mount itself.
-            mount.file_paths.push(full_key.to_owned());
+            mount.file_paths.push(disk_path.to_owned());
             return;
         }
         // Intermediate dirs are Folders; the immediate parent directory is
@@ -251,7 +264,7 @@ fn place_file(
             .entry(parts[parts.len() - 2].to_owned())
             .or_insert_with(SourceNode::folder);
         class_for(kind).clone_into(&mut promoted.class_name);
-        promoted.file_paths.push(full_key.to_owned());
+        promoted.file_paths.push(disk_path.to_owned());
     } else {
         // Plain leaf script: every path component before it is a Folder.
         let container = ensure_chain(mount, &parts[..parts.len() - 1]);
@@ -260,7 +273,7 @@ fn place_file(
             .entry(script_name.to_owned())
             .or_insert_with(SourceNode::folder);
         class_for(kind).clone_into(&mut leaf.class_name);
-        leaf.file_paths.push(full_key.to_owned());
+        leaf.file_paths.push(disk_path.to_owned());
     }
 }
 
@@ -306,8 +319,13 @@ pub fn write_value(root: &Path, value: &Value) -> Result<()> {
 /// Builds and atomically writes `<root>/sourcemap.json`. Used by the synchronous
 /// callers (daemon bootstrap, syncback materialize); the live writer uses
 /// `build_sourcemap` + `write_value` directly to keep the lock hold short.
-pub fn write_sourcemap(root: &Path, project: &Project, tree: &Tree) -> Result<()> {
-    let value = build_sourcemap(project, tree);
+pub fn write_sourcemap(
+    root: &Path,
+    project: &Project,
+    tree: &Tree,
+    remaps: &[PackageRemap],
+) -> Result<()> {
+    let value = build_sourcemap(project, tree, remaps);
     write_value(root, &value)
 }
 
@@ -392,7 +410,7 @@ mod tests {
         tree.insert("src/Bar/init.luau".to_owned(), entry(ScriptKind::ModuleScript));
         tree.insert("src/Bar/Baz.luau".to_owned(), entry(ScriptKind::ModuleScript));
 
-        let map = build_sourcemap(&project, &tree);
+        let map = build_sourcemap(&project, &tree, &[]);
 
         assert_eq!(map.get("name").and_then(Value::as_str), Some("Test"));
         assert_eq!(class_name(&map), Some("DataModel"));
@@ -434,12 +452,73 @@ mod tests {
         tree.insert("src/Server.server.luau".to_owned(), entry(ScriptKind::Script));
         tree.insert("src/Client.client.luau".to_owned(), entry(ScriptKind::LocalScript));
 
-        let map = build_sourcemap(&project, &tree);
+        let map = build_sourcemap(&project, &tree, &[]);
         let sss = child(&map, "ServerScriptService").expect("service node present");
         // No `$className` on the mount → the service keeps its own name as class.
         assert_eq!(class_name(sss), Some("ServerScriptService"));
         assert_eq!(class_name(child(sss, "Server").unwrap()), Some("Script"));
         assert_eq!(class_name(child(sss, "Client").unwrap()), Some("LocalScript"));
+    }
+
+    /// The instance path a Wally package's sources are keyed by is NOT their
+    /// path on disk: `relative` elides the package's own `$path` segment so
+    /// `<pkg>/src/init.lua` keys as `<pkg>/init.lua` (A10). `filePaths` is the
+    /// one field that must undo that — luau-lsp opens exactly the string we
+    /// emit, and no file exists at the collapsed path. Pushing the tree key
+    /// verbatim left every package source unresolvable, so `require(Packages.X)`
+    /// had no types and go-to-definition dead-ended.
+    #[test]
+    fn build_sourcemap_file_paths_point_at_real_disk_paths() {
+        let project: Project = serde_json::from_str(
+            r#"{"name":"T","tree":{"$className":"DataModel","Packages":{"$path":"Packages"}}}"#,
+        )
+        .expect("parse project");
+
+        // What `ProjectState::rebuild_package_remaps` derives for a package whose
+        // nested project is `{"name":"Roact","tree":{"$path":"src"}}` — note the
+        // instance prefix also carries the project's `name`, not the dir name.
+        let remaps = vec![PackageRemap {
+            fs_prefix: "Packages/_Index/roblox_roact@1.4.4/roact/src".to_owned(),
+            instance_prefix: "Packages/_Index/roblox_roact@1.4.4/Roact".to_owned(),
+        }];
+
+        let mut tree = Tree::new();
+        tree.insert(
+            "Packages/_Index/roblox_roact@1.4.4/Roact/init.lua".to_owned(),
+            entry(ScriptKind::ModuleScript),
+        );
+        tree.insert(
+            "Packages/_Index/roblox_roact@1.4.4/Roact/Binding.lua".to_owned(),
+            entry(ScriptKind::ModuleScript),
+        );
+        // A plain top-level file must round-trip untouched.
+        tree.insert("Packages/Roact.lua".to_owned(), entry(ScriptKind::ModuleScript));
+
+        let map = build_sourcemap(&project, &tree, &remaps);
+        let packages = child(&map, "Packages").expect("Packages mount");
+        let index = child(packages, "_Index").expect("_Index folder");
+        let versioned = child(index, "roblox_roact@1.4.4").expect("versioned folder");
+        let roact = child(versioned, "Roact").expect("package module");
+
+        assert_eq!(
+            class_name(roact),
+            Some("ModuleScript"),
+            "instance shape must stay collapsed — only filePaths are disk-shaped"
+        );
+        assert_eq!(
+            file_paths(roact),
+            vec!["Packages/_Index/roblox_roact@1.4.4/roact/src/init.lua".to_owned()],
+            "the package module must point at the real file, `src/` segment intact"
+        );
+        assert_eq!(
+            file_paths(child(roact, "Binding").expect("Binding child")),
+            vec!["Packages/_Index/roblox_roact@1.4.4/roact/src/Binding.lua".to_owned()],
+        );
+        assert_eq!(
+            file_paths(child(packages, "Roact").expect("link module")),
+            vec!["Packages/Roact.lua".to_owned()],
+            "a non-package key must be emitted verbatim"
+        );
     }
 
     #[test]
@@ -465,7 +544,7 @@ mod tests {
             entry(ScriptKind::ModuleScript),
         );
 
-        let map = build_sourcemap(&project, &tree);
+        let map = build_sourcemap(&project, &tree, &[]);
         let packages = child(&map, "Packages").expect("Packages mount present");
         let index = child(packages, "_Index").expect("_Index folder present");
         assert_eq!(class_name(index), Some("Folder"));
@@ -501,7 +580,7 @@ mod tests {
         )
         .expect("parse project");
 
-        let map = build_sourcemap(&project, &Tree::new());
+        let map = build_sourcemap(&project, &Tree::new(), &[]);
         let rs = child(&map, "ReplicatedStorage").expect("service node present even with no files");
         assert_eq!(class_name(rs), Some("ReplicatedStorage"));
         assert_eq!(
@@ -537,7 +616,7 @@ mod tests {
             entry(ScriptKind::ModuleScript),
         );
 
-        let map = build_sourcemap(&project, &tree);
+        let map = build_sourcemap(&project, &tree, &[]);
         let rs = child(&map, "ReplicatedStorage").expect("service node present");
         assert!(child(rs, "Boot").is_some(), "boot-scan file must be mapped");
         let watched = child(rs, "Watched").expect("watcher-cased file must be mapped too");
@@ -595,7 +674,7 @@ mod tests {
         .expect("parse project");
         let mut tree = Tree::new();
         tree.insert("src/Foo.luau".to_owned(), entry(ScriptKind::ModuleScript));
-        write_sourcemap(dir.path(), &project, &tree).expect("write sourcemap");
+        write_sourcemap(dir.path(), &project, &tree, &[]).expect("write sourcemap");
         let written = std::fs::read_to_string(dir.path().join("sourcemap.json")).expect("read back");
         let parsed: Value = serde_json::from_str(&written).expect("valid json");
         assert_eq!(class_name(&parsed), Some("DataModel"));

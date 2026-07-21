@@ -705,15 +705,7 @@ impl ProjectState {
     /// (A10 `wally-1`). Identity for non-package keys, so every existing write
     /// path is byte-for-byte unchanged.
     pub fn fs_rel_for(&self, key: &str) -> String {
-        for remap in &self.package_remaps {
-            if key == remap.instance_prefix {
-                return remap.fs_prefix.clone();
-            }
-            if let Some(sub) = strip_dir_prefix(key, &remap.instance_prefix) {
-                return format!("{}/{sub}", remap.fs_prefix);
-            }
-        }
-        key.to_owned()
+        fs_rel_with(&self.package_remaps, key)
     }
 
     pub fn is_under_mapping(&self, rel: &str) -> bool {
@@ -807,6 +799,23 @@ pub fn sha256_hex(bytes: &[u8]) -> String {
 /// Returns the tail of `s` strictly below `prefix` (i.e. after `prefix/`), or
 /// `None` when `s` equals `prefix` or is unrelated. The trailing-slash check
 /// keeps a `PackageRemap` for `foo` from matching a sibling `foobar`.
+/// Free-standing form of `ProjectState::fs_rel_for` — a tree key (instance
+/// path) rewritten back to its real on-disk path. Split out so `sourcemap`,
+/// which is pure over `(project, tree, remaps)` and holds no `ProjectState`,
+/// applies the exact same inverse rather than reimplementing it.
+#[must_use]
+pub fn fs_rel_with(remaps: &[PackageRemap], key: &str) -> String {
+    for remap in remaps {
+        if key == remap.instance_prefix {
+            return remap.fs_prefix.clone();
+        }
+        if let Some(sub) = strip_dir_prefix(key, &remap.instance_prefix) {
+            return format!("{}/{sub}", remap.fs_prefix);
+        }
+    }
+    key.to_owned()
+}
+
 fn strip_dir_prefix<'a>(s: &'a str, prefix: &str) -> Option<&'a str> {
     s.strip_prefix(prefix)?.strip_prefix('/')
 }

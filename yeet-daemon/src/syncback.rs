@@ -28,7 +28,7 @@ use base64::engine::general_purpose::STANDARD as BASE64_STD;
 use serde::Serialize;
 use serde_json::json;
 
-use crate::project::{Project, TreeNode};
+use crate::project::{PROJECT_FILE_NAME, Project, TreeNode};
 use crate::protocol::{
     ScriptKind, SerializedInstance, SerializedProperty, SyncbackMode, SyncbackStats,
     SyncbackTemplate,
@@ -247,9 +247,14 @@ pub fn materialize(session: SyncbackSession, total_seq: u32) -> Result<SyncbackS
     // window opens in the IDE. `ctx.tree_base` is keyed by the same `src/<Service>`
     // paths the project's `$path` mounts declare, so the generator maps them
     // directly. Best-effort: a sourcemap failure must not fail the syncback.
-    if let Err(e) =
-        crate::sourcemap::write_sourcemap(&session.opts.target_path, &project, &ctx.tree_base)
-    {
+    // No package remaps: this tree was keyed straight off the `src/<Service>`
+    // mounts the materializer just wrote, so every key already is its disk path.
+    if let Err(e) = crate::sourcemap::write_sourcemap(
+        &session.opts.target_path,
+        &project,
+        &ctx.tree_base,
+        &[],
+    ) {
         ctx.stats
             .warnings
             .push(format!("could not write sourcemap.json: {e:#}"));
@@ -284,6 +289,21 @@ fn prepare_target(opts: &SyncbackOptions) -> Result<()> {
             }
             std::fs::create_dir_all(&opts.target_path)
                 .with_context(|| format!("mkdir {}", opts.target_path.display()))?;
+            // `default.project.json` is regenerated from scratch below
+            // (`build_project_json`: flat `src/<Service>` mounts, no
+            // `$className`, no `$properties`, no nesting), and `sourcemap.json`
+            // is rewritten alongside it — so a hand-written layout, a `Packages`
+            // mount, or any Wally wiring is destroyed by this run. Obsolete
+            // scripts have always been relocated under `.yeet/backup/` for
+            // exactly this reason; these two were missed only because
+            // `is_reconcilable` admits nothing outside `src/`. Best-effort: the
+            // user already opted into an overwrite, so a failed backup must not
+            // abort the syncback they asked for.
+            for rel in [PROJECT_FILE_NAME, "sourcemap.json"] {
+                if let Err(e) = move_to_backup(&opts.target_path, rel) {
+                    tracing::warn!(path = rel, error = ?e, "could not back up before overwrite");
+                }
+            }
         }
     }
     Ok(())
@@ -1693,6 +1713,64 @@ mod tests {
         // Package-manager landings are owned elsewhere (M7).
         assert!(!is_reconcilable("src/Packages/Foo.luau"));
         assert!(!is_reconcilable("src/ReplicatedStorage/_Index/Pkg/init.luau"));
+    }
+
+    /// An overwrite-merge regenerates `default.project.json` from scratch —
+    /// flat `src/<Service>` mounts, no `$className`, no `$properties`, no
+    /// nested children. Anything the user hand-wrote (custom `$path` layouts,
+    /// a `Packages` mount, Wally wiring) is gone, and the sourcemap next to it
+    /// goes the same way. Obsolete *scripts* were already relocated under
+    /// `.yeet/backup/` for exactly this reason; these two files were not,
+    /// because `is_reconcilable` only admits paths under `src/`. The recovery
+    /// path must cover them too.
+    #[test]
+    fn merge_overwrite_backs_up_project_file_and_sourcemap() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let target = dir.path().to_path_buf();
+
+        let custom_project = r#"{"name":"Handwritten","tree":{"$className":"DataModel","ReplicatedStorage":{"$path":"lib/shared"},"Packages":{"$path":"Packages"}}}"#;
+        let custom_sourcemap = r#"{"name":"Handwritten","className":"DataModel","filePaths":[],"children":[]}"#;
+        std::fs::write(target.join("default.project.json"), custom_project).expect("write project");
+        std::fs::write(target.join("sourcemap.json"), custom_sourcemap).expect("write sourcemap");
+
+        materialize_overwrite(
+            &target,
+            "backup-run",
+            vec![
+                inst(1, None, "DataModel", "game"),
+                inst(2, Some(1), "ServerScriptService", "ServerScriptService"),
+                script_inst(3, Some(2), "Foo", "return 1\n"),
+            ],
+        );
+
+        let backup_project = target.join(".yeet/backup/default.project.json");
+        assert!(
+            backup_project.exists(),
+            "the overwritten project file must be recoverable under .yeet/backup"
+        );
+        assert_eq!(
+            std::fs::read_to_string(&backup_project).expect("read backup"),
+            custom_project,
+            "the backup must be the user's original bytes, not the regenerated file"
+        );
+
+        let backup_sourcemap = target.join(".yeet/backup/sourcemap.json");
+        assert!(
+            backup_sourcemap.exists(),
+            "the overwritten sourcemap must be recoverable too"
+        );
+        assert_eq!(
+            std::fs::read_to_string(&backup_sourcemap).expect("read backup"),
+            custom_sourcemap,
+        );
+
+        // The overwrite itself still has to happen — a backup is not a veto.
+        let regenerated =
+            std::fs::read_to_string(target.join("default.project.json")).expect("read project");
+        assert!(
+            regenerated.contains("src/ServerScriptService"),
+            "the regenerated project must describe the materialized tree"
+        );
     }
 
     /// A second overwrite-merge with a reduced tree must clean up after the
