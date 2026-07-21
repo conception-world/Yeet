@@ -27,6 +27,7 @@
 use std::collections::BTreeMap;
 use std::hash::{Hash as _, Hasher as _};
 use std::io::Write as _;
+use std::ops::Not as _;
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
@@ -91,14 +92,18 @@ pub const GENERATED_BY_VALUE: &str = "yeet";
 #[must_use]
 pub fn is_foreign(root: &Path) -> bool {
     let path = root.join("sourcemap.json");
-    let Ok(raw) = std::fs::read_to_string(&path) else {
-        // Missing (or unreadable) — nothing to protect, so writing is fine.
-        return false;
-    };
-    let Ok(value) = serde_json::from_str::<Value>(&raw) else {
-        return true;
-    };
-    value.get(GENERATED_BY_KEY).and_then(Value::as_str) != Some(GENERATED_BY_VALUE)
+    match std::fs::read_to_string(&path) {
+        Ok(raw) => serde_json::from_str::<Value>(&raw).is_ok_and(|value| {
+            value.get(GENERATED_BY_KEY).and_then(Value::as_str) == Some(GENERATED_BY_VALUE)
+        })
+        .not(),
+        // Genuinely absent — nothing to protect, so writing is fine.
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => false,
+        // Present but unreadable (permissions, a lock, non-UTF-8 such as a
+        // UTF-16 map from another tool). We cannot confirm it is ours, and the
+        // whole point of this guard is to not clobber what we cannot read.
+        Err(_) => true,
+    }
 }
 
 fn class_for(kind: ScriptKind) -> &'static str {
@@ -202,21 +207,27 @@ pub fn build_sourcemap(project: &Project, tree: &Tree, remaps: &[PackageRemap]) 
     }
 
     // Route each tracked file to its best (longest matching dir) mount, then
-    // materialize it into that mount's subtree. A tie routes to *every* mount
-    // at that length: Rojo materializes a directory into each mount that names
-    // it, so one `src/shared` reachable from both `ReplicatedStorage` and
-    // `StarterPlayerScripts` belongs in both. Picking a single winner (what
-    // `max_by_key` did — last candidate on a tie, i.e. `BTreeMap` order) left
-    // the other service empty.
+    // materialize it into that mount's subtree.
+    //
+    // On a tie only ONE mount wins, matching the plugin. Rojo would materialize
+    // the directory under every mount that names it, and an earlier revision of
+    // this function did the same — but `TreeBuilder.luau` keys its mapping table
+    // by the `$path` *string* (`mappings[path] = parent`), so two mounts sharing
+    // a path collapse to one entry and Yeet only ever creates one of the two
+    // instances. Emitting both made the sourcemap advertise an instance that
+    // does not exist at runtime, which is worse than the empty service it
+    // replaced: luau-lsp would resolve a path that fails in Studio. Making both
+    // real is a plugin change; until then the map tells the truth about what
+    // Yeet syncs, and `detect_shared_mounts` warns that the other mount is
+    // unreachable.
     let mut keys: Vec<&str> = tree.keys().map(String::as_str).collect();
     keys.sort_unstable();
     for key in keys {
-        let Some(best_len) = mounts
+        let best = mounts
             .iter()
-            .filter(|(_, dir)| under_dir(key, dir).is_some())
-            .map(|(_, dir)| dir.len())
-            .max()
-        else {
+            .filter_map(|(segments, dir)| under_dir(key, dir).map(|rel| (segments, dir.len(), rel)))
+            .max_by_key(|(_, dir_len, _)| *dir_len);
+        let Some((segments, _dir_len, rel)) = best else {
             continue;
         };
         let file_name = key.rsplit('/').next().unwrap_or(key);
@@ -226,16 +237,8 @@ pub fn build_sourcemap(project: &Project, tree: &Tree, remaps: &[PackageRemap]) 
         // luau-lsp opens the `filePaths` string verbatim, so it has to be the
         // real path on disk — undo the package collapse the tree key carries.
         let disk_path = fs_rel_with(remaps, key);
-        for (segments, dir) in &mounts {
-            if dir.len() != best_len {
-                continue;
-            }
-            let Some(rel) = under_dir(key, dir) else {
-                continue;
-            };
-            let mount = ensure_segment_chain(&mut root, project, segments);
-            place_file(mount, &rel, &disk_path, &script_name, kind);
-        }
+        let mount = ensure_segment_chain(&mut root, project, segments);
+        place_file(mount, &rel, &disk_path, &script_name, kind);
     }
 
     let mut value = root.to_json(root_name);
@@ -262,6 +265,39 @@ fn collect_declared(
         collect_declared(child, parents, out);
         parents.pop();
     }
+}
+
+/// Every `$path` claimed by more than one mount, as
+/// `(path, the instance chains that declare it)`, sorted.
+///
+/// Rojo materializes such a directory under each mount. Yeet cannot: the
+/// plugin's `TreeBuilder` keys its mapping table by the `$path` string, so the
+/// mounts collapse to one entry and only one instance is ever created — which
+/// one depends on traversal order. Making both real is a plugin change; naming
+/// the mounts is what turns "one of my services is mysteriously empty" into a
+/// message.
+#[must_use]
+pub fn detect_shared_mounts(project: &Project) -> Vec<(String, Vec<String>)> {
+    let mut by_path: BTreeMap<String, Vec<String>> = BTreeMap::new();
+    for (segments, dir) in project.path_mappings() {
+        let instance = if segments.is_empty() {
+            "game".to_owned()
+        } else {
+            format!("game.{}", segments.join("."))
+        };
+        by_path
+            .entry(normalize_dir(&dir))
+            .or_default()
+            .push(instance);
+    }
+    by_path
+        .into_iter()
+        .filter(|(_, mounts)| mounts.len() > 1)
+        .map(|(path, mut mounts)| {
+            mounts.sort();
+            (path, mounts)
+        })
+        .collect()
 }
 
 /// Every set of tracked files that would collapse onto a single Roblox
@@ -413,11 +449,18 @@ fn ensure_chain<'a>(start: &'a mut SourceNode, dirs: &[&str]) -> &'a mut SourceN
 /// rewrite when this is unchanged, so a content-only edit never regenerates the
 /// file.
 #[must_use]
-pub fn structure_signature(tree: &Tree) -> u64 {
+pub fn structure_signature(project: &Project, tree: &Tree) -> u64 {
     let mut keys: Vec<&str> = tree.keys().map(String::as_str).collect();
     keys.sort_unstable();
     let mut hasher = std::collections::hash_map::DefaultHasher::new();
     keys.hash(&mut hasher);
+    // The map is a function of the project too, not just the file set: its
+    // name, every declared node, and each `$className` all shape the output.
+    // Hashing only the keys meant a project-file reload that added a mount or
+    // renamed the DataModel woke the writer and was then skipped as a no-op.
+    serde_json::to_string(project)
+        .unwrap_or_default()
+        .hash(&mut hasher);
     hasher.finish()
 }
 
@@ -425,6 +468,18 @@ pub fn structure_signature(tree: &Tree) -> u64 {
 /// Split from `write_sourcemap` so the background writer can build the JSON
 /// under a read lock and then do the (blocking) disk write after releasing it.
 pub fn write_value(root: &Path, value: &Value) -> Result<()> {
+    // Re-check ownership on every write, not just at startup: the common way to
+    // end up with a foreign map is `rojo sourcemap --watch` started in a second
+    // terminal *after* `Yeet: Start`, which the bootstrap check cannot see. This
+    // is the single choke point for every writer (bootstrap, the background
+    // writer, syncback), so one guard here covers them all.
+    if is_foreign(root) {
+        tracing::warn!(
+            "sourcemap.json is not Yeet's (no `{GENERATED_BY_KEY}: {GENERATED_BY_VALUE}` \
+             marker) — not overwriting it"
+        );
+        return Ok(());
+    }
     let mut bytes = serde_json::to_vec_pretty(value).context("serialize sourcemap")?;
     bytes.push(b'\n');
     let path = root.join("sourcemap.json");
@@ -742,15 +797,13 @@ mod tests {
         );
     }
 
-    /// Rojo materializes a directory into *every* mount that names it, so the
-    /// standard shared-code layout — one `src/shared` reachable from both
-    /// `ReplicatedStorage` and `StarterPlayerScripts` — puts the same modules in
-    /// both places. Routing picked a single winner via `max_by_key`, which on a
-    /// length tie keeps the *last* candidate; mounts are walked in `BTreeMap`
-    /// order, so `StarterPlayer` (S) silently beat `ReplicatedStorage` (R) and
-    /// the service the user actually requires from came out empty.
+    /// Two mounts sharing one `$path` is legal Rojo, and Rojo puts the files
+    /// under both. Yeet cannot: `TreeBuilder.luau` keys its mapping table by the
+    /// `$path` string, so the mounts collapse and only one instance is created.
+    /// The map therefore describes ONE of them — advertising both would resolve
+    /// in the editor and fail at runtime — and the conflict is reported instead.
     #[test]
-    fn build_sourcemap_routes_shared_path_to_every_tied_mount() {
+    fn shared_path_mounts_are_reported_not_duplicated() {
         let project: Project = serde_json::from_str(
             r#"{
                 "name": "Shared",
@@ -773,20 +826,39 @@ mod tests {
 
         let map = build_sourcemap(&project, &tree, &[]);
         let rs = child(&map, "ReplicatedStorage").expect("ReplicatedStorage present");
-        assert_eq!(
-            file_paths(child(rs, "Config").expect("Config under ReplicatedStorage")),
-            vec!["src/shared/Config.luau".to_owned()],
-        );
         let sps = child(
             child(&map, "StarterPlayer").expect("StarterPlayer present"),
             "StarterPlayerScripts",
         )
         .expect("StarterPlayerScripts present");
+        let placed = usize::from(child(rs, "Config").is_some())
+            + usize::from(child(sps, "Config").is_some());
         assert_eq!(
-            file_paths(child(sps, "Config").expect("Config under StarterPlayerScripts")),
-            vec!["src/shared/Config.luau".to_owned()],
-            "a shared $path must materialize under every mount that names it"
+            placed, 1,
+            "exactly one mount may claim the file — the map must not promise an \
+             instance the plugin never creates"
         );
+
+        assert_eq!(
+            detect_shared_mounts(&project),
+            vec![(
+                "src/shared".to_owned(),
+                vec![
+                    "game.ReplicatedStorage".to_owned(),
+                    "game.StarterPlayer.StarterPlayerScripts".to_owned()
+                ]
+            )],
+            "the unreachable mount must be named so the empty service is not a mystery"
+        );
+    }
+
+    #[test]
+    fn detect_shared_mounts_ignores_distinct_paths() {
+        let project: Project = serde_json::from_str(
+            r#"{"name":"D","tree":{"$className":"DataModel","A":{"$path":"src/a"},"B":{"$path":"src/b"}}}"#,
+        )
+        .expect("parse project");
+        assert!(detect_shared_mounts(&project).is_empty());
     }
 
     /// A longer mount must still win outright — routing to *all* tied mounts
@@ -933,6 +1005,9 @@ mod tests {
 
     #[test]
     fn structure_signature_ignores_content_changes() {
+        let proj: Project =
+            serde_json::from_str(r#"{"name":"S","tree":{"$className":"DataModel"}}"#)
+                .expect("parse project");
         let mut a = Tree::new();
         a.insert("src/Foo.luau".to_owned(), entry(ScriptKind::ModuleScript));
         let mut b = Tree::new();
@@ -945,17 +1020,37 @@ mod tests {
             },
         );
         assert_eq!(
-            structure_signature(&a),
-            structure_signature(&b),
+            structure_signature(&proj, &a),
+            structure_signature(&proj, &b),
             "same key set ⇒ same signature regardless of content"
         );
 
         let mut c = Tree::new();
         c.insert("src/Bar.luau".to_owned(), entry(ScriptKind::ModuleScript));
         assert_ne!(
-            structure_signature(&a),
-            structure_signature(&c),
+            structure_signature(&proj, &a),
+            structure_signature(&proj, &c),
             "a different key set must change the signature"
+        );
+
+        // The map is a function of the project too: a reload that renames the
+        // DataModel or declares a node must not be skipped as a no-op.
+        let renamed: Project =
+            serde_json::from_str(r#"{"name":"RENAMED","tree":{"$className":"DataModel"}}"#)
+                .expect("parse project");
+        assert_ne!(
+            structure_signature(&proj, &a),
+            structure_signature(&renamed, &a),
+            "a project change must change the signature even with an identical tree"
+        );
+        let declared: Project = serde_json::from_str(
+            r#"{"name":"S","tree":{"$className":"DataModel","Shared":{"$className":"Folder"}}}"#,
+        )
+        .expect("parse project");
+        assert_ne!(
+            structure_signature(&proj, &a),
+            structure_signature(&declared, &a),
+            "a newly declared node must change the signature"
         );
     }
 
@@ -998,16 +1093,23 @@ mod tests {
             "no file at all is not foreign — there is nothing to protect"
         );
 
-        std::fs::write(
-            &path,
-            r#"{"name":"X","className":"DataModel","filePaths":[],"children":[]}"#,
-        )
-        .expect("write foreign");
+        let foreign = r#"{"name":"X","className":"DataModel","filePaths":[],"children":[]}"#;
+        std::fs::write(&path, foreign).expect("write foreign");
         assert!(is_foreign(root), "a map without the marker belongs to the user");
 
+        // The write path re-checks ownership, so a foreign map survives even a
+        // direct `write_sourcemap` — the guard is not just a startup decision.
         let project: Project =
             serde_json::from_str(r#"{"name":"X","tree":{"$className":"DataModel"}}"#)
                 .expect("parse project");
+        write_sourcemap(root, &project, &Tree::new(), &[]).expect("write is a no-op, not an error");
+        assert_eq!(
+            std::fs::read_to_string(&path).expect("read back"),
+            foreign,
+            "a foreign map must survive a write attempt byte-for-byte"
+        );
+
+        std::fs::remove_file(&path).expect("clear foreign");
         write_sourcemap(root, &project, &Tree::new(), &[]).expect("write ours");
         assert!(
             !is_foreign(root),

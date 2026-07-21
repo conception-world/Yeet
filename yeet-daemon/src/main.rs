@@ -266,6 +266,17 @@ async fn main() -> Result<()> {
             "multiple files resolve to one instance — Studio will keep whichever syncs last"
         );
     }
+    // Rojo would put a shared `$path` under every mount that names it; the
+    // plugin keys its mapping table by the path string, so only one instance is
+    // ever created and the others stay empty. Name them rather than leaving the
+    // user to wonder which service lost.
+    for (path, mounts) in sourcemap::detect_shared_mounts(&state_inner.project) {
+        warn!(
+            path,
+            mounts = mounts.join(", "),
+            "several mounts share one $path — Yeet materializes it under only one of them"
+        );
+    }
     // Two ways this is switched off. `--no-sourcemap` is the user saying they
     // drive luau-lsp some other way. The ownership check is the safety net for
     // everyone who never heard of the flag: a `sourcemap.json` without Yeet's
@@ -308,7 +319,7 @@ async fn main() -> Result<()> {
     } else {
         None
     };
-    let sourcemap_sig = sourcemap::structure_signature(&state_inner.tree_fs);
+    let sourcemap_sig = sourcemap::structure_signature(&state_inner.project, &state_inner.tree_fs);
     if args.dry_run {
         warn!(
             "DRY-RUN MODE: every disk write, disk delete, push to Studio and delete on \
@@ -528,7 +539,7 @@ async fn sourcemap_writer(
         // Drain everything that piled up during the debounce window.
         while rx.try_recv().is_ok() {}
         let guard = state.read().await;
-        let sig = sourcemap::structure_signature(&guard.tree_fs);
+        let sig = sourcemap::structure_signature(&guard.project, &guard.tree_fs);
         if sig == last_sig {
             continue;
         }
@@ -586,6 +597,20 @@ async fn handle_fs_event(
                     guard.tree_studio.remove(path);
                     guard.meta.remove(path);
                     guard.meta_attributes.remove(path);
+                    // In-flight work for a path Yeet no longer manages has to
+                    // go too, and dropping it here is what makes the removals
+                    // above stick. `handle_file_applied` and
+                    // `sweep_pending_applies` re-insert into `tree_base` /
+                    // `tree_studio` unconditionally, so a surviving pending
+                    // apply would resurrect the entry we just deleted — and the
+                    // next merge would read `(base: Some, studio: Some,
+                    // fs: None)` as "deleted on disk" and delete the instance in
+                    // Studio. `handle_conflict_resolved` is the same story in
+                    // the other direction: resolving a stale conflict as
+                    // "Studio deleted" would remove a file Yeet has stopped
+                    // tracking. Unmapping must stay non-destructive.
+                    guard.pending_applies.remove(path);
+                    guard.pending_conflicts.remove(path);
                 }
                 // Newly mapped files are announced only when Yeet has never
                 // tracked them. One already present in `tree_base` (persisted

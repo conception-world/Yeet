@@ -397,10 +397,45 @@ impl ProjectState {
                 return Ok(false);
             }
         };
-        self.project = project;
-        self.mapping_roots_canonical = Self::canonical_mapping_roots(&self.root, &self.project);
-        self.rescan_fs()?;
-        self.project_dirty = false;
+        // `rescan_fs` clears `tree_fs` before repopulating it, and propagates
+        // any read error mid-walk — a real risk here, since the classic trigger
+        // for a project-file change is a `git checkout` that rewrites the source
+        // files at the same time (sharing violations on Windows). Aborting on a
+        // half-filled tree would make the next reconcile read every unread file
+        // as deleted. Keep the old project and tree, and stay dirty, so the
+        // situation is recoverable by saving the file again.
+        let previous_project = std::mem::replace(&mut self.project, project);
+        let previous_roots = std::mem::replace(
+            &mut self.mapping_roots_canonical,
+            Self::canonical_mapping_roots(&self.root, &self.project),
+        );
+        let previous_tree = self.tree_fs.clone();
+        let previous_meta = self.meta.clone();
+        let previous_attributes = self.meta_attributes.clone();
+        if let Err(e) = self.rescan_fs() {
+            tracing::warn!(error = ?e, "rescan after project reload failed; restoring previous state");
+            self.project = previous_project;
+            self.mapping_roots_canonical = previous_roots;
+            self.tree_fs = previous_tree;
+            self.meta = previous_meta;
+            self.meta_attributes = previous_attributes;
+            self.project_dirty = true;
+            return Ok(false);
+        }
+        // A mount whose directory does not exist yet cannot be canonicalized,
+        // so it is absent from `mapping_roots_canonical` and the next aggressive
+        // sweep would happily delete it the moment the user creates it empty.
+        // That is the original reason this flag latched. Keep it up while any
+        // declared mount is missing; it clears on the reload that finds them all.
+        let missing_mounts =
+            self.project.path_mappings().len() != self.mapping_roots_canonical.len();
+        if missing_mounts {
+            tracing::warn!(
+                "some $path mounts are not on disk yet; empty-directory cleanup stays paused \
+                 until they exist"
+            );
+        }
+        self.project_dirty = missing_mounts;
         self.mark_sourcemap_dirty();
         Ok(true)
     }
@@ -696,26 +731,39 @@ impl ProjectState {
     /// Only the prefix is normalized: `filePaths` in the sourcemap and every
     /// disk write below the mount need the real on-disk casing.
     fn canonicalize_mount_case(&self, rel: String) -> String {
-        for (_, dir) in self.project.path_mappings() {
-            let dir = dir.to_string_lossy().replace('\\', "/");
+        // Longest match wins, not first. `path_mappings()` yields DFS/BTreeMap
+        // order, so a shallower mount (`src`) is seen before a deeper one
+        // (`src/Shared`) that also matches — taking the first would apply the
+        // wrong mount's casing and leave one physical file under two keys,
+        // which is the exact defect this function exists to prevent.
+        let mut best: Option<&str> = None;
+        let mounts: Vec<String> = self
+            .project
+            .path_mappings()
+            .into_iter()
+            .map(|(_, dir)| dir.to_string_lossy().replace('\\', "/"))
+            .collect();
+        for dir in &mounts {
             let dir = dir.trim_end_matches('/');
             if dir.is_empty() || dir == "." {
                 continue;
             }
-            if rel.eq_ignore_ascii_case(dir) {
-                return dir.to_owned();
-            }
             // The separator check also guarantees `dir.len()` is a char
             // boundary — `/` is ASCII, never a UTF-8 continuation byte — and
             // keeps a mount `src` from claiming a sibling `srcextra`.
-            if rel.len() > dir.len()
-                && rel.as_bytes()[dir.len()] == b'/'
-                && rel[..dir.len()].eq_ignore_ascii_case(dir)
-            {
-                return format!("{dir}{}", &rel[dir.len()..]);
+            let matches = rel.eq_ignore_ascii_case(dir)
+                || (rel.len() > dir.len()
+                    && rel.as_bytes()[dir.len()] == b'/'
+                    && rel[..dir.len()].eq_ignore_ascii_case(dir));
+            if matches && best.is_none_or(|b| dir.len() > b.len()) {
+                best = Some(dir);
             }
         }
-        rel
+        match best {
+            Some(dir) if rel.len() > dir.len() => format!("{dir}{}", &rel[dir.len()..]),
+            Some(dir) => dir.to_owned(),
+            None => rel,
+        }
     }
 
     /// Disk→instance half of a `PackageRemap`: rewrites a raw project-relative

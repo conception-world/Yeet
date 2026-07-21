@@ -266,6 +266,14 @@ interface SourcemapNode {
 	children: SourcemapNode[];
 }
 
+/// Ownership marker the daemon stamps on maps it generates, and looks for
+/// before overwriting an existing one (`sourcemap::is_foreign`). The scaffold
+/// map MUST carry it: without it the daemon treats this file as a
+/// hand-maintained one, refuses to manage it, and a freshly created project
+/// never gets per-file type resolution at all.
+const GENERATED_BY_KEY = "generatedBy";
+const GENERATED_BY_VALUE = "yeet";
+
 /// Emits an initial `sourcemap.json` at the project root mirroring the scaffold
 /// (the KNOWN_SERVICES → `src/<Service>` mounts). It carries only the empty
 /// service nodes so the LSP has a valid DataModel root immediately after
@@ -279,9 +287,10 @@ function writeInitialSourcemap(
 ): void {
 	const rootClass =
 		typeof project.tree.$className === "string" ? project.tree.$className : "DataModel";
-	const sourcemap: SourcemapNode = {
+	const sourcemap: SourcemapNode & Record<string, unknown> = {
 		name: project.name,
 		className: rootClass,
+		[GENERATED_BY_KEY]: GENERATED_BY_VALUE,
 		filePaths: [],
 		children: treeToSourcemapChildren(project.tree),
 	};
