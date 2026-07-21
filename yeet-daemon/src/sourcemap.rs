@@ -74,6 +74,33 @@ impl SourceNode {
     }
 }
 
+/// Marker Yeet stamps on the sourcemap root, and looks for before overwriting
+/// an existing one. Rojo does not define this key and luau-lsp ignores keys it
+/// does not know, so it is inert to every consumer — its only job is to let a
+/// later run tell "a map I wrote" from "a map the user maintains".
+pub const GENERATED_BY_KEY: &str = "generatedBy";
+pub const GENERATED_BY_VALUE: &str = "yeet";
+
+/// True when `<root>/sourcemap.json` exists but was not written by Yeet — a
+/// hand-maintained map, or one produced by `rojo sourcemap --watch`, which is
+/// the standard luau-lsp setup. Yeet used to overwrite it unconditionally on
+/// every daemon start, silently narrowing it to Yeet's own view.
+///
+/// A file we cannot parse counts as foreign: refusing to touch what we cannot
+/// read is the only safe reading of an ambiguous state.
+#[must_use]
+pub fn is_foreign(root: &Path) -> bool {
+    let path = root.join("sourcemap.json");
+    let Ok(raw) = std::fs::read_to_string(&path) else {
+        // Missing (or unreadable) — nothing to protect, so writing is fine.
+        return false;
+    };
+    let Ok(value) = serde_json::from_str::<Value>(&raw) else {
+        return true;
+    };
+    value.get(GENERATED_BY_KEY).and_then(Value::as_str) != Some(GENERATED_BY_VALUE)
+}
+
 fn class_for(kind: ScriptKind) -> &'static str {
     match kind {
         ScriptKind::ModuleScript => "ModuleScript",
@@ -211,7 +238,14 @@ pub fn build_sourcemap(project: &Project, tree: &Tree, remaps: &[PackageRemap]) 
         }
     }
 
-    root.to_json(root_name)
+    let mut value = root.to_json(root_name);
+    if let Some(object) = value.as_object_mut() {
+        object.insert(
+            GENERATED_BY_KEY.to_owned(),
+            Value::String(GENERATED_BY_VALUE.to_owned()),
+        );
+    }
+    value
 }
 
 /// Collects the instance-path segments of every child the project tree
@@ -922,6 +956,68 @@ mod tests {
             structure_signature(&a),
             structure_signature(&c),
             "a different key set must change the signature"
+        );
+    }
+
+    /// The root node carries an ownership marker so a later run can tell a map
+    /// Yeet wrote from one the user maintains (`rojo sourcemap --watch` is the
+    /// common case). It goes on the root only — every child would be noise, and
+    /// luau-lsp ignores keys it does not know.
+    #[test]
+    fn build_sourcemap_marks_the_root_as_yeet_generated() {
+        let project: Project = serde_json::from_str(
+            r#"{"name":"M","tree":{"$className":"DataModel","ReplicatedStorage":{"$path":"src"}}}"#,
+        )
+        .expect("parse project");
+        let mut tree = Tree::new();
+        tree.insert("src/Foo.luau".to_owned(), entry(ScriptKind::ModuleScript));
+
+        let map = build_sourcemap(&project, &tree, &[]);
+        assert_eq!(
+            map.get(GENERATED_BY_KEY).and_then(Value::as_str),
+            Some(GENERATED_BY_VALUE)
+        );
+        let rs = child(&map, "ReplicatedStorage").expect("service present");
+        assert!(
+            rs.get(GENERATED_BY_KEY).is_none(),
+            "only the root carries the marker"
+        );
+        // The Rojo-defined fields must be untouched by the addition.
+        assert_eq!(map.get("name").and_then(Value::as_str), Some("M"));
+        assert_eq!(class_name(&map), Some("DataModel"));
+    }
+
+    #[test]
+    fn is_foreign_only_flags_a_map_yeet_did_not_write() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let root = dir.path();
+        let path = root.join("sourcemap.json");
+
+        assert!(
+            !is_foreign(root),
+            "no file at all is not foreign — there is nothing to protect"
+        );
+
+        std::fs::write(
+            &path,
+            r#"{"name":"X","className":"DataModel","filePaths":[],"children":[]}"#,
+        )
+        .expect("write foreign");
+        assert!(is_foreign(root), "a map without the marker belongs to the user");
+
+        let project: Project =
+            serde_json::from_str(r#"{"name":"X","tree":{"$className":"DataModel"}}"#)
+                .expect("parse project");
+        write_sourcemap(root, &project, &Tree::new(), &[]).expect("write ours");
+        assert!(
+            !is_foreign(root),
+            "a map we just wrote must be recognized as ours"
+        );
+
+        std::fs::write(&path, "{ not json").expect("write garbage");
+        assert!(
+            is_foreign(root),
+            "an unparseable file is treated as the user's — never clobber what we cannot read"
         );
     }
 

@@ -79,6 +79,11 @@
           "default": false,
           "description": "Pass --debug-echo to the daemon so every hash and echo-detection decision is logged at info level. Useful when diagnosing ping-pong between Studio and disk."
         },
+        "yeet.generateSourcemap": {
+          "type": "boolean",
+          "default": true,
+          "description": "Generate and maintain sourcemap.json at the project root so luau-lsp can resolve game.<Service>.<Script>, require(Packages.X), and Wally package types. Turn this off if you already drive luau-lsp from `rojo sourcemap --watch` or a hand-maintained map. Yeet already refuses to overwrite a sourcemap.json it did not write (one lacking its \"generatedBy\": \"yeet\" marker), so this setting is only needed to disable the feature outright."
+        },
         "yeet.createTemplate": {
           "type": "array",
           "items": { "type": "string" },

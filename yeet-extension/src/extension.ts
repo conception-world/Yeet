@@ -499,9 +499,13 @@ async function startDaemonInner(): Promise<void> {
 	}
 
 	const debugEcho = cfg.get<boolean>("debugEcho") ?? false;
+	const generateSourcemap = cfg.get<boolean>("generateSourcemap") ?? true;
 	const args: string[] = [projectRoot];
 	if (debugEcho) {
 		args.push("--debug-echo");
+	}
+	if (!generateSourcemap) {
+		args.push("--no-sourcemap");
 	}
 
 	// Re-probe immediately before spawn. The earlier probe at the top
