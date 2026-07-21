@@ -519,38 +519,79 @@ async fn handle_fs_event(
     }
 
     // Special-case the project file: a change to `default.project.json`
-    // mid-session means the user added/removed a `$path` mapping. We can't
-    // safely hot-reload (mapping_roots_canonical is captured at startup
-    // and threaded into every prune call), but we MUST stop pruning empty
-    // dirs — a freshly-mapped path with no files yet would otherwise be
-    // wiped by the next aggressive sweep. Set the dirty flag and emit a
-    // SyncError so the user knows to restart the daemon.
+    // mid-session means the user added or removed a `$path` mapping, so adopt
+    // it. Everything derived from the project is rebuilt — the mounts, the
+    // canonical mount roots pruning protects, and `tree_fs` — after which the
+    // union of the pre- and post-reload trees is reconciled so newly mapped
+    // files reach Studio and unmapped ones stop being tracked.
     {
         let project_file_rel = state.read().await.relative(&abs_for_meta);
         if project_file_rel.as_deref() == Some(PROJECT_FILE) {
-            let already_dirty = {
+            let (reloaded, mounts, added) = {
                 let mut guard = state.write().await;
-                let was = guard.project_dirty;
-                guard.project_dirty = true;
-                was
+                let before: BTreeSet<String> = guard.tree_fs.keys().cloned().collect();
+                let reloaded = guard.reload_project()?;
+                let after: BTreeSet<String> = guard.tree_fs.keys().cloned().collect();
+
+                // Files whose mount disappeared are *unmapped*, not deleted:
+                // they are still on disk, Yeet just no longer manages them.
+                // Forget them everywhere so a later reconcile can't read the
+                // leftover `tree_base` entry as "Studio deleted this" and take
+                // the file out on disk. Deliberately no Studio-side delete —
+                // removing a `$path` is a config edit, not a destructive one.
+                let unmapped: Vec<String> = before.difference(&after).cloned().collect();
+                for path in &unmapped {
+                    guard.tree_base.remove(path);
+                    guard.tree_studio.remove(path);
+                    guard.meta.remove(path);
+                    guard.meta_attributes.remove(path);
+                }
+                // Newly mapped files are announced only when Yeet has never
+                // tracked them. One already present in `tree_base` (persisted
+                // by an earlier session that mapped it) is by definition in
+                // sync, and reconciling it with an empty `tree_studio` — the
+                // normal state until a plugin connects — would merge as
+                // "deleted in Studio, unchanged on disk" and delete the file.
+                let added: Vec<String> = after
+                    .difference(&before)
+                    .filter(|path| !guard.tree_base.contains_key(*path))
+                    .cloned()
+                    .collect();
+                if !unmapped.is_empty() {
+                    persist_base(&guard)?;
+                }
+                let mounts = guard.project.path_mappings().len();
+                (reloaded, mounts, added)
             };
-            if !already_dirty {
-                warn!(
-                    "default.project.json changed at runtime; further prune operations \
-                     will be skipped until daemon restart"
-                );
+            if !reloaded {
+                // Unusable file — the previous project stays in force and
+                // pruning is suspended. The editor writes this file keystroke
+                // by keystroke, so this is routine mid-edit; the message is
+                // what makes a *persistently* broken file diagnosable.
                 broadcast_server_msg(
                     state,
                     bcast_tx,
                     ServerMsg::SyncError {
                         kind: SyncErrorKind::UnsafePath,
                         path: PROJECT_FILE.to_owned(),
-                        reason: "default.project.json changed at runtime; restart the daemon \
-                                 for new $path mappings to take effect"
+                        reason: "default.project.json could not be parsed; the previous \
+                                 project is still in effect and empty-directory cleanup \
+                                 is paused until it is valid again"
                             .to_owned(),
                     },
                 )
                 .await;
+                return Ok(());
+            }
+            info!(
+                mounts,
+                newly_mapped = added.len(),
+                "default.project.json reloaded"
+            );
+            for path in added {
+                if let Err(e) = reconcile_path(state, &path, bcast_tx).await {
+                    warn!(path = %path, error = ?e, "project reload reconcile failed");
+                }
             }
             return Ok(());
         }
@@ -7898,6 +7939,319 @@ mod fs_removed_pending_tests {
         assert!(
             !guard.meta_attributes.contains_key("src/Foo.luau"),
             "meta_attributes must be cleared once the removal finalizes (B5)"
+        );
+    }
+}
+
+#[cfg(test)]
+mod project_reload_tests {
+    //! `default.project.json` edited while the daemon runs. Before this the
+    //! handler only set `project_dirty` and returned, so a newly added `$path`
+    //! mount stayed invisible until the user restarted — and the one hint that
+    //! anything was wrong went to the Studio plugin, not to the IDE where the
+    //! edit had just happened.
+
+    use super::{handle_fs_event, PROJECT_FILE};
+    use std::sync::Arc;
+    use std::time::Duration;
+    use tokio::sync::{broadcast, RwLock};
+    use yeet_daemon::project::Project;
+    use yeet_daemon::protocol::ServerMsg;
+    use yeet_daemon::state::{ProjectState, SharedState};
+    use yeet_daemon::watcher::FileEvent;
+
+    struct Env {
+        state: SharedState,
+        bcast_tx: broadcast::Sender<Arc<ServerMsg>>,
+        _root: tempfile::TempDir,
+    }
+
+    const INITIAL_PROJECT: &str = r#"{
+        "name": "Reload",
+        "tree": {
+            "$className": "DataModel",
+            "ServerScriptService": { "$className": "ServerScriptService", "$path": "src/server" }
+        }
+    }"#;
+
+    async fn make_env() -> Env {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let root = dir.path();
+        std::fs::write(root.join(PROJECT_FILE), INITIAL_PROJECT).expect("write project");
+        std::fs::create_dir_all(root.join("src/server")).expect("mkdir server");
+        std::fs::create_dir_all(root.join("src/shared")).expect("mkdir shared");
+        std::fs::write(root.join("src/server/Main.server.luau"), "return 1\n").expect("write main");
+        // Present on disk from the start, but outside every mount — so it is
+        // invisible until the project file starts mapping `src/shared`.
+        std::fs::write(root.join("src/shared/Config.luau"), "return {}\n").expect("write config");
+
+        let project = Project::load(&root.join(PROJECT_FILE)).expect("load project");
+        let state_inner = ProjectState::bootstrap(root, project, false, false).expect("bootstrap");
+        let state: SharedState = Arc::new(RwLock::new(state_inner));
+        let (bcast_tx, _) = broadcast::channel(64);
+        Env {
+            state,
+            bcast_tx,
+            _root: dir,
+        }
+    }
+
+    async fn drain(rx: &mut broadcast::Receiver<Arc<ServerMsg>>) -> Vec<ServerMsg> {
+        let mut out = Vec::new();
+        while let Ok(Ok(m)) = tokio::time::timeout(Duration::from_millis(20), rx.recv()).await {
+            out.push((*m).clone());
+        }
+        out
+    }
+
+    /// Adding a `$path` mount must take effect immediately: its files enter
+    /// `tree_fs` and are announced to Studio, with no restart.
+    #[tokio::test]
+    async fn added_mount_is_picked_up_without_restart() {
+        let env = make_env().await;
+        let root = env.state.read().await.root.clone();
+        let mut rx = env.bcast_tx.subscribe();
+
+        assert!(
+            !env.state.read().await.tree_fs.contains_key("src/shared/Config.luau"),
+            "precondition: the unmapped file must start untracked"
+        );
+
+        std::fs::write(
+            root.join(PROJECT_FILE),
+            r#"{
+                "name": "Reload",
+                "tree": {
+                    "$className": "DataModel",
+                    "ServerScriptService": { "$className": "ServerScriptService", "$path": "src/server" },
+                    "ReplicatedStorage": { "$className": "ReplicatedStorage", "$path": "src/shared" }
+                }
+            }"#,
+        )
+        .expect("rewrite project");
+        handle_fs_event(
+            &env.state,
+            FileEvent::Touched(root.join(PROJECT_FILE)),
+            &env.bcast_tx,
+        )
+        .await
+        .expect("handle project change");
+
+        let guard = env.state.read().await;
+        assert!(
+            guard.tree_fs.contains_key("src/shared/Config.luau"),
+            "a newly mapped file must be tracked without a restart"
+        );
+        assert!(
+            guard.tree_fs.contains_key("src/server/Main.server.luau"),
+            "the pre-existing mount must survive the reload"
+        );
+        assert!(
+            !guard.project_dirty,
+            "a successful reload must clear the dirty flag so pruning resumes"
+        );
+        assert_eq!(
+            guard.project.path_mappings().len(),
+            2,
+            "the in-memory project must be the new one"
+        );
+        drop(guard);
+
+        let msgs = drain(&mut rx).await;
+        assert!(
+            msgs.iter().any(
+                |m| matches!(m, ServerMsg::FileCreated { path, .. } if path == "src/shared/Config.luau")
+            ),
+            "the newly mapped file must be announced to Studio; got {msgs:?}"
+        );
+    }
+
+    /// Removing a mount must stop tracking its files rather than leaving stale
+    /// entries that later reconcile against a mapping that no longer exists.
+    #[tokio::test]
+    async fn removed_mount_drops_its_files() {
+        let env = make_env().await;
+        let root = env.state.read().await.root.clone();
+
+        std::fs::write(
+            root.join(PROJECT_FILE),
+            r#"{"name":"Reload","tree":{"$className":"DataModel","ReplicatedStorage":{"$path":"src/shared"}}}"#,
+        )
+        .expect("rewrite project");
+        handle_fs_event(
+            &env.state,
+            FileEvent::Touched(root.join(PROJECT_FILE)),
+            &env.bcast_tx,
+        )
+        .await
+        .expect("handle project change");
+
+        let guard = env.state.read().await;
+        assert!(
+            !guard.tree_fs.contains_key("src/server/Main.server.luau"),
+            "a file whose mount was removed must no longer be tracked"
+        );
+        assert!(guard.tree_fs.contains_key("src/shared/Config.luau"));
+    }
+
+    /// The reload must never reach for the blanket reconcile that
+    /// `handle_rescan` uses. `bootstrap` seeds `tree_base` from `tree_fs`, and
+    /// `tree_studio` stays empty until a plugin connects — the normal state
+    /// when the user is editing in the IDE alone. An untouched tracked file
+    /// therefore merges as `(base: Some, studio: None, fs: Some)` with matching
+    /// hashes, which means "Studio deleted it, disk still matches base" and
+    /// applies a *disk delete*. Reconciling every path on reload would delete
+    /// the project.
+    #[tokio::test]
+    async fn reload_does_not_delete_untouched_files_from_disk() {
+        let env = make_env().await;
+        let root = env.state.read().await.root.clone();
+        let main = root.join("src/server/Main.server.luau");
+
+        // Rewrite with a different but equivalent-for-src/server project, so
+        // the pre-existing mount's files are untouched across the reload.
+        std::fs::write(
+            root.join(PROJECT_FILE),
+            r#"{
+                "name": "Renamed",
+                "tree": {
+                    "$className": "DataModel",
+                    "ServerScriptService": { "$className": "ServerScriptService", "$path": "src/server" },
+                    "ReplicatedStorage": { "$className": "ReplicatedStorage", "$path": "src/shared" }
+                }
+            }"#,
+        )
+        .expect("rewrite project");
+        handle_fs_event(
+            &env.state,
+            FileEvent::Touched(root.join(PROJECT_FILE)),
+            &env.bcast_tx,
+        )
+        .await
+        .expect("handle project change");
+
+        assert!(
+            main.exists(),
+            "an untouched tracked file must still be on disk after a reload"
+        );
+        assert_eq!(
+            std::fs::read_to_string(&main).expect("read main"),
+            "return 1\n",
+            "its contents must be untouched too"
+        );
+    }
+
+    /// Unmapping a path must not be read as a deletion: the file stays on disk
+    /// and Studio is not told to remove anything. Dropping the stale
+    /// `tree_base` entry is what prevents a later reconcile from doing exactly
+    /// that.
+    #[tokio::test]
+    async fn removed_mount_leaves_files_on_disk_and_forgets_them() {
+        let env = make_env().await;
+        let root = env.state.read().await.root.clone();
+        let main = root.join("src/server/Main.server.luau");
+        let mut rx = env.bcast_tx.subscribe();
+
+        std::fs::write(
+            root.join(PROJECT_FILE),
+            r#"{"name":"Reload","tree":{"$className":"DataModel","ReplicatedStorage":{"$path":"src/shared"}}}"#,
+        )
+        .expect("rewrite project");
+        handle_fs_event(
+            &env.state,
+            FileEvent::Touched(root.join(PROJECT_FILE)),
+            &env.bcast_tx,
+        )
+        .await
+        .expect("handle project change");
+
+        assert!(main.exists(), "unmapping must not delete the file on disk");
+        let guard = env.state.read().await;
+        assert!(
+            !guard.tree_base.contains_key("src/server/Main.server.luau"),
+            "a stale base entry would later merge as a Studio-side delete"
+        );
+        drop(guard);
+
+        let msgs = drain(&mut rx).await;
+        assert!(
+            !msgs
+                .iter()
+                .any(|m| matches!(m, ServerMsg::FileDeleted { path } if path.starts_with("src/server"))),
+            "removing a $path is a config edit, not a destructive one; got {msgs:?}"
+        );
+    }
+
+    /// A half-written or malformed project file must not take the daemon's
+    /// working configuration down with it — the editor writes this file
+    /// keystroke by keystroke.
+    #[tokio::test]
+    async fn malformed_project_keeps_the_previous_one_and_warns() {
+        let env = make_env().await;
+        let root = env.state.read().await.root.clone();
+        let mut rx = env.bcast_tx.subscribe();
+
+        std::fs::write(root.join(PROJECT_FILE), "{ not json").expect("write garbage");
+        handle_fs_event(
+            &env.state,
+            FileEvent::Touched(root.join(PROJECT_FILE)),
+            &env.bcast_tx,
+        )
+        .await
+        .expect("a malformed project must not fail the event handler");
+
+        let guard = env.state.read().await;
+        assert_eq!(
+            guard.project.path_mappings().len(),
+            1,
+            "the last good project must stay in force"
+        );
+        assert!(
+            guard.tree_fs.contains_key("src/server/Main.server.luau"),
+            "tracking must survive a malformed edit"
+        );
+        assert!(
+            guard.project_dirty,
+            "an unusable project file must disable pruning until it parses again"
+        );
+        drop(guard);
+
+        let msgs = drain(&mut rx).await;
+        assert!(
+            msgs.iter().any(|m| matches!(m, ServerMsg::SyncError { .. })),
+            "the user must be told the project file is broken; got {msgs:?}"
+        );
+    }
+
+    /// Recovering from a malformed edit must re-enable everything the failure
+    /// switched off — otherwise a single typo disables pruning for the session.
+    #[tokio::test]
+    async fn recovering_from_malformed_project_clears_dirty() {
+        let env = make_env().await;
+        let root = env.state.read().await.root.clone();
+
+        std::fs::write(root.join(PROJECT_FILE), "{ not json").expect("write garbage");
+        handle_fs_event(
+            &env.state,
+            FileEvent::Touched(root.join(PROJECT_FILE)),
+            &env.bcast_tx,
+        )
+        .await
+        .expect("handle malformed");
+        assert!(env.state.read().await.project_dirty);
+
+        std::fs::write(root.join(PROJECT_FILE), INITIAL_PROJECT).expect("restore project");
+        handle_fs_event(
+            &env.state,
+            FileEvent::Touched(root.join(PROJECT_FILE)),
+            &env.bcast_tx,
+        )
+        .await
+        .expect("handle restored");
+
+        assert!(
+            !env.state.read().await.project_dirty,
+            "a project file that parses again must clear the dirty flag"
         );
     }
 }

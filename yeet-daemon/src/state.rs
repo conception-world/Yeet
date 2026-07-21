@@ -136,13 +136,12 @@ pub struct ProjectState {
     /// pressure (e.g. "session rotated 50 times in an hour" → broadcast
     /// channel sized too small for the project).
     pub rotation_count: u64,
-    /// Set when the watcher observes a change to `default.project.json`
-    /// after startup. The daemon doesn't hot-reload the project file (path
-    /// mappings are baked into `mapping_roots_canonical` at bootstrap and
-    /// changing them mid-flight is a much larger refactor), but it MUST
-    /// stop pruning empty directories — a freshly-added `$path` mount with
-    /// no files yet would otherwise be deleted by the next aggressive
-    /// sweep. Cleared only by daemon restart.
+    /// Set when `default.project.json` changed on disk but could not be
+    /// adopted — it does not parse, or is mid-write by the editor. The old
+    /// project stays in force, and pruning is suspended while the flag is up:
+    /// a mount the user is in the middle of adding has no files yet, and the
+    /// next aggressive sweep would delete the directory out from under them.
+    /// `reload_project` clears it as soon as the file parses again.
     pub project_dirty: bool,
     /// Set by `--dry-run` at startup. When true, every mutation path
     /// (write_to_fs, delete_from_fs, push_to_studio, delete_on_studio)
@@ -248,28 +247,7 @@ impl ProjectState {
         // the persisted file is more of a debugging breadcrumb than a
         // resume primitive across daemon restarts.
         let session_id = uuid::Uuid::new_v4().to_string();
-        // Pre-compute the canonical absolute path of every `$path` mount.
-        // We canonicalize so prune-time `strip_prefix` checks compare like
-        // shapes (Windows UNC vs non-UNC bites otherwise). Missing mounts
-        // are skipped — `rescan_fs` already warns about them.
-        let mapping_roots_canonical: Vec<PathBuf> = project
-            .path_mappings()
-            .into_iter()
-            .filter_map(|(_, rel)| {
-                let abs = root.join(&rel);
-                match std::fs::canonicalize(&abs) {
-                    Ok(c) => Some(c),
-                    Err(e) => {
-                        tracing::warn!(
-                            path = %abs.display(),
-                            error = ?e,
-                            "mapping root not on disk; pruning will not protect it"
-                        );
-                        None
-                    }
-                }
-            })
-            .collect();
+        let mapping_roots_canonical = Self::canonical_mapping_roots(root, &project);
         // Auth token: 256 bits of entropy (two stacked v4 UUIDs).
         // `Uuid::new_v4()` uses `getrandom` under the hood, which on
         // every supported OS pulls from a CSPRNG (Windows BCrypt,
@@ -395,6 +373,63 @@ impl ProjectState {
     /// `tree_base` and `tree_studio` are left untouched. Public so the FS
     /// event pipeline can re-run a full scan after a watcher backend
     /// error/overflow dropped notifications (AUDITORIA-YEET.md M19).
+    /// Re-reads `default.project.json` and adopts it, rebuilding everything
+    /// derived from it: the `$path` mounts, the canonical mount roots pruning
+    /// refuses to delete, and — via `rescan_fs` — `tree_fs` itself, since a
+    /// changed mount set changes which files are tracked at all.
+    ///
+    /// Returns `Ok(false)` and leaves the previous project untouched when the
+    /// file does not parse. An editor writes this file keystroke by keystroke,
+    /// so a transiently invalid read is normal and must not take the daemon's
+    /// working configuration down with it; `project_dirty` goes up instead, and
+    /// clears on the next read that parses.
+    ///
+    /// The caller still owns reconciliation: `tree_fs` moves here, but
+    /// `tree_base`/`tree_studio` are left alone so the merge can see the
+    /// difference and tell Studio about it.
+    pub fn reload_project(&mut self) -> Result<bool> {
+        let path = self.root.join(crate::project::PROJECT_FILE_NAME);
+        let project = match Project::load(&path) {
+            Ok(project) => project,
+            Err(e) => {
+                tracing::warn!(error = ?e, "default.project.json is unusable; keeping the previous one");
+                self.project_dirty = true;
+                return Ok(false);
+            }
+        };
+        self.project = project;
+        self.mapping_roots_canonical = Self::canonical_mapping_roots(&self.root, &self.project);
+        self.rescan_fs()?;
+        self.project_dirty = false;
+        self.mark_sourcemap_dirty();
+        Ok(true)
+    }
+
+    /// Canonical absolute path of every `$path` mount that exists on disk. We
+    /// canonicalize so prune-time `strip_prefix` checks compare like shapes
+    /// (Windows UNC vs non-UNC bites otherwise). Missing mounts are skipped —
+    /// `rescan_fs` already warns about them.
+    fn canonical_mapping_roots(root: &Path, project: &Project) -> Vec<PathBuf> {
+        project
+            .path_mappings()
+            .into_iter()
+            .filter_map(|(_, rel)| {
+                let abs = root.join(&rel);
+                match std::fs::canonicalize(&abs) {
+                    Ok(c) => Some(c),
+                    Err(e) => {
+                        tracing::warn!(
+                            path = %abs.display(),
+                            error = ?e,
+                            "mapping root not on disk; pruning will not protect it"
+                        );
+                        None
+                    }
+                }
+            })
+            .collect()
+    }
+
     pub fn rescan_fs(&mut self) -> Result<()> {
         self.tree_fs.clear();
         self.meta.clear();

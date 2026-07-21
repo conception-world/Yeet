@@ -107,19 +107,56 @@ impl TreeNode {
 /// a missing directory is already handled downstream (`rescan_fs` warns and
 /// skips, `state.rs`).
 fn parse_path(value: &Value) -> std::result::Result<String, String> {
-    match value {
-        Value::String(path) => Ok(path.clone()),
+    let path = match value {
+        Value::String(path) => path.clone(),
         Value::Object(map) => map
             .get("optional")
             .and_then(Value::as_str)
             .map(str::to_owned)
-            .ok_or_else(|| {
-                "$path object form must carry a string `optional` key".to_owned()
-            }),
-        other => Err(format!(
-            "$path must be a string or an object, got `{other}`"
-        )),
+            .ok_or_else(|| "$path object form must carry a string `optional` key".to_owned())?,
+        other => {
+            return Err(format!(
+                "$path must be a string or an object, got `{other}`"
+            ));
+        }
+    };
+    validate_path(&path)?;
+    Ok(path)
+}
+
+/// Rejects a `$path` Yeet cannot honor. Both shapes below are accepted by the
+/// old parser and then misbehave silently, so refusing them up front is the
+/// only way the user finds out:
+///
+///   * escaping the project root (`../shared`) genuinely reads outside it —
+///     `ProjectState::rel_raw` strips the root lexically and `Path::components`
+///     preserves `ParentDir`, so those files land in `tree_fs` and are
+///     broadcast to Studio. Yeet cannot sync them properly either: the watcher
+///     observes only the root, so nothing out there is seen changing.
+///     `load_nested_package` has rejected this shape since A10.
+///   * an absolute path makes `root.join(...)` discard the root, and the
+///     following `strip_prefix` then fails for every file — an empty mount that
+///     looks exactly like an empty project.
+fn validate_path(path: &str) -> std::result::Result<(), String> {
+    let normalized = path.replace('\\', "/");
+    if normalized.split('/').any(|segment| segment == "..") {
+        return Err(format!(
+            "$path `{path}` escapes the project root; Yeet only syncs files beneath it"
+        ));
     }
+    // `C:/…` and `C:…` are absolute-ish on Windows; `/…` and `//server/share`
+    // everywhere. Checked textually so the rule does not vary by host OS —
+    // a project file is shared across machines.
+    let windows_drive = {
+        let bytes = normalized.as_bytes();
+        bytes.len() >= 2 && bytes[0].is_ascii_alphabetic() && bytes[1] == b':'
+    };
+    if normalized.starts_with('/') || windows_drive {
+        return Err(format!(
+            "$path `{path}` is absolute; it must be relative to the project root"
+        ));
+    }
+    Ok(())
 }
 
 /// Strips a leading UTF-8 BOM. `PowerShell`'s `Out-File` and
@@ -290,6 +327,63 @@ mod tests {
                 serde_json::from_str::<Project>(raw).is_err(),
                 "malformed supported key must still be rejected: {raw}"
             );
+        }
+    }
+
+    /// A top-level `$path` is joined onto the project root and walked. `..`
+    /// escapes that root for real: `rel_raw`'s `strip_prefix` is lexical and
+    /// `Path::components` preserves `ParentDir`, so files outside the project
+    /// land in `tree_fs` and get broadcast to Studio. Yeet cannot sync them
+    /// correctly either — the watcher only observes the root, so nothing outside
+    /// it is ever seen changing. `load_nested_package` has rejected exactly this
+    /// shape since A10; the root loader never did.
+    #[test]
+    fn rejects_path_escaping_the_project_root() {
+        for raw in [
+            r#"{"name":"T","tree":{"R":{"$path":"../outside"}}}"#,
+            r#"{"name":"T","tree":{"R":{"$path":"src/../../outside"}}}"#,
+            r#"{"name":"T","tree":{"R":{"$path":"..\\outside"}}}"#,
+            r#"{"name":"T","tree":{"R":{"$path":".."}}}"#,
+            r#"{"name":"T","tree":{"R":{"$path":{"optional":"../outside"}}}}"#,
+        ] {
+            let err = serde_json::from_str::<Project>(raw)
+                .expect_err("must reject escaping $path")
+                .to_string();
+            assert!(
+                err.contains("$path"),
+                "the error must name the offending key, got: {err}"
+            );
+        }
+    }
+
+    /// An absolute `$path` silently ingests nothing (`root.join` discards the
+    /// base, then `strip_prefix` fails), which looks exactly like an empty
+    /// project. Refusing it up front turns a mystery into a message.
+    #[test]
+    fn rejects_absolute_path() {
+        for raw in [
+            r#"{"name":"T","tree":{"R":{"$path":"/etc/passwd"}}}"#,
+            r#"{"name":"T","tree":{"R":{"$path":"C:/Windows/Temp"}}}"#,
+        ] {
+            assert!(
+                serde_json::from_str::<Project>(raw).is_err(),
+                "must reject absolute $path: {raw}"
+            );
+        }
+    }
+
+    /// The guard must not overreach: a `..` inside a *name*, or a relative path
+    /// that stays inside the root, is legitimate.
+    #[test]
+    fn accepts_ordinary_relative_paths() {
+        for raw in [
+            r#"{"name":"T","tree":{"R":{"$path":"src/shared"}}}"#,
+            r#"{"name":"T","tree":{"R":{"$path":"./src"}}}"#,
+            r#"{"name":"T","tree":{"R":{"$path":"src/..weird/x"}}}"#,
+            r#"{"name":"T","tree":{"$path":"."}}"#,
+        ] {
+            serde_json::from_str::<Project>(raw)
+                .unwrap_or_else(|e| panic!("must accept {raw}: {e}"));
         }
     }
 
