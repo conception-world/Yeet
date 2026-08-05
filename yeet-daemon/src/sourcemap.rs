@@ -237,8 +237,11 @@ pub fn build_sourcemap(project: &Project, tree: &Tree, remaps: &[PackageRemap]) 
         // luau-lsp opens the `filePaths` string verbatim, so it has to be the
         // real path on disk — undo the package collapse the tree key carries.
         let disk_path = fs_rel_with(remaps, key);
+        // A mount reclasses into the script only when it has no explicit
+        // `$className` — a service or a declared Folder keeps its identity.
+        let mount_fixed_class = mount_has_explicit_class(project, segments);
         let mount = ensure_segment_chain(&mut root, project, segments);
-        place_file(mount, &rel, &disk_path, &script_name, kind);
+        place_file(mount, &rel, &disk_path, &script_name, kind, mount_fixed_class);
     }
 
     let mut value = root.to_json(root_name);
@@ -344,6 +347,22 @@ pub fn detect_name_collisions(tree: &Tree) -> Vec<(String, Vec<String>)> {
         .collect()
 }
 
+/// Whether the mount node named by `segments` declares its own `$className`.
+/// When it does, its class is fixed by the project (a service, or a deliberate
+/// `"$className": "Folder"`) and the mount's `$path` contents must not reclass
+/// it; when it does not, a script-shaped `$path` promotes the mount into that
+/// script, matching Rojo.
+fn mount_has_explicit_class(project: &Project, segments: &[String]) -> bool {
+    let mut node = &project.tree;
+    for seg in segments {
+        match node.children.get(seg) {
+            Some(child) => node = child,
+            None => return false,
+        }
+    }
+    node.class_name.is_some()
+}
+
 /// Walks (creating as needed) the instance chain named by `segments`, returning
 /// the deepest node. Each segment's className is resolved the way
 /// `TreeBuilder.ensureNode` does: an explicit `$className` from the project tree
@@ -388,13 +407,16 @@ fn place_file(
     disk_path: &str,
     script_name: &str,
     kind: ScriptKind,
+    mount_fixed_class: bool,
 ) {
     let parts: Vec<&str> = rel.split('/').filter(|p| !p.is_empty()).collect();
     if parts.is_empty() {
         // `$path` points directly at this single file: the mount instance itself
-        // carries the source. Keep the mount's own className (a service/Folder
-        // can't be re-classed into a script from here — matches TreeBuilder's
-        // `materializeAtMount` for a non-script mount).
+        // IS the script. Reclass it to the file's kind (Rojo does), unless the
+        // mount declared its own `$className` — a service keeps its identity.
+        if !mount_fixed_class {
+            class_for(kind).clone_into(&mut mount.class_name);
+        }
         mount.file_paths.push(disk_path.to_owned());
         return;
     }
@@ -402,7 +424,11 @@ fn place_file(
     let file_name = parts[parts.len() - 1];
     if is_init_filename(file_name) {
         if parts.len() == 1 {
-            // `init.[ext]` directly under the mount promotes the mount itself.
+            // `init.[ext]` at the mount root promotes the mount itself into that
+            // script — same reclass rule as the single-file mount above.
+            if !mount_fixed_class {
+                class_for(kind).clone_into(&mut mount.class_name);
+            }
             mount.file_paths.push(disk_path.to_owned());
             return;
         }
@@ -730,6 +756,88 @@ mod tests {
             child(foo, "src").is_none(),
             "the src segment must not appear as a child instance"
         );
+    }
+
+    /// A mount whose `$path` resolves to a script — a dir with `init.luau` at
+    /// its top, or a single script file — IS that Script in Rojo, not a Folder
+    /// wrapping it. Yeet left the mount as its declared container class and
+    /// pushed the init/file into its `filePaths`, so `game.ReplicatedStorage.Lib`
+    /// showed as a Folder while `rojo sourcemap` (verified against 7.6.1) shows a
+    /// ModuleScript. The mount reclasses only when it has no explicit
+    /// `$className` — a service keeps its identity.
+    #[test]
+    fn build_sourcemap_reclasses_script_mount() {
+        let project: Project = serde_json::from_str(
+            r#"{
+                "name": "A6",
+                "tree": {
+                    "$className": "DataModel",
+                    "ReplicatedStorage": {
+                        "$className": "ReplicatedStorage",
+                        "Lib": { "$path": "lib" },
+                        "Solo": { "$path": "single/Only.luau" },
+                        "Srv": { "$className": "Folder", "$path": "srv" }
+                    }
+                }
+            }"#,
+        )
+        .expect("parse project");
+
+        let mut tree = Tree::new();
+        // Lib: a directory mount whose top is init.luau -> ModuleScript named Lib.
+        tree.insert("lib/init.luau".to_owned(), entry(ScriptKind::ModuleScript));
+        tree.insert("lib/Helper.luau".to_owned(), entry(ScriptKind::ModuleScript));
+        // Solo: a single-file mount -> ModuleScript named Solo.
+        tree.insert("single/Only.luau".to_owned(), entry(ScriptKind::ModuleScript));
+        // Srv: same shape but an explicit $className must win, staying a Folder.
+        tree.insert("srv/init.luau".to_owned(), entry(ScriptKind::ModuleScript));
+
+        let map = build_sourcemap(&project, &tree, &[]);
+        let rs = child(&map, "ReplicatedStorage").expect("service present");
+
+        let lib = child(rs, "Lib").expect("Lib present");
+        assert_eq!(
+            class_name(lib),
+            Some("ModuleScript"),
+            "an init.luau at the mount root makes the mount the ModuleScript"
+        );
+        assert_eq!(file_paths(lib), vec!["lib/init.luau".to_owned()]);
+        assert_eq!(
+            class_name(child(lib, "Helper").expect("Helper under Lib")),
+            Some("ModuleScript"),
+            "siblings of the mount init become its children"
+        );
+
+        let solo = child(rs, "Solo").expect("Solo present");
+        assert_eq!(
+            class_name(solo),
+            Some("ModuleScript"),
+            "a single-file mount is that ModuleScript"
+        );
+        assert_eq!(file_paths(solo), vec!["single/Only.luau".to_owned()]);
+
+        let srv = child(rs, "Srv").expect("Srv present");
+        assert_eq!(
+            class_name(srv),
+            Some("Folder"),
+            "an explicit $className must not be reclassed by the mount's contents"
+        );
+    }
+
+    /// A `.server`/`.client` init at the mount root reclasses to the matching
+    /// script kind, not ModuleScript.
+    #[test]
+    fn build_sourcemap_reclasses_script_mount_by_kind() {
+        let project: Project = serde_json::from_str(
+            r#"{"name":"K","tree":{"$className":"DataModel","ServerScriptService":{"$className":"ServerScriptService","Job":{"$path":"job"}}}}"#,
+        )
+        .expect("parse project");
+        let mut tree = Tree::new();
+        tree.insert("job/init.server.luau".to_owned(), entry(ScriptKind::Script));
+
+        let map = build_sourcemap(&project, &tree, &[]);
+        let job = child(child(&map, "ServerScriptService").unwrap(), "Job").expect("Job present");
+        assert_eq!(class_name(job), Some("Script"));
     }
 
     #[test]

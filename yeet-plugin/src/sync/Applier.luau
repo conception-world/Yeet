@@ -59,6 +59,7 @@ type Project = {
 }
 
 type Mappings = { [string]: Instance }
+type FixedClass = { [string]: boolean }
 
 type Log = (string) -> ()
 type TrackHook = (path: string, instance: Instance) -> ()
@@ -159,6 +160,9 @@ Applier.__index = Applier
 type self = {
 	fileToInstance: { [string]: Instance },
 	mappings: Mappings,
+	-- Which `$path` mounts have a project-fixed `$className` (so a script-shaped
+	-- mount must not be reclassed). Threaded into `TreeBuilder.materializeFile`.
+	fixedClass: FixedClass,
 	bootstrapped: boolean,
 	log: Log,
 	-- Hash of the content we last wrote into `Source` for each path.
@@ -268,6 +272,7 @@ function Applier.new(log: Log): Applier
 	return setmetatable({
 		fileToInstance = {},
 		mappings = {},
+		fixedClass = {},
 		bootstrapped = false,
 		log = log,
 		recentlyApplied = {},
@@ -590,6 +595,7 @@ local function resetPerSessionState(self: Applier)
 	self.instanceToPath = {}
 	self.pendingCollisions = {}
 	self.mappings = {}
+	self.fixedClass = {}
 	self.appliedAttributes = {}
 end
 
@@ -603,6 +609,7 @@ local function applyProjectOpenedForPreview(self: Applier, project: Project)
 
 	local result = TreeBuilder.discover(project)
 	self.mappings = result.mappings
+	self.fixedClass = result.fixedClass
 	-- Mark as bootstrapped so that `applyFileCreated` / `applyFileChanged` /
 	-- `applyFileDeleted` triggered by the daemon's per-resolution broadcasts
 	-- after `BulkSyncConfirm` aren't rejected with "ignored before bootstrap".
@@ -758,6 +765,7 @@ local function applyProjectOpened(self: Applier, msg: any)
 		local result = TreeBuilder.build(project, initialFiles)
 		self.fileToInstance = result.fileToInstance
 		self.mappings = result.mappings
+		self.fixedClass = result.fixedClass
 		self.bootstrapped = true
 		divergent = result.divergent
 	end)
@@ -859,7 +867,7 @@ local function applyFileCreated(self: Applier, msg: any)
 	local prevApplying = self.applyingDaemonCreate
 	self.applyingDaemonCreate = true
 	local ok, err = withRecording("YeetFileCreated", function()
-		created = TreeBuilder.materializeFile(snap, self.mappings)
+		created = TreeBuilder.materializeFile(snap, self.mappings, self.fixedClass)
 		if created ~= nil then
 			self.fileToInstance[snap.path] = created
 			self.instanceToPath[created] = snap.path

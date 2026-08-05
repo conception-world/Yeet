@@ -43,6 +43,13 @@ export type Project = {
 
 export type Mappings = { [string]: Instance }
 
+-- Per-`$path` flag: true when the mount node declared its own `$className`, so
+-- its class is fixed by the project (a service, or a deliberate
+-- `"$className": "Folder"`). A mount without one is reclassed into a script
+-- when its `$path` resolves to `init.[ext]` or a single script file — matching
+-- Rojo and the daemon's sourcemap (`sourcemap::mount_has_explicit_class`).
+export type FixedClass = { [string]: boolean }
+
 -- When a Script already existed in the `DataModel` with a `Source` that
 -- disagrees with the daemon's snapshot, `build` records it here instead of
 -- clobbering. Caller is expected to echo the Studio `Source` back to the
@@ -71,6 +78,7 @@ export type Untracked = {
 export type BuildResult = {
 	fileToInstance: { [string]: Instance },
 	mappings: Mappings,
+	fixedClass: FixedClass,
 	divergent: { Divergent },
 }
 
@@ -233,10 +241,18 @@ local function ensureNode(parent: Instance, name: string, node: ProjectTreeNode)
 	return child
 end
 
-local function traverseTree(node: ProjectTreeNode, parent: Instance, mappings: Mappings)
+local function traverseTree(
+	node: ProjectTreeNode,
+	parent: Instance,
+	mappings: Mappings,
+	fixedClass: FixedClass
+)
 	local path = node["$path"]
 	if path ~= nil then
 		mappings[path] = parent
+		-- Record whether this mount's class is nailed down by the project, so
+		-- `materializeAtMount` knows if it may reclass the mount into a script.
+		fixedClass[path] = node["$className"] ~= nil
 	end
 	for key, child in pairs(node :: any) do
 		if typeof(key) ~= "string" then
@@ -247,7 +263,7 @@ local function traverseTree(node: ProjectTreeNode, parent: Instance, mappings: M
 		end
 		local childNode = child :: ProjectTreeNode
 		local childInstance = ensureNode(parent, key :: string, childNode)
-		traverseTree(childNode, childInstance, mappings)
+		traverseTree(childNode, childInstance, mappings, fixedClass)
 	end
 end
 
@@ -269,23 +285,65 @@ local function bestMapping(snap: FileSnapshot, mappings: Mappings): (string?, In
 	return bestKey, bestInst
 end
 
--- Honors a nested-project `$path` mount whose package module maps directly onto
--- the mapping Instance itself (AUDITORIA-YEET.md A10 `wally-1`): a Wally package
--- `default.project.json` (`{name, tree:{$path:"src"}}`) makes the package folder
--- THE ModuleScript. When the mapped Instance is already a `LuaSourceContainer`
--- we set its `Source` (reporting a divergence rather than clobbering, exactly as
--- the leaf path does). A `Folder`/service mount can't be re-classed here, so it
--- returns nil and the snapshot is dropped — unchanged from before A10.
-local function materializeAtMount(parent: Instance, snap: FileSnapshot): (Instance?, string?)
-	if not parent:IsA("LuaSourceContainer") then
-		return nil, nil
+-- Reclasses a `Folder` mount into a script of `className`, preserving children
+-- and updating the `mappings` entry so later siblings under the same `$path`
+-- land inside the new script rather than the destroyed Folder. Returns the new
+-- (or reused, if already that class) instance. Only ever called for a mount the
+-- caller has already confirmed is a plain `Folder` with no fixed `$className`.
+local function reclassMount(
+	mappings: Mappings,
+	mapPath: string,
+	folder: Instance,
+	className: string
+): Instance
+	local fresh = Instance.new(className)
+	fresh.Name = folder.Name .. "__yeet_swap"
+	fresh.Parent = folder.Parent
+	for _, child in folder:GetChildren() do
+		child.Parent = fresh
 	end
-	local existingSource = (parent :: LuaSourceContainer).Source
+	local finalName = folder.Name
+	folder:Destroy()
+	fresh.Name = finalName
+	mappings[mapPath] = fresh
+	return fresh
+end
+
+-- Materializes a file that lands directly on a `$path` mount — either the mount
+-- points at a single script file, or at a directory whose top is `init.[ext]`.
+-- Rojo makes the mount instance itself that script. Three shapes:
+--   1. The mount Instance is already a `LuaSourceContainer` (a Wally package
+--      folder that became the package ModuleScript, A10): set its `Source` in
+--      place, reporting a divergence rather than clobbering.
+--   2. It is a plain `Folder` with no project-fixed `$className`: reclass it
+--      into `className`, carrying its children across, then set the source.
+--   3. It is a service, the DataModel, or a Folder the project explicitly
+--      declared: it cannot become a script, so the snapshot is dropped (nil).
+local function materializeAtMount(
+	mappings: Mappings,
+	mapPath: string,
+	parent: Instance,
+	snap: FileSnapshot,
+	className: string,
+	fixedClass: FixedClass
+): (Instance?, string?)
+	local target = parent
+	if not target:IsA("LuaSourceContainer") then
+		if target:IsA("Folder") and not fixedClass[mapPath] then
+			target = reclassMount(mappings, mapPath, target, className)
+		else
+			-- A service / DataModel / explicitly-classed Folder mount cannot be
+			-- re-classed. Matches the daemon's sourcemap, which leaves it a
+			-- container too, so the two never disagree about this instance.
+			return nil, nil
+		end
+	end
+	local existingSource = (target :: LuaSourceContainer).Source
 	if existingSource ~= snap.content then
-		return parent, existingSource
+		return target, existingSource
 	end
-	;(parent :: LuaSourceContainer).Source = snap.content
-	return parent, nil
+	;(target :: LuaSourceContainer).Source = snap.content
+	return target, nil
 end
 
 -- Materializes a single file snapshot as an Instance in the tree, returning the
@@ -299,7 +357,8 @@ end
 -- (which can't be re-classed here).
 local function materializeFile(
 	snap: FileSnapshot,
-	mappings: Mappings
+	mappings: Mappings,
+	fixedClass: FixedClass
 ): (Instance?, string?)
 	local mapPath, parent = bestMapping(snap, mappings)
 	if mapPath == nil or parent == nil then
@@ -308,10 +367,10 @@ local function materializeFile(
 	local relPath = if snap.path == mapPath then "" else snap.path:sub(#mapPath + 2)
 	local parts = splitPath(relPath)
 	if #parts == 0 then
-		-- `$path` pointing directly at a single file/module: the Instance at
-		-- this node *is* the script (a nested-project package folder that
-		-- became the ModuleScript, A10). Honor it in place when it's a script.
-		return materializeAtMount(parent, snap)
+		-- `$path` pointing directly at a single file: the mount Instance *is*
+		-- the script — a nested-project package folder (A10) or a plain mount
+		-- Rojo promotes. `snap.kind` gives the class.
+		return materializeAtMount(mappings, mapPath, parent, snap, classFor(snap.kind), fixedClass)
 	end
 
 	local fileName = parts[#parts]
@@ -319,12 +378,18 @@ local function materializeFile(
 
 	if promotedKind ~= nil then
 		-- `init.[ext]` promotes its parent directory into a script of
-		-- `promotedKind`. With only one component (the init file itself) the
-		-- package module maps onto the mapping Instance itself — a nested-project
-		-- mount (A10). Promote in place when it's already a script; a
-		-- service / Folder `$path` mount can't be re-classed, so it still drops.
+		-- `promotedKind`. With only one component (the init file itself) that
+		-- parent IS the mount: a nested-project package (A10) or a mount Rojo
+		-- makes the script. `promotedKind` gives the class.
 		if #parts < 2 then
-			return materializeAtMount(parent, snap)
+			return materializeAtMount(
+				mappings,
+				mapPath,
+				parent,
+				snap,
+				classFor(promotedKind),
+				fixedClass
+			)
 		end
 		local container: Instance = parent
 		for i = 1, #parts - 2 do
@@ -483,7 +548,8 @@ end
 
 function TreeBuilder.build(project: Project, snapshots: { FileSnapshot }): BuildResult
 	local mappings: Mappings = {}
-	traverseTree(project.tree, game, mappings)
+	local fixedClass: FixedClass = {}
+	traverseTree(project.tree, game, mappings, fixedClass)
 	local fileToInstance: { [string]: Instance } = {}
 	local divergent: { Divergent } = {}
 	-- Sort init files before non-init siblings within each parent dir, and
@@ -508,7 +574,7 @@ function TreeBuilder.build(project: Project, snapshots: { FileSnapshot }): Build
 		return a.path < b.path
 	end)
 	for _, snap in ipairs(sorted) do
-		local created, priorSource = materializeFile(snap, mappings)
+		local created, priorSource = materializeFile(snap, mappings, fixedClass)
 		if created ~= nil then
 			fileToInstance[snap.path] = created
 			if priorSource ~= nil then
@@ -523,6 +589,7 @@ function TreeBuilder.build(project: Project, snapshots: { FileSnapshot }): Build
 	return {
 		fileToInstance = fileToInstance,
 		mappings = mappings,
+		fixedClass = fixedClass,
 		divergent = divergent,
 	}
 end
@@ -582,7 +649,8 @@ end
 local function traverseTreeDryRun(
     node: ProjectTreeNode,
     parent: Instance?,
-    mappings: Mappings
+    mappings: Mappings,
+    fixedClass: FixedClass
 )
     if parent == nil then
         return
@@ -590,6 +658,7 @@ local function traverseTreeDryRun(
     local path = node["$path"]
     if path ~= nil then
         mappings[path] = parent
+        fixedClass[path] = node["$className"] ~= nil
     end
     for key, child in pairs(node :: any) do
         if typeof(key) ~= "string" then
@@ -610,7 +679,7 @@ local function traverseTreeDryRun(
         else
             childInst = parent:FindFirstChild(key :: string)
         end
-        traverseTreeDryRun(childNode, childInst, mappings)
+        traverseTreeDryRun(childNode, childInst, mappings, fixedClass)
     end
 end
 
@@ -631,9 +700,12 @@ export type DiscoveredScript = {
     instance: Instance,
 }
 
-function TreeBuilder.discover(project: Project): { mappings: Mappings, scripts: { DiscoveredScript } }
+function TreeBuilder.discover(
+    project: Project
+): { mappings: Mappings, fixedClass: FixedClass, scripts: { DiscoveredScript } }
     local mappings: Mappings = {}
-    traverseTreeDryRun(project.tree, game, mappings)
+    local fixedClass: FixedClass = {}
+    traverseTreeDryRun(project.tree, game, mappings, fixedClass)
     local scripts: { DiscoveredScript } = {}
     -- Yield every YIELD_EVERY descendants so a place with thousands of
     -- instances doesn't block the main thread for several seconds.
@@ -668,7 +740,7 @@ function TreeBuilder.discover(project: Project): { mappings: Mappings, scripts: 
             })
         end
     end
-    return { mappings = mappings, scripts = scripts }
+    return { mappings = mappings, fixedClass = fixedClass, scripts = scripts }
 end
 
 -- Returns the `Instance.Name` a script should have after being renamed to
