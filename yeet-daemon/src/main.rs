@@ -83,22 +83,32 @@ const BROADCAST_CAPACITY: usize = 4096;
 /// stack N × 256 MiB allocations before any rate-limit or content-size
 /// check kicks in. With the lower cap and the connection cap below,
 /// peak attacker-controlled buffering is bounded at
-/// `WS_MAX_FRAME_BYTES × MAX_CONCURRENT_CONNECTIONS = 64 MiB`.
+/// `WS_MAX_FRAME_BYTES × MAX_CONCURRENT_CONNECTIONS = 128 MiB`.
 /// If a future protocol change ships content > 10 MiB, raise this in
 /// lockstep — but think hard about chunking on the wire instead of
 /// bumping the cap.
 const WS_MAX_FRAME_BYTES: usize = 16 * 1024 * 1024;
 const WS_MAX_MESSAGE_BYTES: usize = 16 * 1024 * 1024;
 /// Maximum number of concurrent WebSocket connections the daemon serves
-/// at once. Real usage is `1 plugin + 1 extension = 2`; the cap is set
-/// to `4` to leave headroom for a brief reconnect overlap (old socket
-/// still draining while new one finishes handshake) without rejecting
-/// legitimate traffic. Excess connections are accepted at the TCP layer
-/// then immediately dropped before the WS upgrade — preserves the
-/// "anyone can probe" property without letting a flood saturate memory
-/// or CPU. Pairs with `WS_MAX_FRAME_BYTES` to bound peak attacker memory
-/// (worst case: 4 × 16 MiB = 64 MiB).
-const MAX_CONCURRENT_CONNECTIONS: usize = 4;
+/// at once. Steady-state usage is still `1 plugin + 1 extension = 2`, but
+/// discovery adds short-lived probes on top: every Studio place that opens
+/// the Yeet panel scans the whole port window, so this daemon sees one
+/// extra connection per scanning place for a few milliseconds each.
+///
+/// At the old cap of 4, three places scanning while one of them held a
+/// live session (1 session + 3 probes) sat exactly on the limit, and the
+/// next probe was dropped before the WS upgrade — silently, from the
+/// prober's point of view. The symptom would have been a daemon randomly
+/// missing from someone's picker with nothing in any log to explain it,
+/// which is precisely the failure mode discovery exists to remove.
+///
+/// Excess connections are still accepted at the TCP layer then dropped
+/// before the upgrade, preserving the "anyone can probe" property without
+/// letting a flood saturate memory or CPU. Pairs with
+/// `WS_MAX_FRAME_BYTES` to bound peak attacker memory: worst case is now
+/// 8 × 16 MiB = 128 MiB, still bounded, and probe connections are torn
+/// down in milliseconds.
+const MAX_CONCURRENT_CONNECTIONS: usize = 8;
 /// Threshold above which `write_frame` logs the outbound payload size at
 /// `warn!`. Sized so steady-state `FileChanged` frames (~10s of KB) stay at
 /// `trace!` and only handshake / bulk-sync payloads draw attention — the
