@@ -13,6 +13,8 @@
 
 local Roact = require(script.Parent.Parent.Packages.Roact)
 local Reconnect = require(script.Parent.Parent.net.Reconnect)
+local Discovery = require(script.Parent.Parent.net.Discovery)
+local ProjectPicker = require(script.Parent.ProjectPicker)
 local Applier = require(script.Parent.Parent.sync.Applier)
 local SourceWatcher = require(script.Parent.Parent.sync.SourceWatcher)
 local ConflictResolver = require(script.Parent.ConflictResolver)
@@ -174,6 +176,22 @@ type SourceWatcherHandle = {
 }
 
 type LogEntry = { time: string, text: string }
+
+-- Locally redeclared (types don't reliably cross `require` in strict mode).
+type DaemonEntry = {
+  daemonId: string,
+  projectName: string,
+  projectRoot: string,
+  port: number,
+  daemonVersion: string,
+  pluginConnected: boolean,
+  url: string,
+}
+
+type DiscoveryHandle = {
+  cancel: (self: DiscoveryHandle) -> (),
+}
+
 type ViewProps = {
   connected: boolean,
   -- True between the moment the user clicks Connect (or a server-side
@@ -192,6 +210,21 @@ type ViewProps = {
   -- doesn't render the row in tests/dev contexts where no settings
   -- dock has been registered.
   onOpenSettings: (() -> ())?,
+  -- ── Project picker ──────────────────────────────────────────────────
+  -- Daemons found by the last discovery scan, sorted by port.
+  daemons: { DaemonEntry },
+  -- Which row is highlighted. Nil (or "") means the manual Daemon URL row,
+  -- when one is shown.
+  selectedDaemonId: string?,
+  scanning: boolean,
+  -- Set when every probe failed the HttpEnabled pre-flight — a different
+  -- problem from "nothing running", with a different fix.
+  httpDisabled: boolean,
+  -- The user's Daemon URL override from Settings, when it is not the default.
+  manualUrl: string?,
+  onSelectDaemon: (daemonId: string) -> (),
+  onSelectManual: (() -> ())?,
+  onRefreshDaemons: () -> (),
 }
 
 local DAEMON_URL = "ws://127.0.0.1:34872"
@@ -219,6 +252,31 @@ local LEGACY_AUTH_TOKEN_SETTING = "yeet.authToken"
 -- persistence bug above.
 local function authTokenKey(daemonId: string): string
 	return "yeet_auth_" .. daemonId
+end
+
+-- Per-place key remembering which daemon this place last connected to.
+--
+-- This is the ONLY place Yeet reads a Roblox identity value, and it is used
+-- purely as an opaque namespacing integer: never sent to the daemon, never
+-- logged, never part of any authorization decision.
+--
+-- It has to be per-place because `plugin:SetSetting` is scoped to the user's
+-- Studio profile, not the place file. A single shared key would have two open
+-- places overwrite each other's choice on every connect — the same class of bug
+-- as the global auth token above.
+--
+-- `PlaceId` is 0 for a place that has never been saved; those share one bucket
+-- rather than not remembering at all, since an unsaved place still benefits
+-- from its choice surviving a plugin reload.
+local function lastDaemonKey(): string
+	local placeId = 0
+	pcall(function()
+		placeId = game.PlaceId
+	end)
+	if placeId == 0 then
+		return "yeet_lastDaemon_unsaved"
+	end
+	return "yeet_lastDaemon_" .. tostring(placeId)
 end
 
 -- Drops the pre-multi-place global token once, on plugin load.
@@ -365,7 +423,7 @@ local function WidgetView(props: ViewProps)
     connectButton = Roact.createElement("TextButton", {
       Size = CONNECTING_BUTTON_HEIGHT,
       AutomaticSize = Enum.AutomaticSize.None,
-      LayoutOrder = 3,
+      LayoutOrder = 4,
       BackgroundColor3 = theme.colors.accentWarning,
       BorderSizePixel = 0,
       AutoButtonColor = true,
@@ -423,7 +481,7 @@ local function WidgetView(props: ViewProps)
       variant = if props.connected then "danger" else "primary",
       size = BUTTON_HEIGHT,
       onClick = props.onToggle,
-      layoutOrder = 3,
+      layoutOrder = 4,
     })
   end
 
@@ -439,7 +497,7 @@ local function WidgetView(props: ViewProps)
       variant = if props.paused then "accept" else "ghost",
       size = BUTTON_HEIGHT,
       onClick = props.onPauseToggle,
-      layoutOrder = 4,
+      layoutOrder = 5,
     })
     else nil
 
@@ -447,7 +505,7 @@ local function WidgetView(props: ViewProps)
   -- since users may want to tweak daemon URL / auto-connect BEFORE
   -- connecting). Uses ghost variant so it stays visually
   -- secondary to the primary Connect / Disconnect call-to-action.
-  -- Lives at layoutOrder=5 so it sits below pauseButton when
+  -- Lives at layoutOrder=6 so it sits below pauseButton when
   -- present and below connectButton when not.
   local settingsButton = if props.onOpenSettings ~= nil
     then Roact.createElement(Button, {
@@ -455,7 +513,7 @@ local function WidgetView(props: ViewProps)
       variant = "ghost",
       size = BUTTON_HEIGHT,
       onClick = props.onOpenSettings,
-      layoutOrder = 5,
+      layoutOrder = 6,
     })
     else nil
 
@@ -470,6 +528,20 @@ local function WidgetView(props: ViewProps)
       }),
       status = statusRow,
       heading = heading,
+      -- Above Connect: choosing the target precedes acting on it, so it reads
+      -- in the order the user works.
+      picker = Roact.createElement(ProjectPicker, {
+        entries = props.daemons,
+        selectedDaemonId = props.selectedDaemonId,
+        scanning = props.scanning,
+        connected = props.connected,
+        httpDisabled = props.httpDisabled,
+        manualUrl = props.manualUrl,
+        onSelect = props.onSelectDaemon,
+        onSelectManual = props.onSelectManual,
+        onRefresh = props.onRefreshDaemons,
+        layoutOrder = 3,
+      }),
       button = connectButton,
       pauseButton = pauseButton,
       settingsButton = settingsButton,
@@ -589,6 +661,19 @@ type self = {
   -- here so the Widget's view can render an inline Settings button
   -- without taking a hard dependency on the SettingsDock module.
   onOpenSettings: (() -> ())?,
+  -- Stable id of the daemon/project this Widget is pointed at. Seeds the
+  -- per-connection id in `_onConnectPressed`; the connection's own copy is what
+  -- the auth handlers use, so a late callback from a previous daemon cannot
+  -- touch this project's token.
+  activeDaemonId: string?,
+  -- ── Project picker ──────────────────────────────────────────────────
+  daemons: { DaemonEntry },
+  selectedDaemonId: string?,
+  scanning: boolean,
+  httpDisabled: boolean,
+  activeScan: DiscoveryHandle?,
+  scanGeneration: number,
+  didInitialScan: boolean,
 }
 
 export type Widget = typeof(setmetatable({} :: self, Widget))
@@ -636,6 +721,23 @@ function Widget.new(plugin: Plugin, initialSettings: WidgetSettings?): Widget
     -- (discovery) or `project_opened`. Namespaces this project's stored auth
     -- token. Nil before the first connect through a manual Daemon URL.
     activeDaemonId = nil :: string?,
+    -- ── Project picker state ────────────────────────────────────────────
+    daemons = {} :: { DaemonEntry },
+    selectedDaemonId = nil :: string?,
+    scanning = false,
+    -- Set when every probe in a scan failed the HttpEnabled pre-flight, so the
+    -- empty state can give the right instruction instead of "no daemons found".
+    httpDisabled = false,
+    -- Live scan, so a Refresh (or a teardown) can cancel the previous one
+    -- instead of letting two scans race into the same state.
+    activeScan = nil :: DiscoveryHandle?,
+    -- Bumped per scan so a superseded scan's callbacks can identify themselves
+    -- as stale and bow out. Necessary because cancelling a scan still fires its
+    -- completion callback.
+    scanGeneration = 0,
+    -- Ensures the automatic "fill the picker on load" scan happens exactly
+    -- once, rather than on every Settings save.
+    didInitialScan = false,
     applier = nil :: ApplierHandle?,
     sourceWatcher = nil :: SourceWatcherHandle?,
     resolver = resolver :: ConflictResolverHandle,
@@ -679,6 +781,15 @@ function Widget.new(plugin: Plugin, initialSettings: WidgetSettings?): Widget
       if self.tree == nil then return end
       self:applySettings(initialSettings)
     end)
+  else
+    -- No settings to apply means no auto-connect path to run a scan for, so
+    -- populate the picker here instead. With settings present, `applySettings`
+    -- owns the first scan when auto-connect is on; when it is off the user's
+    -- first Refresh (or opening the panel) fills the list.
+    task.defer(function()
+      if self.tree == nil then return end
+      self:_startScan()
+    end)
   end
   return self
 end
@@ -710,8 +821,33 @@ function Widget.applySettings(self: Widget, s: {
     -- placeholder default `false`). Subsequent saves where the user
     -- toggled it on while disconnected also work, which is what we
     -- want — toggle on, see immediate connect.
-    self:_appendLog("auto-connect enabled — connecting now")
-    self:_onConnectPressed()
+    --
+    -- Deferred behind a scan: with one daemon per project, connecting before
+    -- discovery has run would use the Settings URL — a single fixed address —
+    -- and could attach this place to a different project than the one it was
+    -- last paired with. Waiting lets the remembered choice be restored first.
+    self:_appendLog("auto-connect enabled — looking for this place's project")
+    self:_startScanThen(function()
+      if self.connection ~= nil then
+        -- The user got there first while the scan ran.
+        return
+      end
+      if self.selectedDaemonId == nil and #self.daemons > 0 then
+        -- Daemons are running but none is the one this place remembers.
+        -- Connecting to an arbitrary one is exactly the cross-project mistake
+        -- the picker exists to prevent, so stop and let the user choose.
+        self:_appendLog("auto-connect: no remembered project among those running — pick one")
+        return
+      end
+      self:_onConnectPressed()
+    end)
+  elseif not self.didInitialScan then
+    -- Auto-connect is off, so nothing else would populate the picker. Scan once
+    -- on the first apply (plugin load) so the list is already filled when the
+    -- user opens the panel, instead of showing an empty state until they find
+    -- Refresh. Guarded so that merely saving Settings later does not kick off
+    -- another scan behind the user's back.
+    self:_startScan()
   end
   -- Settings-changed log line. Useful when the user is debugging
   -- "did my toggle take effect" — they see a confirmation in the
@@ -759,6 +895,18 @@ function Widget.forceShowSyncPreview(self: Widget)
 end
 
 function Widget.destroy(self: Widget)
+  -- Invalidate any in-flight scan before cancelling it. Cancelling still fires
+  -- the completion callback, which touches `self` and calls `_rerender` — and
+  -- by then the tree is being unmounted. Bumping the generation makes that
+  -- callback recognise itself as stale and return immediately.
+  self.scanGeneration += 1
+  local scan = self.activeScan
+  if scan ~= nil then
+    pcall(function()
+      scan:cancel()
+    end)
+    self.activeScan = nil
+  end
   self:_teardownConnection()
   if self.tree ~= nil then
     Roact.unmount(self.tree)
@@ -786,7 +934,179 @@ function Widget._renderTree(self: Widget)
       self:_onPauseToggle()
     end,
     onOpenSettings = self.onOpenSettings,
+    daemons = self.daemons,
+    selectedDaemonId = self.selectedDaemonId,
+    scanning = self.scanning,
+    httpDisabled = self.httpDisabled,
+    -- Only surfaced when the user actually overrode it; the default URL is
+    -- what the scan already covers, so pinning a row for it would be noise.
+    manualUrl = if self.settings.daemonUrl ~= DAEMON_URL and self.settings.daemonUrl ~= ""
+      then self.settings.daemonUrl
+      else nil,
+    onSelectDaemon = function(daemonId: string)
+      self:_onSelectDaemon(daemonId)
+    end,
+    onSelectManual = function()
+      self:_onSelectManual()
+    end,
+    onRefreshDaemons = function()
+      self:_startScan()
+    end,
   })
+end
+
+-- Runs a discovery scan and folds the result into the picker.
+--
+-- Cancels any scan already running: a user clicking Refresh twice, or a
+-- failure-triggered rescan landing on top of a manual one, would otherwise have
+-- two scans writing `self.daemons` in an unpredictable order.
+function Widget._startScan(self: Widget)
+  self:_startScanThen(nil)
+end
+
+-- `_startScan` with a callback that runs once the scan has completed and the
+-- remembered selection has been restored. Used by auto-connect, which must not
+-- pick a daemon before discovery has had its say.
+function Widget._startScanThen(self: Widget, afterScan: (() -> ())?)
+  self.didInitialScan = true
+
+  -- Generation counter. `Discovery.cancel` deliberately still fires
+  -- `onComplete` (so a caller never leaks a pending state), which means a
+  -- cancelled scan's callbacks arrive AFTER the replacement scan has started.
+  -- Without this guard the old scan's completion would overwrite the new
+  -- scan's results and reset `scanning`/`activeScan` out from under it —
+  -- clicking Refresh twice would leave the picker showing the first scan's
+  -- findings and stuck in a bad state.
+  self.scanGeneration += 1
+  local generation = self.scanGeneration
+
+  local previous = self.activeScan
+  if previous ~= nil then
+    pcall(function()
+      previous:cancel()
+    end)
+    self.activeScan = nil
+  end
+
+  self.scanning = true
+  self.httpDisabled = false
+  -- Cleared BEFORE the scan starts, not after: the progress callback below
+  -- appends to this list as answers arrive, so clearing it afterwards would
+  -- throw away every daemon found in the first moments of the scan.
+  self.daemons = {}
+  self:_rerender()
+
+  -- Counts probes that failed the HttpEnabled pre-flight. If EVERY port fails
+  -- that way the problem is the place's HTTP setting, not the absence of
+  -- daemons, and the empty state should say so.
+  local httpFailures = 0
+  local verbose = self.settings.verboseLogging
+
+  local handle = Discovery.scan({
+    skipHttpEnabledCheck = self.settings.skipHttpEnabledCheck,
+    log = function(message: string)
+      if message:find("HTTP requests are disabled", 1, true) ~= nil then
+        httpFailures += 1
+      end
+      -- Per-port tracing is the only way to diagnose "the picker is empty" on
+      -- a user's machine, since there is no console we can inspect — but it is
+      -- noisy, so it rides behind the existing verboseLogging setting.
+      if verbose then
+        self:_appendLog(message)
+      end
+    end,
+  }, function(entries: { DaemonEntry })
+    if generation ~= self.scanGeneration then
+      -- A newer scan superseded this one, so these results are stale. Returning
+      -- here also leaves the newer scan's `activeScan`/`scanning` untouched.
+      return
+    end
+    self.activeScan = nil
+    self.scanning = false
+    self.daemons = entries
+    self.httpDisabled = #entries == 0 and httpFailures > 0
+
+    -- Restore the remembered choice when it is still on the list. A remembered
+    -- daemon that is NOT present leaves nothing selected on purpose: silently
+    -- falling back to the first result is how a user ends up syncing the wrong
+    -- project, which is the exact failure this picker exists to prevent.
+    if self.selectedDaemonId == nil then
+      local remembered = Settings.readWrapped(self.plugin, lastDaemonKey())
+      if typeof(remembered) == "string" and remembered ~= "" then
+        for _, entry in entries do
+          if entry.daemonId == remembered then
+            self.selectedDaemonId = remembered
+            break
+          end
+        end
+      end
+    end
+
+    if #entries == 0 then
+      self:_appendLog(`no daemons found on {Discovery.windowDescription()}`)
+    else
+      self:_appendLog(`found {#entries} daemon(s)`)
+    end
+    self:_rerender()
+    if afterScan ~= nil then
+      -- Isolated: a throwing continuation must not leave `scanning` stuck on
+      -- or the picker wedged mid-state.
+      local ok, err = pcall(afterScan)
+      if not ok then
+        self:_appendLog(`!! post-scan action failed: {tostring(err)}`)
+      end
+    end
+  end, function(entry: DaemonEntry)
+    if generation ~= self.scanGeneration then
+      -- Late answer from a superseded scan — appending it would mix two scans'
+      -- findings into one list.
+      return
+    end
+    -- Incremental: show each daemon the moment it answers rather than making
+    -- the user wait for the slowest dead port in the window.
+    table.insert(self.daemons, entry)
+    self:_rerender()
+  end)
+
+  -- Cleared as soon as the scan completes; held meanwhile so it can be
+  -- cancelled.
+  self.activeScan = handle
+end
+
+-- Picks a discovered daemon. Remembered per place so the next session
+-- reconnects to the same project without asking.
+function Widget._onSelectDaemon(self: Widget, daemonId: string)
+  if self.connected then
+    -- Rows are inert while connected; this is belt and braces.
+    return
+  end
+  self.selectedDaemonId = daemonId
+  local failure = Settings.writeWrapped(self.plugin, lastDaemonKey(), daemonId)
+  if failure ~= nil then
+    self:_appendLog(`!! could not remember this project: {failure}`)
+  end
+  for _, entry in self.daemons do
+    if entry.daemonId == daemonId then
+      self:_appendLog(`selected {entry.projectName} (:{entry.port})`)
+      break
+    end
+  end
+  self:_rerender()
+end
+
+-- Picks the manual Daemon URL row, clearing the remembered daemon so the
+-- Settings override wins on the next connect.
+function Widget._onSelectManual(self: Widget)
+  if self.connected then
+    return
+  end
+  self.selectedDaemonId = nil
+  local failure = Settings.clearWrapped(self.plugin, lastDaemonKey())
+  if failure ~= nil then
+    self:_appendLog(`!! could not clear the remembered project: {failure}`)
+  end
+  self:_appendLog("using the Daemon URL from Settings")
+  self:_rerender()
 end
 
 -- Wires the Settings button's onClick. Host (init.server.luau)
@@ -1355,6 +1675,29 @@ function Widget._onConnectPressed(self: Widget)
   if typeof(url) ~= "string" or url == "" then
     url = DAEMON_URL
   end
+
+  -- A daemon picked in the project picker wins over the Settings URL. With one
+  -- daemon per project the settings value is a single fixed address, so honouring
+  -- it over an explicit pick would quietly connect the user to a different
+  -- project than the one they just clicked.
+  --
+  -- Selecting the pinned "Manual (from Settings)" row clears `selectedDaemonId`,
+  -- which falls through to the URL above — that is how the override stays
+  -- reachable.
+  local selectedId = self.selectedDaemonId
+  if selectedId ~= nil and selectedId ~= "" then
+    for _, entry in self.daemons do
+      if entry.daemonId == selectedId then
+        url = entry.url
+        -- Known before the socket opens, so the Hello can carry this project's
+        -- stored token on the very first attempt instead of re-pairing once.
+        connectionDaemonId = selectedId
+        self:_appendLog(`connecting to {entry.projectName}`)
+        break
+      end
+    end
+  end
+
   self:_appendLog("connecting to " .. url)
 
   local handle = Reconnect.run(url, {

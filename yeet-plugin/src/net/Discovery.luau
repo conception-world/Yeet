@@ -86,24 +86,50 @@ local PORT_WINDOW_SIZE = 10
 
 -- How many probes may be in flight at once.
 --
--- Roblox does not document a concurrent-WebStreamClient limit, so this is
--- deliberately conservative rather than "all ten at once". Four keeps the scan
--- to three quick rounds while staying well inside any plausible cap. If it
--- turns out Studio is happy with more, raising this is a one-line change; if a
--- cap is discovered to be lower, so is lowering it.
+-- Roblox does not document a concurrent-WebStreamClient limit, so rather than
+-- betting on a number, the scanner starts here and *measures*: a port that
+-- fails to construct a client while several are already open is treated as
+-- evidence of a cap, the batch size is halved, and that port is retried. See
+-- `retryQueue` below. Four is the starting guess; the adaptation is what makes
+-- the scanner correct regardless of whether the real cap is 2, 8, or absent.
 local PROBE_BATCH_SIZE = 4
+
+-- Floor for the adaptive batch size. At 1 the scan is fully sequential, which
+-- is slow but always works; going below would mean not scanning at all.
+local MIN_BATCH_SIZE = 1
 
 -- Upper bound on a single probe. A port with nothing listening normally fails
 -- its TCP connect almost immediately on loopback, so this budget is really for
 -- the pathological case: something IS bound but never completes the WebSocket
 -- upgrade (an unrelated app squatting a port in our window). Without a
 -- per-probe deadline such a port would stall its whole batch.
+--
+-- Whether a dead loopback port reports itself promptly is the other thing
+-- Roblox does not document. If it does, this timeout is nearly never reached
+-- and a scan settles in milliseconds; if it does not, every scan would cost the
+-- full budget per batch. `FAST_SETTLE_GRACE_SEC` below removes that worst case
+-- without assuming either answer.
 local PROBE_TIMEOUT_SEC = 1.5
 
+-- Once ANY port in a batch has settled, the rest get only this much longer.
+--
+-- All ports in a batch are dialled at the same instant over loopback, so a
+-- healthy one answering proves the round trip is fast. Anything still silent
+-- well after that is a port with nothing on it, whatever signal Studio does or
+-- does not deliver for that case. This turns "dead ports never report" from a
+-- worst case that dominates every scan into a fixed, small tax.
+local FAST_SETTLE_GRACE_SEC = 0.35
+
 -- Upper bound on the entire scan, as a backstop in case a probe neither
--- succeeds, errors, nor closes. Generous enough not to truncate a slow Studio;
--- short enough that a Refresh click still feels responsive.
-local SCAN_TIMEOUT_SEC = 6
+-- succeeds, errors, nor closes.
+--
+-- Sized for the worst path the adaptive loop can take: every port refused,
+-- forcing the batch size down to 1 and a full per-port wait each. Being
+-- generous costs nothing in the common case, where the scan settles in well
+-- under a second and this timer is simply cancelled by `finish` running first;
+-- being too tight would silently truncate a slow scan and show the user an
+-- empty picker on a machine that has daemons running.
+local SCAN_TIMEOUT_SEC = PORT_WINDOW_SIZE * PROBE_TIMEOUT_SEC + 4
 
 local function parseEntry(payload: Payload, port: number): DaemonEntry?
 	if payload.type ~= "daemon_info" then
@@ -174,7 +200,12 @@ function Discovery.scan(
 	end
 
 	-- Probes one port and resolves via `done` exactly once, whatever happens.
-	local function probe(port: number, done: () -> ())
+	--
+	-- `done(constructFailed)` reports whether the failure was Studio refusing to
+	-- create the WebSocket client at all, as opposed to the port simply having
+	-- nothing on it. The caller uses that to detect a concurrency cap and retry
+	-- the port in a smaller batch.
+	local function probe(port: number, done: (constructFailed: boolean) -> ())
 		local url = string.format("ws://127.0.0.1:%d", port)
 		local handle: ConnectionHandle? = nil
 		local finished = false
@@ -186,7 +217,7 @@ function Discovery.scan(
 		-- the lifetime of the plugin VM — ten leaked sockets per scan, and the
 		-- user's only symptom would be discovery mysteriously degrading.
 		local closePending = false
-		local function settleOne(reason: string)
+		local function settleOne(reason: string, constructFailed: boolean?)
 			if finished then
 				return
 			end
@@ -202,7 +233,7 @@ function Discovery.scan(
 			else
 				closePending = true
 			end
-			done()
+			done(constructFailed == true)
 		end
 
 		handle = Connection.connect(url, {
@@ -256,9 +287,14 @@ function Discovery.scan(
 		})
 
 		if handle == nil then
-			-- `Connection.connect` already reported why through its own
-			-- onError (most often: HTTP requests disabled for this place).
-			settleOne("connect refused locally")
+			-- `Connection.connect` returned nil: either the HttpEnabled
+			-- pre-flight refused, or `CreateWebStreamClient` itself failed.
+			-- The latter is what a concurrency cap looks like from here, so
+			-- flag it and let the caller retry this port in a smaller batch.
+			-- A genuinely disabled HttpService retries harmlessly: every port
+			-- fails the same way and the scan still ends empty, which is the
+			-- correct outcome.
+			settleOne("client could not be created", true)
 			return
 		end
 
@@ -285,30 +321,88 @@ function Discovery.scan(
 	end
 
 	task.spawn(function()
-		local offset = 0
-		while offset < PORT_WINDOW_SIZE and not cancelled and not settled do
-			local remaining = PORT_WINDOW_SIZE - offset
-			local batch = if remaining < PROBE_BATCH_SIZE then remaining else PROBE_BATCH_SIZE
-			local outstanding = batch
+		-- Ports still to try. Seeded with the whole window; a port refused
+		-- because Studio would not create another client goes back on the end
+		-- so a smaller batch can retry it.
+		local pending: { number } = {}
+		for offset = 0, PORT_WINDOW_SIZE - 1 do
+			table.insert(pending, PORT_WINDOW_BASE + offset)
+		end
+		-- Adapts downward when Studio refuses concurrent clients. Never adapts
+		-- back up within a scan: having found a ceiling, re-testing it every
+		-- round would just re-fail the same ports.
+		local batchSize = PROBE_BATCH_SIZE
+		-- Guards against an infinite retry loop when construction fails for a
+		-- reason that is NOT concurrency (HttpService disabled being the common
+		-- one). Each port earns at most one retry.
+		local retried: { [number]: boolean } = {}
+
+		while #pending > 0 and not cancelled and not settled do
+			local batch: { number } = {}
+			for _ = 1, math.min(batchSize, #pending) do
+				table.insert(batch, table.remove(pending, 1) :: number)
+			end
+
+			local outstanding = #batch
 			local batchDone = false
-			for i = 0, batch - 1 do
-				probe(PORT_WINDOW_BASE + offset + i, function()
+			local refused: { number } = {}
+			-- Set by the first probe in this batch to settle, whatever its
+			-- outcome. Loopback dials all of them at once, so one settling
+			-- proves the round trip is quick and the stragglers are dead ports.
+			local firstSettleAt: number? = nil
+
+			for _, port in batch do
+				probe(port, function(constructFailed: boolean)
+					if constructFailed and not retried[port] then
+						retried[port] = true
+						table.insert(refused, port)
+					end
+					if firstSettleAt == nil then
+						firstSettleAt = os.clock()
+					end
 					outstanding -= 1
 					if outstanding <= 0 then
 						batchDone = true
 					end
 				end)
 			end
-			-- Wait for the batch to drain. Every probe carries its own
-			-- `task.delay` deadline, so this always completes; the wall-clock
-			-- bound is a second line of defence in case a probe's callback is
-			-- somehow never reached. Measured with `os.clock` rather than by
-			-- accumulating `task.wait()` returns, which drift under load.
-			local deadline = os.clock() + PROBE_TIMEOUT_SEC + 1
-			while not batchDone and not cancelled and os.clock() < deadline do
+
+			-- Wait for the batch. Two bounds, whichever comes first: the full
+			-- per-probe budget, or a short grace period after the first probe
+			-- settled. The grace is what keeps a scan fast if it turns out
+			-- Studio never signals a dead loopback port — without it every
+			-- batch would cost the full budget.
+			local hardDeadline = os.clock() + PROBE_TIMEOUT_SEC + 1
+			while not batchDone and not cancelled and os.clock() < hardDeadline do
+				local seenAt = firstSettleAt
+				if seenAt ~= nil and os.clock() - seenAt > FAST_SETTLE_GRACE_SEC then
+					break
+				end
 				task.wait()
 			end
-			offset += batch
+
+			if #refused > 0 then
+				-- Studio would not hand out another client while this many were
+				-- open. Halve and retry the refused ports; at batchSize 1 the
+				-- refusal is not about concurrency, so stop blaming it.
+				if batchSize > MIN_BATCH_SIZE then
+					batchSize = math.max(MIN_BATCH_SIZE, batchSize // 2)
+					trace(string.format(
+						"[discovery] client creation refused; retrying %d port(s) with batch size %d",
+						#refused,
+						batchSize
+					))
+					for _, port in refused do
+						table.insert(pending, port)
+					end
+				else
+					trace(string.format(
+						"[discovery] %d port(s) refused a client even one at a time "
+							.. "(is HttpService enabled?)",
+						#refused
+					))
+				end
+			end
 		end
 		finish()
 	end)
