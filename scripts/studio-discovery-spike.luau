@@ -116,7 +116,7 @@ for offset = 0, PORT_WINDOW_SIZE - 1 do
 		local sendOk, sendErr = pcall(function()
 			socket:Send(HttpService:JSONEncode({
 				type = "hello",
-				version = "0.5.0",
+				version = "0.6.0",
 				role = "discover",
 			}))
 		end)

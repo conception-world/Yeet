@@ -38,9 +38,12 @@ features:
   - title: Works in any VS Code fork
     icon: 🧩
     details: Tested in VS Code, Cursor, and Antigravity. The extension uses only stable VS Code APIs.
+  - title: One daemon per project
+    icon: 🗂️
+    details: Sync two projects at once. Each gets its own daemon on its own port, and a picker in the Studio panel lets each place choose which project it belongs to.
   - title: Local-only by design
     icon: 🔒
-    details: WebSocket on `127.0.0.1:34872` with Origin allowlist + auth token. No telemetry, no cloud relay, no remote access.
+    details: Loopback-only WebSocket with Origin allowlist + auth token. No telemetry, no cloud relay, no remote access.
 ---
 
 ## What is Yeet?
@@ -55,7 +58,8 @@ loss.
 It's three components:
 
 - **Daemon** — a local Rust process that watches the project root
-  and arbitrates between Studio and disk.
+  and arbitrates between Studio and disk. One per project, on the
+  first free port in `127.0.0.1:34872..34881`.
 - **Plugin** — a Luau plugin that runs inside Studio and talks to
   the daemon.
 - **Extension** — a TypeScript VS Code extension that manages the
@@ -74,8 +78,13 @@ machine.
 
 In VS Code:
 
-1. **`Yeet: Start`** → daemon launches; status bar shows `Yeet: running`.
-2. Open the same place in Studio → click **Connect** in the Yeet plugin dock.
+1. **`Yeet: Start`** → daemon launches; status bar shows `Yeet: running (:34872)`.
+2. Open the same place in Studio → in the Yeet plugin dock, pick your
+   project under **Project**, then click **Connect**.
 3. Edit a script anywhere. Save. It appears on the other side within ~200 ms.
+
+Working on two projects at once? Start Yeet in both IDE windows — the
+second daemon takes the next free port — and pick the matching project
+in each place's Yeet panel.
 
 [Full installation guide →](/getting-started)

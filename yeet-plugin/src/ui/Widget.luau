@@ -227,6 +227,17 @@ type ViewProps = {
   onRefreshDaemons: () -> (),
 }
 
+-- Plugin version, in one place.
+--
+-- It is sent on every Hello (the daemon gates on it against
+-- MIN_COMPATIBLE_PLUGIN_VERSION) and shown in the dock title, so the two must
+-- never drift — a plugin that advertises one version and displays another makes
+-- "which build am I running?" unanswerable from a bug report.
+local PLUGIN_VERSION = "0.6.0"
+
+-- First port a daemon tries, and so the fallback when nothing has been picked.
+-- Not a promise of where any given daemon is: with one daemon per project they
+-- spread across the discovery window, which is what the picker is for.
 local DAEMON_URL = "ws://127.0.0.1:34872"
 local WIDGET_ID = "YeetMain"
 local LOG_LIMIT = 200
@@ -707,7 +718,7 @@ function Widget.new(plugin: Plugin, initialSettings: WidgetSettings?): Widget
 
   local info = DockWidgetPluginGuiInfo.new(Enum.InitialDockState.Right, false, false, 320, 480, 280, 360)
   local gui = plugin:CreateDockWidgetPluginGui(WIDGET_ID, info)
-  gui.Title = "Yeet v0.5.0"
+  gui.Title = "Yeet v" .. PLUGIN_VERSION
   gui.Name = WIDGET_ID
 
   local resolver = ConflictResolver.new(plugin) :: any
@@ -1723,7 +1734,7 @@ function Widget._onConnectPressed(self: Widget)
         -- in lockstep with breaking protocol changes so the daemon can
         -- refuse old plugins instead of silently misinterpreting their
         -- frames.
-        version = "0.5.0",
+        version = PLUGIN_VERSION,
         studio_snapshot = {},
         request_bootstrap_preview = true,
       }

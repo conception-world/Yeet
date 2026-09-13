@@ -73,19 +73,60 @@ In VS Code:
 
 1. Open your Roblox project folder.
 2. **`Yeet: Start`** from the command palette. The status bar shows
-   `Yeet: running` once the daemon is up.
+   `Yeet: running (:34872)` once the daemon is up — the number is the
+   port this project's daemon took.
 3. Open the same place in Studio.
 4. Click the **Yeet** toolbar button to open the plugin dock.
-5. Click **Connect**. You should see "Connected" within a second —
+5. Under **Project**, pick your project from the list. The plugin
+   scans for running daemons and shows one row per project it finds,
+   with its root path and port. With a single project open there will
+   be exactly one row.
+6. Click **Connect**. You should see "Connected" within a second —
    no manual pairing required (the extension keeps a fresh pairing
    breadcrumb at `<root>/.yeet/pairing` while the daemon runs).
-6. Edit a script in either side and save. It appears on the other
+7. Edit a script in either side and save. It appears on the other
    within ~200 ms.
+
+Studio remembers which project you picked, per place, so you only do
+step 5 once per place file.
 
 If something doesn't work, check
 [Troubleshooting](/troubleshooting) — most issues are HTTP-requests
-being off, port 34872 being held by another process, or SmartScreen
-blocking the bundled daemon's first run.
+being off, the project not appearing in the picker (the daemon isn't
+running, or it landed outside the scanned port window — see below), or
+SmartScreen blocking the bundled daemon's first run.
+
+## Working on more than one project
+
+Each project root gets its own daemon, so you can sync two projects at
+the same time:
+
+1. Open project A in one IDE window and project B in another. Run
+   **`Yeet: Start`** in each.
+2. The first daemon takes port `34872`, the second takes `34873`, and
+   so on — the daemon walks the window `34872..34881` and takes the
+   first free port. Each window's status bar shows its own port.
+3. Open both places in Studio.
+4. In each place's Yeet panel, pick that place's project from the
+   **Project** list, then **Connect**.
+
+Rows in the picker carry an **"in use"** badge when that daemon
+already has a plugin connected to it — usually another open place. Use
+it as a signal that you're about to take a connection away from that
+place, not as an error. **Refresh** re-runs the scan if you started a
+daemon after opening the panel.
+
+Two caveats:
+
+- The picker only sees daemons inside the `34872..34881` window. If
+  all ten ports are taken, a further daemon still starts and still
+  syncs, but on an OS-assigned port outside the window — it logs a
+  warning saying so, and the plugin's scan won't list it. Connect it
+  by setting the plugin's Daemon URL to the address the daemon logged.
+- Confirm you picked the right row before connecting. The root path is
+  shown precisely so two projects with the same name can be told
+  apart; pointing a place at the wrong project's daemon would sync the
+  wrong file tree into it.
 
 ## Daemon binary on macOS / Linux
 

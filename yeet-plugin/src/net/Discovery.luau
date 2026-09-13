@@ -77,6 +77,12 @@ export type Handle = {
 
 local Discovery = {}
 
+-- Mirrors `PLUGIN_VERSION` in ui/Widget.luau. Duplicated rather than shared
+-- because this module sits below the UI layer and must not depend upward on
+-- it; the value only labels the handshake, since discovery is answered before
+-- the daemon's version gate.
+local PLUGIN_VERSION = "0.6.0"
+
 -- Keep in lockstep with PORT_WINDOW_BASE / PORT_WINDOW_SIZE in
 -- yeet-daemon/src/main.rs. A daemon outside this window is unreachable by the
 -- picker (it is still reachable by setting the Daemon URL by hand, and the
@@ -251,8 +257,9 @@ function Discovery.scan(
 					type = "hello",
 					-- The daemon answers discovery before its version gate, so
 					-- this value never gates the reply; it is sent because
-					-- `Hello.version` is a required field.
-					version = "0.5.0",
+					-- `Hello.version` is a required field. Kept accurate anyway
+					-- so the daemon's handshake log names the real build.
+					version = PLUGIN_VERSION,
 					role = "discover",
 				})
 			end,

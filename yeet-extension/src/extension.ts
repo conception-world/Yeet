@@ -24,7 +24,7 @@ const KILL_GRACE_MS = 2000;
 // warning naming both versions; sync continues to operate (semver
 // minor compat usually holds), but the user knows what to fix when
 // behavior gets weird.
-const EXPECTED_DAEMON_VERSION = "0.5.0";
+const EXPECTED_DAEMON_VERSION = "0.6.0";
 // How long to wait for the daemon's `yeet-port:` line before giving up and
 // assuming it landed on the window's base port. The daemon prints it the
 // instant it binds, so reaching this timeout means something is wrong (the
@@ -228,7 +228,7 @@ function stopAutoPairing(): void {
 // the user can retry from Studio. In normal operation
 // (auto-pair running since `Yeet: Start`) the user never needs this.
 async function pairStudio(): Promise<void> {
-	const projectRoot = resolveProjectRoot();
+	const projectRoot = await resolveProjectRoot();
 	if (projectRoot === undefined) {
 		return;
 	}
@@ -387,7 +387,7 @@ async function startDaemonInner(): Promise<void> {
 	// Resolved up front: with per-project daemons, every decision below —
 	// whether one is already running, which one to reuse — is scoped to this
 	// project root rather than to a single well-known port.
-	const earlyProjectRoot = resolveProjectRoot();
+	const earlyProjectRoot = await resolveProjectRoot();
 	if (earlyProjectRoot === undefined) {
 		setStatus("stopped");
 		return;
@@ -484,10 +484,9 @@ async function startDaemonInner(): Promise<void> {
 		return;
 	}
 
-	const projectRoot = resolveProjectRoot();
-	if (projectRoot === undefined) {
-		return;
-	}
+	// Already resolved at the top of this function. Re-resolving would re-prompt
+	// a multi-root user who just answered the QuickPick.
+	const projectRoot = earlyProjectRoot;
 
 	const debugEcho = cfg.get<boolean>("debugEcho") ?? false;
 	const generateSourcemap = cfg.get<boolean>("generateSourcemap") ?? true;
@@ -891,7 +890,20 @@ async function killDaemon(timeoutMs: number): Promise<void> {
 	daemon = undefined;
 }
 
-function resolveProjectRoot(): string | undefined {
+/// Remembers which workspace folder the user chose, so a multi-root workspace
+/// only asks once. Scoped to the workspace rather than globally: the answer is
+/// about this window's folder set, not about the machine.
+const PICKED_ROOT_KEY = "yeet.pickedProjectRoot";
+
+/// Every workspace folder that looks like a Yeet/Rojo project.
+function candidateProjectRoots(): string[] {
+	const folders = vscode.workspace.workspaceFolders ?? [];
+	return folders
+		.map((folder) => folder.uri.fsPath)
+		.filter((candidate) => fs.existsSync(path.join(candidate, "default.project.json")));
+}
+
+async function resolveProjectRoot(): Promise<string | undefined> {
 	const folders = vscode.workspace.workspaceFolders;
 	if (!folders || folders.length === 0) {
 		void vscode.window.showErrorMessage(
@@ -899,23 +911,48 @@ function resolveProjectRoot(): string | undefined {
 		);
 		return undefined;
 	}
-	// Phase 1 only supports a single project root. If the workspace has several,
-	// we pick the first that contains default.project.json and log the choice.
-	for (const folder of folders) {
-		const candidate = folder.uri.fsPath;
-		if (fs.existsSync(path.join(candidate, "default.project.json"))) {
-			if (folders.length > 1) {
-				output?.appendLine(
-					`[yeet] multiple workspace folders open; using ${candidate}`,
-				);
-			}
-			return candidate;
-		}
+
+	const candidates = candidateProjectRoots();
+	if (candidates.length === 0) {
+		void vscode.window.showErrorMessage(
+			"No workspace folder contains default.project.json. Yeet uses Rojo's project file to decide what to sync.",
+		);
+		return undefined;
 	}
-	void vscode.window.showErrorMessage(
-		"No workspace folder contains default.project.json. Yeet uses Rojo's project file to decide what to sync.",
+	if (candidates.length === 1) {
+		return candidates[0];
+	}
+
+	// Several candidates. This used to silently take the first one and only
+	// mention it in the output channel — so a user with two projects open could
+	// sync the wrong one and have no visible reason why. Ask instead, once, and
+	// remember the answer.
+	const remembered = extensionContext?.workspaceState.get<string>(PICKED_ROOT_KEY);
+	if (remembered !== undefined && candidates.includes(remembered)) {
+		return remembered;
+	}
+
+	const picked = await vscode.window.showQuickPick(
+		candidates.map((candidate) => ({
+			label: path.basename(candidate),
+			description: candidate,
+		})),
+		{
+			title: "Yeet: which project should this window sync?",
+			placeHolder: "This workspace has more than one Rojo project",
+			ignoreFocusOut: true,
+		},
 	);
-	return undefined;
+	if (picked === undefined) {
+		// Cancelled. Do not fall back to a guess — starting sync on a project
+		// the user declined to confirm is the exact mistake this prompt exists
+		// to avoid.
+		output?.appendLine("[yeet] project selection cancelled; not starting");
+		return undefined;
+	}
+	await extensionContext?.workspaceState.update(PICKED_ROOT_KEY, picked.description);
+	output?.appendLine(`[yeet] project root set to ${picked.description}`);
+	return picked.description;
 }
 
 function waitForExit(child: ChildProcess, timeoutMs: number): Promise<boolean> {

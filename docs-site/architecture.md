@@ -16,7 +16,8 @@ useful when debugging weird states or contributing.
 │  └─────┬──────┘  │                       │  └─────┬──────┘  │
 └────────┼─────────┘                       └────────┼─────────┘
          │ WebSocket                                │ WebSocket
-         │ ws://127.0.0.1:34872                     │ ws://127.0.0.1:34872
+         │ ws://127.0.0.1:PORT                      │ ws://127.0.0.1:PORT
+         │ (first free in 34872..34881)             │
          │                                          │
          │           ┌──────────────────┐           │
          └──────────►│      Daemon      │◄──────────┘
@@ -34,9 +35,14 @@ Built on `tokio` + `tungstenite` + `notify`. Responsibilities:
 
 - Watches the project's `default.project.json` `$path` mappings and
   builds an in-memory tree of disk files.
-- Accepts WebSocket connections on `127.0.0.1:34872`. Origin
+- Accepts WebSocket connections on loopback, on the first free port
+  in the window `34872..34881` (see
+  [One daemon per project](#one-daemon-per-project)). Origin
   allowlist + auth token gate the upgrade — browsers and remote
   clients are rejected before any frame is read.
+- Registers itself in `~/.yeet/daemons.json` at startup and removes
+  its row on clean shutdown.
+- Answers discovery probes so the Studio plugin can find it.
 - Routes frames between the plugin and the extension.
 - Emits sync deltas (file changed, file added, file removed) to
   whoever asks.
@@ -57,6 +63,9 @@ Strict Luau (`--!strict`), uses Roact for the dock UI. Responsibilities:
   and forwards edits to the daemon.
 - Receives daemon-pushed edits and applies them to the matching
   script in Studio (preserving undo history).
+- Scans the port window for running daemons and renders the result
+  as the **Project** picker (see
+  [One daemon per project](#one-daemon-per-project)).
 - Renders the dock UI: connection status, Activity log, BulkSync
   preview, ConflictResolver 3-pane merge.
 - Persists user-facing settings via `plugin:SetSetting` (with a
@@ -69,7 +78,12 @@ Lives in [`yeet-extension/`](https://github.com/conception-world/Yeet/tree/main/
 Strict TypeScript, esbuild bundle, no runtime deps beyond `ws`.
 Responsibilities:
 
-- Spawns and supervises the daemon process via `child_process.spawn`.
+- Spawns and supervises the daemon process via `child_process.spawn`,
+  and learns the port it bound from the daemon's `yeet-port: <n>`
+  stdout line (printed next to the existing `yeet-auth-token: <hex>`).
+- Reads `~/.yeet/daemons.json` before spawning: if a live daemon is
+  already serving this project root, it attaches to that one instead
+  of starting a duplicate.
 - Bundles the daemon binary at `bin/win-x64/yeet-daemon.exe` so the
   user doesn't have a separate install step on Windows.
 - Handles `open_project_request` frames from the daemon (with a
@@ -94,7 +108,8 @@ Key frames:
 
 | Frame | Direction | Purpose |
 |---|---|---|
-| `Hello { version, role }` | client → daemon | First frame. Role distinguishes plugin from extension. |
+| `Hello { version, role }` | client → daemon | First frame. Role distinguishes plugin from extension. `role: "discover"` makes it a discovery probe. |
+| `DaemonInfo { daemon_id, project_name, project_root, port, daemon_version, plugin_connected }` | daemon → plugin | Reply to a discovery probe. The daemon closes the socket right after. |
 | `Welcome { daemon_version, project_root }` | daemon → plugin | Confirms handshake, names the project the daemon is serving. |
 | `FileSnapshot[]` | plugin → daemon | Initial DataModel state on plugin Hello. |
 | `FileChanged { path, source }` | bidirectional | Mirrored edit. |
@@ -103,6 +118,76 @@ Key frames:
 
 Frame size is capped at 16 MiB to bound buffering under attacker
 flood scenarios.
+
+## One daemon per project
+
+There is one daemon per project root, not one daemon per machine.
+
+### The port window
+
+The daemon binds loopback on the **first free port in `34872..34881`**.
+The first project you open still lands on `34872`, so nothing changes
+if you only ever work on one project; a second project lands on
+`34873`, and so on. If every port in the window is taken, the daemon
+falls back to an OS-assigned ephemeral port — it still starts and
+still syncs, but it logs a warning that the Studio plugin's scan will
+not find it, since the scan only covers the window.
+
+To see which port a daemon took: the IDE status bar reads
+`Yeet: running (:34873)`, and the daemon logs the address it bound at
+startup.
+
+### The registry (`~/.yeet/daemons.json`)
+
+Each daemon writes a row there at startup — `daemon_id`, `pid`,
+`port`, `project_root`, `project_name`, `daemon_version`,
+`started_at` — and removes it on clean shutdown.
+
+The **extension** reads it to answer one question: "is a daemon
+already serving this project root?" If so, it attaches to that daemon
+instead of spawning a duplicate. Rows left behind by a crash are
+pruned by probing the port; the recorded `pid` is for humans reading
+the file and is never used as a liveness check.
+
+The registry is advisory. If it is missing, unreadable, or corrupt,
+nothing breaks — the extension just spawns its own daemon.
+
+### Discovery, and the project picker
+
+The plugin cannot read the registry: inside Studio there is no
+filesystem access and no HTTP client, only
+`HttpService:CreateWebStreamClient`. So it finds daemons the only way
+it can — it opens a short-lived WebSocket to each port in the window,
+sends `Hello { role: "discover" }`, and each daemon that answers
+replies with a `DaemonInfo` frame and closes the connection.
+
+The daemon answers a discovery probe **before its version gate and
+before its auth gate**, takes only a read lock, and never rotates the
+session id. That matters: scanning must not disturb a plugin already
+connected to one of the scanned daemons, and must not consume anyone's
+one-shot pairing breadcrumb. Answering before the version gate also
+means a plugin that is too old or too new for a given daemon can still
+*see* it and say so, instead of silently missing it.
+
+The Yeet dock renders the results as a **Project** list: one row per
+daemon found, showing the project name, its root path and its port,
+plus a Refresh button. You click the project this place belongs to,
+and the choice is remembered per place. A row carries an **"in use"**
+badge when that daemon already has a plugin session — it is another
+open place talking to it, and connecting there would take the
+connection away from it.
+
+The plugin stores its auth token **per project**, keyed by
+`daemon_id`. A single global key used to make two daemons clear each
+other's token in a reject/re-pair loop.
+
+### Working on two projects at once
+
+Open project A in one IDE window and project B in another, and run
+`Yeet: Start` in each; you get two daemons on two ports. Open both
+places in Studio, and in each place's Yeet panel pick the project that
+place belongs to. Each place then syncs only against its own project's
+daemon.
 
 ## Conflict resolution
 
@@ -122,8 +207,8 @@ happens, and the cost of asking the user explicitly is bounded
 
 ## Security model
 
-Yeet's network surface is a single TCP listener on
-`127.0.0.1:34872`. To prevent abuse:
+Yeet's network surface is a single loopback TCP listener per daemon,
+on a port in the `34872..34881` window. To prevent abuse:
 
 - **Loopback bind only**: external clients can't reach the daemon
   at all.
@@ -137,6 +222,21 @@ Yeet's network surface is a single TCP listener on
 - **Concurrent connection cap**: 4 simultaneous connections max,
   bounding peak memory under DoS.
 - **Frame-size cap**: 16 MiB, to prevent unbounded buffering.
+
+The **discovery endpoint is unauthenticated by design** — the plugin
+has to be able to ask "who is there?" before it can know which
+project's token to present, and running the probe through the auth
+gate would burn the one-shot pairing breadcrumb of projects the user
+never meant to connect to. It is therefore readable by any local
+process that can open a loopback socket, so it returns only
+non-sensitive identity: `daemon_id`, `project_name`, `project_root`,
+`port`, `daemon_version`, `plugin_connected`. Never the auth token,
+never file contents, never a session id. `project_root` is the one
+arguably sensitive field, and it is already disclosed to any
+unauthenticated plugin via `ProjectOpened.project_root` — the picker
+needs it to tell apart two projects that share a name. Everything
+past the probe still goes through the Origin allowlist and the auth
+token.
 
 The `open_project_request` flow has an additional defence: the
 extension always shows a modal naming the path and requires
@@ -162,6 +262,10 @@ but the daemon earns its keep:
 - **Multiple plugins can connect to one daemon.** Studio + a
   hypothetical second IDE talking to the same project tree just
   works.
+- **And multiple daemons can coexist.** One per project root, each on
+  its own port, each discoverable — so two projects open side by side
+  don't fight over a single process or a single port. A per-machine
+  singleton could do neither.
 
 ## Source code
 
