@@ -1,12 +1,17 @@
 import { type ChildProcess, spawn } from "node:child_process";
 import * as fs from "node:fs";
-import * as net from "node:net";
 import * as path from "node:path";
 import * as vscode from "vscode";
 import { createProject } from "./create";
 import { openProject } from "./openProject";
+import { findLiveDaemonForRoot } from "./registry";
 import { type OutboundFrame, YeetControlChannel } from "./websocket";
 
+// First port a daemon tries, and the base of the window it walks. No longer a
+// promise of where any given daemon ends up: with one daemon per project, the
+// second project lands on 34873, the third on 34874, and so on. Kept as the
+// fallback for the rare case where a daemon never reported its port, and as the
+// value to name in diagnostics about the window itself.
 const DAEMON_PORT = 34872;
 const KILL_GRACE_MS = 2000;
 // Daemon version this extension build was tested against. Bumped in
@@ -20,12 +25,12 @@ const KILL_GRACE_MS = 2000;
 // minor compat usually holds), but the user knows what to fix when
 // behavior gets weird.
 const EXPECTED_DAEMON_VERSION = "0.5.0";
-// How long the pre-spawn TCP probe waits for `connect` to settle
-// before declaring the port unbound. Short enough that startDaemon
-// stays responsive; long enough to catch a daemon whose accept
-// thread is briefly busy. Loopback connects normally complete in
-// <5 ms, so 500 ms is generous.
-const DAEMON_PROBE_TIMEOUT_MS = 500;
+// How long to wait for the daemon's `yeet-port:` line before giving up and
+// assuming it landed on the window's base port. The daemon prints it the
+// instant it binds, so reaching this timeout means something is wrong (the
+// daemon died during startup, or it is an older build that predates the
+// marker) — in both cases falling back beats hanging.
+const PORT_REPORT_TIMEOUT_MS = 10_000;
 
 // Captured at activate(); needed to resolve the bundled daemon
 // binary's path under `<extensionPath>/bin/<os>-<arch>/`. Without
@@ -45,6 +50,17 @@ let channel: YeetControlChannel | undefined;
 // frame proves to the daemon we have local FS access (== legitimate
 // extension, not a browser tab via DNS rebinding).
 let daemonAuthToken: string | undefined;
+// Port the daemon actually bound, scraped from its `yeet-port:` stdout line (or
+// taken from the registry when attaching to a daemon we did not spawn). The
+// port is no longer a constant: each project's daemon takes its own slot in the
+// discovery window, so `DAEMON_PORT` is only the first candidate, not a
+// promise. Undefined until the daemon reports in.
+let daemonPort: number | undefined;
+// Resolves the moment the `yeet-port:` line is scraped, so the spawn path can
+// wait for the real port before opening the control channel. Constructing the
+// channel against a guessed port and correcting it later would mean a window
+// where the reconnect loop hammers whatever else happens to be on that port.
+let resolvePortOnce: ((port: number) => void) | undefined;
 // Auto-pair state. The extension keeps a `yeet-pairing.txt`
 // breadcrumb live for the entire duration the daemon is running so
 // the plugin can auto-pair on first connect with zero clicks. Refresh
@@ -271,9 +287,14 @@ function setStatus(state: DaemonState): void {
 			statusBar.tooltip = undefined;
 			break;
 		case "running":
-			statusBar.text = `$(zap) Yeet: running (:${DAEMON_PORT})`;
+			// Show the port this window's daemon actually bound, not the
+			// window base — with several projects open they differ, and the
+			// status bar is exactly where a user looks to tell them apart.
+			statusBar.text = `$(zap) Yeet: running (:${daemonPort ?? DAEMON_PORT})`;
 			statusBar.command = "yeet.stop";
-			statusBar.tooltip = "Click to stop the Yeet daemon";
+			statusBar.tooltip = daemon === undefined
+				? "Attached to a daemon started elsewhere. Click to detach."
+				: "Click to stop the Yeet daemon";
 			break;
 		case "crashed":
 			statusBar.text = "$(error) Yeet: crashed";
@@ -333,43 +354,20 @@ function resolveBundledDaemon(): string | undefined {
 	return undefined;
 }
 
-// Pings 127.0.0.1:DAEMON_PORT to detect a daemon already running
-// before we try to spawn another. Resolves true if the port is
-// already bound (something — possibly a previous Yeet daemon
-// orphaned by a force-quit, possibly a different VS Code window
-// running Yeet at the same time, possibly an unrelated app
-// squatting the port). Resolves false if the port is unbound.
+// `probeDaemonAlive` lived here: a bare TCP probe of 127.0.0.1:34872 used to
+// decide whether to refuse a spawn. It answered "is that one port busy?", which
+// was the right question only while every daemon shared it. It has been
+// replaced by `findLiveDaemonForRoot` (registry.ts), which answers the question
+// that now matters — "is a daemon already serving THIS project root?" — by
+// looking the root up in ~/.yeet/daemons.json and confirming over the wire with
+// a discovery handshake.
 //
-// This closes two production failure modes audited as HIGH:
-//   * H1 — two VS Code windows on different projects both trying
-//     to spawn a daemon, second one bind-fails silently and the
-//     plugin in window B ends up syncing window A's project.
-//   * H4 — user force-quits VS Code, daemon stays alive, user
-//     reopens VS Code and `Yeet: Start` spawns a phantom second
-//     daemon that bind-fails into the void.
-function probeDaemonAlive(): Promise<boolean> {
-	return new Promise((resolve) => {
-		const socket = new net.Socket();
-		// Race a connect() against a timeout. Either branch resolves
-		// the promise exactly once and tears down the socket.
-		let settled = false;
-		const finish = (alive: boolean) => {
-			if (settled) return;
-			settled = true;
-			try {
-				socket.destroy();
-			} catch {
-				// Socket already destroyed — fine.
-			}
-			resolve(alive);
-		};
-		socket.setTimeout(DAEMON_PROBE_TIMEOUT_MS);
-		socket.once("connect", () => finish(true));
-		socket.once("timeout", () => finish(false));
-		socket.once("error", () => finish(false));
-		socket.connect(DAEMON_PORT, "127.0.0.1");
-	});
-}
+// The two failure modes the old probe was added for are still covered:
+//   * H1 (two windows, two projects, second one silently syncing the first's
+//     tree) — now impossible: each project gets its own daemon on its own port,
+//     and reuse requires the roots to match.
+//   * H4 (force-quit leaves an orphan) — the registry prunes dead rows by
+//     probing their ports, and a live orphan for this root is simply reused.
 
 async function startDaemonInner(): Promise<void> {
 	// A daemon crash leaves the previous control channel's reconnect
@@ -386,42 +384,35 @@ async function startDaemonInner(): Promise<void> {
 		channel.dispose();
 		channel = undefined;
 	}
-	// Short-circuit if a daemon already answers on the expected
-	// port. Re-use it instead of trying to spawn a duplicate that
-	// would fail to bind. The control channel's connect+hello will
-	// surface auth/version/project mismatches AS errors the user
-	// can act on, instead of the silent "spawn-and-vanish" we had
-	// before (which left orphan processes on every accidental
-	// double-start).
-	if (await probeDaemonAlive()) {
-		// Either (a) a previous Yeet daemon orphaned by a force-
-		// quit, (b) another VS Code window already running Yeet,
-		// (c) an unrelated app squatting :34872. We can't tell
-		// them apart from out here, but ANY case that's not "we
-		// own this daemon" is bad and surfacing it loudly is the
-		// right move. Don't try to spawn a duplicate (the bind
-		// would silently fail and we'd be left with a phantom
-		// process); refuse with an actionable error.
-		output?.appendLine(
-			`[yeet] port 127.0.0.1:${DAEMON_PORT} already in use; refusing to spawn a second daemon`,
-		);
-		const choice = await vscode.window.showErrorMessage(
-			`Yeet: port ${DAEMON_PORT} is already in use. This usually means:\n\n`
-				+ "  1. Another VS Code window is running Yeet on this machine.\n"
-				+ "  2. A previous Yeet daemon was orphaned (force-quit) and is still running.\n"
-				+ "  3. An unrelated app is using the port.\n\n"
-				+ "Yeet supports one daemon at a time. Close other windows first, or "
-				+ "kill the orphan from your task manager.",
-			"Open Output",
-		);
-		if (choice === "Open Output") {
-			output?.show();
-		}
-		// Mark stopped so the user can retry after they handle the
-		// conflict. Do NOT auto-reuse: the running daemon may be
-		// on a different project (silently corrupting THIS project
-		// if we reattached blindly).
+	// Resolved up front: with per-project daemons, every decision below —
+	// whether one is already running, which one to reuse — is scoped to this
+	// project root rather than to a single well-known port.
+	const earlyProjectRoot = resolveProjectRoot();
+	if (earlyProjectRoot === undefined) {
 		setStatus("stopped");
+		return;
+	}
+
+	// Reuse a daemon ONLY when it is already serving THIS project root.
+	//
+	// This replaces the old "is port 34872 taken? then refuse to start"
+	// guard, which existed purely because the port was a constant. Daemons now
+	// take a port each, so a busy port says nothing about whether it is
+	// relevant to us — and refusing to start because *some other project* is
+	// syncing would defeat the entire point of multi-place.
+	//
+	// The registry narrows this to one candidate port; the discovery handshake
+	// inside `findLiveDaemonForRoot` proves that port still hosts the daemon
+	// for this exact root. If either step is inconclusive we spawn our own: an
+	// extra process is a far milder failure than silently attaching to another
+	// project's daemon and writing its tree into this workspace.
+	const existing = await findLiveDaemonForRoot(earlyProjectRoot);
+	if (existing !== undefined) {
+		output?.appendLine(
+			`[yeet] reusing the daemon already serving this project on port ${existing.port} `
+				+ `(${existing.project_name}, id ${existing.daemon_id})`,
+		);
+		attachToRunningDaemon(existing.port, earlyProjectRoot);
 		return;
 	}
 	const cfg = vscode.workspace.getConfiguration("yeet");
@@ -508,29 +499,35 @@ async function startDaemonInner(): Promise<void> {
 		args.push("--no-sourcemap");
 	}
 
-	// Re-probe immediately before spawn. The earlier probe at the top
-	// of `startDaemonInner` happened ~50-200ms ago (validation, path
-	// resolution); in that window an antivirus / cloud-sync agent /
-	// concurrent VS Code window may have bound :34872. Without this
-	// double-check, spawn races and the new daemon fails to bind
-	// (logged to stderr but the user sees only "starting...crashed").
-	if (await probeDaemonAlive()) {
-		output?.appendLine(
-			`[yeet] port ${DAEMON_PORT} bound between probe and spawn — aborting`,
-		);
-		void vscode.window.showErrorMessage(
-			`Yeet: another process bound 127.0.0.1:${DAEMON_PORT} just now. `
-				+ "Close any other Yeet instance / app using the port, then run "
-				+ "Yeet: Start again.",
-		);
-		setStatus("stopped");
-		return;
-	}
+	// There used to be a re-probe of :34872 here, aborting the spawn if anything
+	// had bound it since the first check. That guarded a daemon that could only
+	// ever take one port, where a lost race meant a silent bind failure and a
+	// phantom process.
+	//
+	// It is now actively wrong: the daemon walks a window of ports and picks the
+	// first free one, so a busy 34872 is the ordinary case the moment a second
+	// project is open. Aborting on it would make the second window refuse to
+	// start — exactly the behaviour multi-place exists to remove. A genuinely
+	// unusable window still surfaces itself, via the daemon's own fallback
+	// warning and the `yeet-port:` line reporting where it actually landed.
 
 	setStatus("starting");
 	output?.appendLine(
 		`[yeet] spawning ${daemonPath} ${args.join(" ")}`,
 	);
+
+	// Armed BEFORE the spawn so the stdout handler can never fire before the
+	// resolver exists.
+	daemonPort = undefined;
+	const portReady = new Promise<number | undefined>((resolve) => {
+		resolvePortOnce = resolve;
+		// The daemon prints `yeet-port:` immediately after binding, so this
+		// budget only matters when the daemon dies during startup or is an old
+		// build that never prints it. Falling back to the window's base port
+		// keeps such a daemon usable instead of leaving the extension stuck.
+		const timer = setTimeout(() => resolve(undefined), PORT_REPORT_TIMEOUT_MS);
+		timer.unref?.();
+	});
 
 	const child = spawn(daemonPath, args, {
 		stdio: ["ignore", "pipe", "pipe"],
@@ -635,6 +632,19 @@ async function startDaemonInner(): Promise<void> {
 					}
 				}
 			}
+			// Same channel, one more marker: the daemon reports the port it
+			// actually bound. It walks a window rather than taking a fixed
+			// port, so this is the only way to know where it landed without
+			// probing.
+			const portMatch = line.match(/^yeet-port:\s*(\d{1,5})\s*$/);
+			if (portMatch !== null) {
+				const parsed = Number(portMatch[1]);
+				if (Number.isInteger(parsed) && parsed > 0 && parsed < 65536) {
+					daemonPort = parsed;
+					output?.appendLine(`[yeet] daemon bound port ${parsed}`);
+					resolvePortOnce?.(parsed);
+				}
+			}
 			checkDaemonVersion(line);
 		}
 	});
@@ -687,11 +697,15 @@ async function startDaemonInner(): Promise<void> {
 		// If the daemon died within ~2s of spawn AND we asked it to run
 		// (not a SIGTERM from killDaemon), surface a modal with the
 		// captured stderr context. This is the actionable failure path —
-		// the daemon's own error message names the cause (Address already
-		// in use, permission denied, missing arg) and the user shouldn't
-		// have to dig through Output to find it. A healthy daemon binds
-		// :34872 within ~50–200ms; anything dying inside 2s is a startup
+		// the daemon's own error message names the cause (permission
+		// denied, a malformed project file, a missing arg) and the user
+		// shouldn't have to dig through Output to find it. A healthy daemon
+		// binds within ~50–200ms; anything dying inside 2s is a startup
 		// failure, not a runtime crash.
+		//
+		// Note this no longer blames a busy port: the daemon walks a window
+		// and only fails to bind if every port in it is taken, which it
+		// reports itself rather than dying over.
 		const elapsedMs = Date.now() - spawnedAt;
 		if (!earlyExitDiagnosed && !clean && elapsedMs < 2000) {
 			earlyExitDiagnosed = true;
@@ -700,8 +714,8 @@ async function startDaemonInner(): Promise<void> {
 				: "(no stderr captured)";
 			void vscode.window.showErrorMessage(
 				`Yeet daemon exited within ${elapsedMs}ms of starting. `
-					+ `Most often this means another process is holding `
-					+ `127.0.0.1:${DAEMON_PORT}. Daemon stderr:\n\n${tail}`,
+					+ `The daemon's own error usually names the cause. `
+					+ `Daemon stderr:\n\n${tail}`,
 				{ modal: true },
 			);
 		}
@@ -716,57 +730,95 @@ async function startDaemonInner(): Promise<void> {
 	// manual command. Stopped in `killDaemon` along with the daemon.
 	startAutoPairing(projectRoot);
 
-	// Opening the control channel eagerly is fine — the daemon might not be
-	// listening yet, but YeetControlChannel's reconnect loop will keep trying
-	// with exponential backoff until the socket comes up.
-	if (output !== undefined) {
-		const log = output;
-		// Provider fallback for the auth token: if stdout scraping
-		// missed the line (extension picked up a daemon someone else
-		// started, e.g. via `cargo run`), read the file the daemon
-		// persisted on disk. We know the project root because we
-		// just spawned the daemon at it.
-		const tokenFilePath = path.join(projectRoot, ".yeet", "auth-token");
-		const ctl = new YeetControlChannel(
-			`ws://127.0.0.1:${DAEMON_PORT}`,
-			log,
-			() => {
-				if (daemonAuthToken !== undefined) {
-					return daemonAuthToken;
+	// Wait for the daemon to report its port before opening the channel.
+	// Previously the channel was constructed immediately because the port was a
+	// constant; now a guess would point the reconnect loop at whatever else
+	// happens to be on that port. The daemon prints the marker the moment it
+	// binds, so in practice this resolves in milliseconds.
+	const reportedPort = await portReady;
+	resolvePortOnce = undefined;
+	if (reportedPort === undefined) {
+		output?.appendLine(
+			`[yeet] daemon did not report a port within ${PORT_REPORT_TIMEOUT_MS}ms; `
+				+ `assuming ${DAEMON_PORT}`,
+		);
+	}
+	openControlChannel(reportedPort ?? DAEMON_PORT, projectRoot);
+}
+
+/// Builds the control channel against `port` and wires its handlers.
+///
+/// Factored out of `startDaemonInner` because there are now two ways to end up
+/// with a daemon: spawning one, or attaching to one that is already serving
+/// this project. Both need an identical channel, and duplicating the wiring is
+/// how the two paths would drift apart.
+function openControlChannel(port: number, projectRoot: string): void {
+	if (output === undefined) {
+		return;
+	}
+	const log = output;
+	// Provider fallback for the auth token: if stdout scraping
+	// missed the line (extension picked up a daemon someone else
+	// started, e.g. via `cargo run`), read the file the daemon
+	// persisted on disk. We know the project root either because we
+	// just spawned the daemon at it, or because that is the root we
+	// matched the running daemon on.
+	const tokenFilePath = path.join(projectRoot, ".yeet", "auth-token");
+	const ctl = new YeetControlChannel(
+		`ws://127.0.0.1:${port}`,
+		log,
+		() => {
+			if (daemonAuthToken !== undefined) {
+				return daemonAuthToken;
+			}
+			try {
+				const fileToken = fs.readFileSync(tokenFilePath, "utf8").trim();
+				if (fileToken.length > 0) {
+					daemonAuthToken = fileToken;
+					return fileToken;
 				}
-				try {
-					const fileToken = fs.readFileSync(tokenFilePath, "utf8").trim();
-					if (fileToken.length > 0) {
-						daemonAuthToken = fileToken;
-						return fileToken;
-					}
-				} catch {
-					// File missing or unreadable — daemon hasn't written
-					// it yet, or we're racing startup. Caller's reconnect
-					// loop will retry; eventually the stdout scrape lands.
-				}
-				return undefined;
+			} catch {
+				// File missing or unreadable — daemon hasn't written
+				// it yet, or we're racing startup. Caller's reconnect
+				// loop will retry; eventually the stdout scrape lands.
+			}
+			return undefined;
+		},
+	);
+	ctl.on("open-project", (projectPath) => {
+		log.appendLine(`[yeet:ctl] opening ${projectPath}`);
+		openProject(projectPath, true, log).then(
+			() => {},
+			(err: unknown) => {
+				const message = err instanceof Error ? err.message : String(err);
+				log.appendLine(`[yeet:ctl] openFolder failed: ${message}`);
 			},
 		);
-		ctl.on("open-project", (projectPath) => {
-			log.appendLine(`[yeet:ctl] opening ${projectPath}`);
-			openProject(projectPath, true, log).then(
-				() => {},
-				(err: unknown) => {
-					const message = err instanceof Error ? err.message : String(err);
-					log.appendLine(`[yeet:ctl] openFolder failed: ${message}`);
-				},
-			);
-		});
-		ctl.on("pick-folder", (requestId, prompt) => {
-			void handleFolderPick(ctl, log, requestId, prompt);
-		});
-		ctl.connect().catch(() => {
-			// First attempt failed; the reconnect loop inside the channel will
-			// retry, and the "error" listener inside the channel already logs.
-		});
-		channel = ctl;
-	}
+	});
+	ctl.on("pick-folder", (requestId, prompt) => {
+		void handleFolderPick(ctl, log, requestId, prompt);
+	});
+	ctl.connect().catch(() => {
+		// First attempt failed; the reconnect loop inside the channel will
+		// retry, and the "error" listener inside the channel already logs.
+	});
+	channel = ctl;
+}
+
+/// Attaches to a daemon this extension did not spawn — one already serving this
+/// project root, confirmed over the wire by `findLiveDaemonForRoot`.
+///
+/// `daemon` stays undefined: we do not own this process and must never kill it
+/// on `Yeet: Stop`, or closing one VS Code window would tear out the daemon
+/// another window is still using. The auth token comes from the project's
+/// `.yeet/auth-token` file, since there is no stdout of ours to scrape.
+function attachToRunningDaemon(port: number, projectRoot: string): void {
+	daemonPort = port;
+	setStatus("running");
+	// Keep the pairing breadcrumb fresh for this root as well, so a Studio
+	// plugin connecting to the reused daemon still auto-pairs.
+	startAutoPairing(projectRoot);
+	openControlChannel(port, projectRoot);
 }
 
 async function handleFolderPick(
@@ -818,8 +870,16 @@ async function killDaemon(timeoutMs: number): Promise<void> {
 	// one, and we don't want the channel's provider fallback to
 	// resurrect a stale value from in-memory state.
 	daemonAuthToken = undefined;
+	// Same for the port: the next daemon may land on a different slot in the
+	// window, so a remembered value would point the next channel at the wrong
+	// place.
+	daemonPort = undefined;
 	const child = daemon;
 	if (!child) {
+		// Nothing of ours to kill. This is the normal path when we attached to
+		// a daemon another window spawned: disposing our channel above detaches
+		// us, and the daemon keeps serving whoever else is still using it.
+		// Killing it here would tear sync out from under them.
 		return;
 	}
 	child.kill("SIGTERM");
