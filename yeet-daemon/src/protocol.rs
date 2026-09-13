@@ -37,8 +37,20 @@ pub struct StudioFileSnapshot {
 #[derive(Debug, Clone, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum ClientMsg {
-    /// First frame from any client. `role` distinguishes plugin from extension;
-    /// missing/`null` defaults to `"plugin"` for backcompat with pre-E3 plugins.
+    /// First frame from any client. `role` selects the session kind; missing or
+    /// `null` defaults to `"plugin"` for backcompat with pre-E3 plugins.
+    ///
+    /// Three roles are accepted:
+    ///
+    /// * `"plugin"` — a Studio plugin. Full session: auth, bootstrap, sync.
+    /// * `"extension"` — the IDE control channel. Auth required up front.
+    /// * `"discover"` — a discovery probe. The daemon replies with a single
+    ///   `DaemonInfo` and closes. It never touches `ProjectState`, never
+    ///   rotates the session id, and never reaches the auth gate, so probing
+    ///   every port in the window cannot disturb a plugin already connected to
+    ///   one of those daemons. Only `version` and `role` are read; every other
+    ///   field is ignored.
+    ///
     /// `studio_snapshot` is only meaningful for `"plugin"` clients — for
     /// `"extension"` it should be empty (and is ignored by the daemon either way).
     /// On a cold plugin boot it's empty too; populated when the plugin reconnects
@@ -538,6 +550,57 @@ pub enum ServerMsg {
         /// still mounted on project A" scenario, which silently writes
         /// project A's files into project B's DataModel.
         project_root: String,
+        /// Stable per-project id — `registry::daemon_id_for(project_root)`.
+        ///
+        /// The plugin namespaces its stored auth token by this value, so that
+        /// connecting to a second project stops invalidating the first one's
+        /// token (a single global key made two daemons clear each other's
+        /// token in a reject/re-pair loop).
+        ///
+        /// Also sent in `DaemonInfo`, but repeated here for the plugin that
+        /// reached this daemon through an explicit `daemonUrl` instead of the
+        /// discovery scan — it would otherwise never learn its own key.
+        daemon_id: String,
+    },
+    /// Reply to a `Hello { role: "discover" }` probe. The daemon closes the
+    /// connection immediately after sending it.
+    ///
+    /// Exists because the Studio plugin cannot read `~/.yeet/daemons.json`: it
+    /// has no filesystem access and no HTTP client, only
+    /// `HttpService:CreateWebStreamClient`. So it finds daemons by opening a
+    /// short-lived WebSocket to each port in the discovery window and asking
+    /// who is there.
+    ///
+    /// Deliberately answered BEFORE the version gate and BEFORE the auth gate:
+    ///
+    /// * Before the version gate, so a plugin too old (or too new) for this
+    ///   daemon can still *discover* it and tell the user "found MyGame on
+    ///   :34872, but it needs a newer plugin" instead of silently missing it.
+    ///   Safe because this is a leaf frame — the socket dies right after, so
+    ///   there is no later protocol for a mismatched client to misread.
+    /// * Before the auth gate, because the pairing breadcrumb is one-shot: a
+    ///   probe that went through `authenticate_or_pair` would consume the
+    ///   breadcrumb of projects the user never intended to connect to, leaving
+    ///   them unpairable until the extension's next 30s refresh.
+    ///
+    /// Everything here is therefore readable by any local process that can open
+    /// a socket, so it carries only non-sensitive identity: no `auth_token`, no
+    /// `initial_files`, no `session_id`. `project_root` is the one arguably
+    /// sensitive field, and it is already disclosed to any unauthenticated
+    /// plugin via `ProjectOpened.project_root` — the picker needs it to tell
+    /// apart two projects that share a `name`.
+    DaemonInfo {
+        daemon_id: String,
+        project_name: String,
+        project_root: String,
+        /// The port this daemon is bound to. Redundant with the port the prober
+        /// dialed, but makes the frame self-describing in logs.
+        port: u16,
+        daemon_version: String,
+        /// True when a plugin already holds a live session with this daemon.
+        /// The picker renders it as "in use" so the user does not take a
+        /// connection away from another open place by accident.
+        plugin_connected: bool,
     },
     /// Daemon recognized the `session_id` the plugin sent on `Hello` and is
     /// replaying buffered events instead of bootstrapping fresh. Sent before

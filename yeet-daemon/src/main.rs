@@ -481,8 +481,23 @@ async fn main() -> Result<()> {
         }
     }
 
+    // Reported to discovery probes as `DaemonInfo.plugin_connected`.
+    let plugin_presence: PluginPresence =
+        Arc::new(std::sync::atomic::AtomicBool::new(false));
+    // The port discovery probes report back. Falls back to the configured bind
+    // port when `local_addr` failed, which only matters for the log line.
+    let discovery_port = local_addr.map_or(PORT_WINDOW_BASE, |a| a.port());
+
     let result = tokio::select! {
-        res = accept_loop(listener, state, sessions, bcast_tx, enforce_loopback_host) => res,
+        res = accept_loop(
+            listener,
+            state,
+            sessions,
+            bcast_tx,
+            enforce_loopback_host,
+            discovery_port,
+            plugin_presence,
+        ) => res,
         res = tokio::signal::ctrl_c() => {
             res.context("install ctrl+c handler")?;
             info!("shutdown: ctrl+c received");
@@ -4360,12 +4375,41 @@ impl Drop for ConnGuard {
     }
 }
 
+/// Whether a plugin currently holds a live session, surfaced to discovery
+/// probes as `DaemonInfo.plugin_connected` so the picker can render "in use"
+/// and stop a user taking a connection away from another open place.
+///
+/// An `AtomicBool` beside `ProjectState` rather than a field inside it: the
+/// flag has to be cleared on EVERY exit from `run_plugin_session`, a long
+/// function with many `?` and `bail!` paths, and the only way to get that right
+/// is a `Drop` guard. `Drop` cannot `.await`, so it cannot take the state's
+/// async `RwLock` — an atomic it can touch synchronously. The flag also needs
+/// no consistency with the rest of the state, so keeping it out is honest
+/// rather than merely convenient.
+type PluginPresence = Arc<std::sync::atomic::AtomicBool>;
+
+/// Sets the flag on construction and clears it on drop.
+struct PluginSessionGuard(PluginPresence);
+impl PluginSessionGuard {
+    fn new(flag: PluginPresence) -> Self {
+        flag.store(true, std::sync::atomic::Ordering::Release);
+        Self(flag)
+    }
+}
+impl Drop for PluginSessionGuard {
+    fn drop(&mut self) {
+        self.0.store(false, std::sync::atomic::Ordering::Release);
+    }
+}
+
 async fn accept_loop(
     listener: TcpListener,
     state: SharedState,
     sessions: Arc<Mutex<SyncbackSessions>>,
     bcast_tx: broadcast::Sender<Arc<ServerMsg>>,
     enforce_loopback_host: bool,
+    local_port: u16,
+    plugin_presence: PluginPresence,
 ) -> Result<()> {
     // Counter of currently-open WebSocket connections. Bounded by
     // `MAX_CONCURRENT_CONNECTIONS` to prevent a malicious local client
@@ -4405,6 +4449,7 @@ async fn accept_loop(
         let state = state.clone();
         let sessions = sessions.clone();
         let bcast_tx = bcast_tx.clone();
+        let plugin_presence = plugin_presence.clone();
         // Note: we deliberately do NOT subscribe to bcast_tx up-front. The
         // plugin session subscribes inside its drain lock so resume-replay
         // never overlaps with broadcast events that have already been
@@ -4413,9 +4458,17 @@ async fn accept_loop(
             // `guard` lives for the lifetime of this task; the counter
             // is decremented on every exit path via Drop.
             let _guard = guard;
-            if let Err(e) =
-                handle_connection(stream, peer, state, sessions, bcast_tx, enforce_loopback_host)
-                    .await
+            if let Err(e) = handle_connection(
+                stream,
+                peer,
+                state,
+                sessions,
+                bcast_tx,
+                enforce_loopback_host,
+                local_port,
+                plugin_presence,
+            )
+            .await
             {
                 error!(%peer, error = ?e, "connection closed with error");
             }
@@ -4504,6 +4557,7 @@ fn is_loopback_bind_addr(addr: &str) -> bool {
     host_is_loopback(split_host(addr.trim()))
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn handle_connection(
     stream: TcpStream,
     peer: SocketAddr,
@@ -4511,6 +4565,8 @@ async fn handle_connection(
     sessions: Arc<Mutex<SyncbackSessions>>,
     bcast_tx: broadcast::Sender<Arc<ServerMsg>>,
     enforce_loopback_host: bool,
+    local_port: u16,
+    plugin_presence: PluginPresence,
 ) -> Result<()> {
     // Pin the frame/message cap explicitly. `WS_MAX_FRAME_BYTES` is set
     // tighter than tungstenite's defaults to bound peak attacker-
@@ -4610,6 +4666,56 @@ async fn handle_connection(
         bootstrap_preview = request_bootstrap_preview,
         "handshake"
     );
+    // Discovery probe: answer who we are, then hang up.
+    //
+    // Placed ahead of BOTH gates below, deliberately:
+    //
+    //   * Ahead of the version gate, so a plugin outside this daemon's
+    //     supported range can still find it and tell the user *why* it cannot
+    //     connect ("found MyGame on :34872, but it needs a newer plugin")
+    //     rather than the daemon being invisible. Safe because `DaemonInfo` is
+    //     a leaf frame — the socket closes immediately after — so there is no
+    //     subsequent protocol a mismatched client could misread.
+    //
+    //   * Ahead of the auth gate, because `authenticate_or_pair` CONSUMES the
+    //     pairing breadcrumb on success. A scan that went through it would burn
+    //     the breadcrumb of every project it probed, including ones the user
+    //     never meant to connect to, leaving them unpairable until the
+    //     extension's next 30s refresh.
+    //
+    // It takes a read lock and returns; it never reaches `run_plugin_session`,
+    // so it cannot rotate the session id — which matters because rotation
+    // clears `pending_deltas`/`pending_applies` and would destroy the resume
+    // buffer of a plugin already attached to this daemon. Probing must be free
+    // of side effects or the plugin's scan would break every other open place.
+    if role_label == "discover" {
+        let (daemon_id, project_name, project_root) = {
+            let guard = state.read().await;
+            (
+                registry::daemon_id_for(&guard.root),
+                guard.project.name.clone(),
+                registry::normalize_root_for_display(&guard.root),
+            )
+        };
+        info!(%peer, client_version = %version, "discovery probe answered");
+        write_frame(
+            &mut writer,
+            &ServerMsg::DaemonInfo {
+                daemon_id,
+                project_name,
+                project_root,
+                port: local_port,
+                daemon_version: env!("CARGO_PKG_VERSION").to_owned(),
+                plugin_connected: plugin_presence.load(std::sync::atomic::Ordering::Acquire),
+            },
+        )
+        .await?;
+        // Close politely so the prober sees a clean shutdown rather than a
+        // reset it would have to distinguish from a real error.
+        let _ = writer.close().await;
+        return Ok(());
+    }
+
     // Reject too-old clients up front. The previous behaviour was to log
     // `client_version = X` and proceed regardless, which let an out-of-
     // date plugin handshake against a newer daemon and silently
@@ -4679,6 +4785,10 @@ async fn handle_connection(
     match role_label {
         "extension" => run_extension_session(state, bcast_tx, peer, writer, reader).await,
         "plugin" => {
+            // Marks this daemon as in use for the duration of the session, so a
+            // discovery probe from another Studio reports `plugin_connected`.
+            // The guard clears it on every exit path of the session below.
+            let _presence = PluginSessionGuard::new(plugin_presence);
             run_plugin_session(
                 state,
                 sessions,
@@ -4888,11 +4998,19 @@ async fn run_plugin_session(
         // so an old plugin holding the previous id can't accidentally resume
         // into a stale view. Subscribe inside the same lock so handshake-time
         // broadcasts land in the new bcast_rx (the plugin de-dups via sha).
-        let (new_session_id, rx, project_root) = {
+        let (new_session_id, rx, project_root, daemon_id) = {
             let mut guard = state.write().await;
             guard.rotate_session_id("plugin handshake (no resume)");
             let root = guard.root.display().to_string();
-            (guard.session_id.clone(), bcast_tx.subscribe(), root)
+            // Derived from the same root, but independently of the
+            // `project_root` string above: that one is left exactly as it was
+            // (verbatim prefix and all) because the plugin's M26 cross-project
+            // guard compares it against what it cached from an earlier
+            // connection, and changing its shape would spuriously trip that
+            // guard on upgrade. `daemon_id_for` normalizes internally, so the
+            // id still matches the one discovery and the registry report.
+            let id = registry::daemon_id_for(&guard.root);
+            (guard.session_id.clone(), bcast_tx.subscribe(), root, id)
         };
         let (conflicts, initial_files, project) = handshake(&state, snapshot, &bcast_tx).await?;
         if !conflicts.is_empty() {
@@ -4908,6 +5026,7 @@ async fn run_plugin_session(
                 // in at compile time — no runtime config needed.
                 daemon_version: format!("{}+{}", env!("CARGO_PKG_VERSION"), BUILD_STAMP),
                 project_root,
+                daemon_id,
             },
         )
         .await?;
@@ -6380,6 +6499,7 @@ fn server_msg_kind(msg: &ServerMsg) -> &'static str {
         ServerMsg::AuthChallenge { .. } => "auth_challenge",
         ServerMsg::AuthGranted { .. } => "auth_granted",
         ServerMsg::AuthRejected { .. } => "auth_rejected",
+        ServerMsg::DaemonInfo { .. } => "daemon_info",
     }
 }
 
