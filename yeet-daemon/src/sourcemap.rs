@@ -490,10 +490,26 @@ pub fn structure_signature(project: &Project, tree: &Tree) -> u64 {
     hasher.finish()
 }
 
+/// What a write attempt actually did. `Ok(SkippedForeign)` is a *success* —
+/// refusing to clobber someone else's map is the intended behaviour, not an
+/// error — but the caller still has to be able to tell it apart from a real
+/// write. The background writer in particular must NOT advance its
+/// `structure_signature` baseline on a skip: doing so marked the structure as
+/// "already written" and meant that deleting the foreign map never brought the
+/// map back, because every later cycle saw an unchanged signature and bailed
+/// before reaching the disk.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WriteOutcome {
+    /// The map was serialized and atomically written to disk.
+    Wrote,
+    /// `<root>/sourcemap.json` exists and is not Yeet's; nothing was written.
+    SkippedForeign,
+}
+
 /// Atomically writes a pre-built sourcemap `Value` to `<root>/sourcemap.json`.
 /// Split from `write_sourcemap` so the background writer can build the JSON
 /// under a read lock and then do the (blocking) disk write after releasing it.
-pub fn write_value(root: &Path, value: &Value) -> Result<()> {
+pub fn write_value(root: &Path, value: &Value) -> Result<WriteOutcome> {
     // Re-check ownership on every write, not just at startup: the common way to
     // end up with a foreign map is `rojo sourcemap --watch` started in a second
     // terminal *after* `Yeet: Start`, which the bootstrap check cannot see. This
@@ -502,14 +518,15 @@ pub fn write_value(root: &Path, value: &Value) -> Result<()> {
     if is_foreign(root) {
         tracing::warn!(
             "sourcemap.json is not Yeet's (no `{GENERATED_BY_KEY}: {GENERATED_BY_VALUE}` \
-             marker) — not overwriting it"
+             marker) — not overwriting it. Delete the file to let Yeet manage it again."
         );
-        return Ok(());
+        return Ok(WriteOutcome::SkippedForeign);
     }
     let mut bytes = serde_json::to_vec_pretty(value).context("serialize sourcemap")?;
     bytes.push(b'\n');
     let path = root.join("sourcemap.json");
-    atomic_write(&path, &bytes)
+    atomic_write(&path, &bytes)?;
+    Ok(WriteOutcome::Wrote)
 }
 
 /// Builds and atomically writes `<root>/sourcemap.json`. Used by the synchronous
@@ -520,7 +537,7 @@ pub fn write_sourcemap(
     project: &Project,
     tree: &Tree,
     remaps: &[PackageRemap],
-) -> Result<()> {
+) -> Result<WriteOutcome> {
     let value = build_sourcemap(project, tree, remaps);
     write_value(root, &value)
 }
@@ -1210,7 +1227,12 @@ mod tests {
         let project: Project =
             serde_json::from_str(r#"{"name":"X","tree":{"$className":"DataModel"}}"#)
                 .expect("parse project");
-        write_sourcemap(root, &project, &Tree::new(), &[]).expect("write is a no-op, not an error");
+        assert_eq!(
+            write_sourcemap(root, &project, &Tree::new(), &[])
+                .expect("write is a no-op, not an error"),
+            WriteOutcome::SkippedForeign,
+            "a refused write must report itself as skipped, not as a successful write"
+        );
         assert_eq!(
             std::fs::read_to_string(&path).expect("read back"),
             foreign,
@@ -1218,7 +1240,11 @@ mod tests {
         );
 
         std::fs::remove_file(&path).expect("clear foreign");
-        write_sourcemap(root, &project, &Tree::new(), &[]).expect("write ours");
+        assert_eq!(
+            write_sourcemap(root, &project, &Tree::new(), &[]).expect("write ours"),
+            WriteOutcome::Wrote,
+            "with nothing in the way the write must land and say so"
+        );
         assert!(
             !is_foreign(root),
             "a map we just wrote must be recognized as ours"
@@ -1229,6 +1255,60 @@ mod tests {
             is_foreign(root),
             "an unparseable file is treated as the user's — never clobber what we cannot read"
         );
+    }
+
+    /// Deleting a foreign `sourcemap.json` must let Yeet take the file over
+    /// again WITHOUT a daemon restart, and with no structural change in
+    /// between. This pins the contract `main::sourcemap_writer` relies on: it
+    /// only advances its `structure_signature` baseline on `Wrote`, so a
+    /// `SkippedForeign` leaves the baseline unset and the next wake-up retries
+    /// the very same structure.
+    ///
+    /// The old shape made this unreachable twice over — the bootstrap check
+    /// latched `sourcemap_tx` to `None` for the whole session, and the writer
+    /// advanced `last_sig` even on a refused write, so an unchanged structure
+    /// compared equal forever after.
+    #[test]
+    fn a_deleted_foreign_map_is_taken_over_without_a_structural_change() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let root = dir.path();
+        let path = root.join("sourcemap.json");
+        let project: Project = serde_json::from_str(
+            r#"{ "name": "R", "tree": { "$className": "DataModel", "ServerScriptService": { "$path": "src" } } }"#,
+        )
+        .expect("parse project");
+        let mut tree = Tree::new();
+        tree.insert("src/Foo.luau".to_owned(), entry(ScriptKind::ModuleScript));
+
+        // A map someone else maintains is in the way at boot.
+        std::fs::write(&path, r#"{"name":"theirs","className":"DataModel"}"#)
+            .expect("write foreign");
+        let sig_before = structure_signature(&project, &tree);
+        assert_eq!(
+            write_sourcemap(root, &project, &tree, &[]).expect("bootstrap write"),
+            WriteOutcome::SkippedForeign,
+        );
+
+        // The user deletes it. Nothing about the project or the tree changed,
+        // so the structure signature is identical — the only thing that may
+        // trigger a rewrite is the writer refusing to treat a skip as done.
+        std::fs::remove_file(&path).expect("user deletes the foreign map");
+        assert_eq!(
+            structure_signature(&project, &tree),
+            sig_before,
+            "precondition: this test is only meaningful with an UNCHANGED structure"
+        );
+
+        assert_eq!(
+            write_sourcemap(root, &project, &tree, &[]).expect("retry write"),
+            WriteOutcome::Wrote,
+            "once the foreign map is gone the retry must actually land"
+        );
+        assert!(!is_foreign(root), "the map is Yeet's again");
+        let parsed: Value =
+            serde_json::from_str(&std::fs::read_to_string(&path).expect("read back"))
+                .expect("valid json");
+        assert_eq!(parsed.get("name").and_then(Value::as_str), Some("R"));
     }
 
     #[test]

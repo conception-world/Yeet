@@ -110,6 +110,7 @@ export async function createProject(output: vscode.OutputChannel): Promise<void>
 
 	writeInitialSourcemap(folder, project, output);
 	writeGitignore(folder, output);
+	writeLuauLspSettings(folder, output);
 
 	if (skipped.length > 0) {
 		output.appendLine(
@@ -287,12 +288,25 @@ function writeInitialSourcemap(
 ): void {
 	const rootClass =
 		typeof project.tree.$className === "string" ? project.tree.$className : "DataModel";
+	// Mirror the daemon's `build_sourcemap` fallback: an empty/whitespace-only
+	// project name emits the literal "game" rather than an empty string, so the
+	// scaffold and the first regeneration agree on the root node's name.
+	const rootName = project.name.trim() === "" ? "game" : project.name;
+	// Key order matches the daemon's output byte-for-byte. The daemon builds the
+	// JSON with serde_json's default `Map`, which is a BTreeMap (the crate is
+	// built without the `preserve_order` feature), so every object comes out
+	// ALPHABETICALLY sorted: children, className, filePaths, generatedBy, name.
+	// `JSON.stringify` emits plain string keys in insertion order, so listing
+	// them alphabetically here is what keeps the two generators identical.
+	// Otherwise the daemon's first regeneration rewrote a structurally
+	// equivalent file purely to reorder keys, which shows up as a spurious diff
+	// and makes "did the sourcemap update?" impossible to answer by eye.
 	const sourcemap: SourcemapNode & Record<string, unknown> = {
-		name: project.name,
-		className: rootClass,
-		[GENERATED_BY_KEY]: GENERATED_BY_VALUE,
-		filePaths: [],
 		children: treeToSourcemapChildren(project.tree),
+		className: rootClass,
+		filePaths: [],
+		[GENERATED_BY_KEY]: GENERATED_BY_VALUE,
+		name: rootName,
 	};
 	const file = path.join(folder, "sourcemap.json");
 	fs.writeFileSync(file, `${JSON.stringify(sourcemap, null, 2)}\n`, "utf8");
@@ -321,14 +335,98 @@ function treeToSourcemapChildren(node: TreeNode, depth = 0): SourcemapNode[] {
 		}
 		const className =
 			typeof value.$className === "string" ? value.$className : depth === 0 ? key : "Folder";
+		// Alphabetical key order, same reason as the root node — see
+		// `writeInitialSourcemap`.
 		children.push({
-			name: key,
+			children: treeToSourcemapChildren(value, depth + 1),
 			className,
 			filePaths: [],
-			children: treeToSourcemapChildren(value, depth + 1),
+			name: key,
 		});
 	}
+	// The daemon keys each node's children in a BTreeMap, so they serialize
+	// sorted by instance name regardless of visit order. `Object.entries` here
+	// follows JS property order instead, which for a hand-edited project file is
+	// whatever the user typed. Sorting makes the two agree.
+	children.sort((a, b) => (a.name < b.name ? -1 : a.name > b.name ? 1 : 0));
 	return children;
+}
+
+/// The luau-lsp setting that decides who owns `sourcemap.json`.
+///
+/// luau-lsp defaults `sourcemap.autogenerate` to `true`, which makes it shell
+/// out to `rojo sourcemap --watch` on its own. In a Yeet project that either
+/// fails outright (no `rojo` on PATH — Yeet is not a Rojo wrapper and does not
+/// require it) or races the daemon for the same file. Since Yeet generates and
+/// maintains the map itself, the LSP's own generator has to be off.
+///
+/// Deliberately NOT touched: `luau-lsp.sourcemap.enabled`, which defaults to
+/// `true` and is the switch that makes the LSP *read* sourcemap.json at all.
+/// Turning that off would kill cross-instance type resolution entirely — the
+/// exact opposite of what this scaffold is for.
+const LUAU_LSP_AUTOGENERATE_KEY = "luau-lsp.sourcemap.autogenerate";
+
+/// Writes `.vscode/settings.json` so luau-lsp reads Yeet's sourcemap instead of
+/// trying to generate its own. Without this, a freshly scaffolded project has
+/// two writers fighting over one file and the user sees "the sourcemap doesn't
+/// work" with nothing in any log to explain why.
+///
+/// Merges rather than overwrites: an existing settings file keeps every key it
+/// already has, and an existing `autogenerate` value is left ALONE — a user who
+/// deliberately set it is not second-guessed by a scaffold. Only a missing key
+/// is added.
+///
+/// A settings file we cannot parse is left untouched and reported. VS Code
+/// accepts JSONC (comments, trailing commas) which `JSON.parse` rejects, and
+/// silently rewriting a file we failed to understand would destroy the user's
+/// configuration. Telling them the one line to add is strictly better than
+/// guessing.
+function writeLuauLspSettings(folder: string, output: vscode.OutputChannel): void {
+	const dir = path.join(folder, ".vscode");
+	const file = path.join(dir, "settings.json");
+
+	if (!fs.existsSync(file)) {
+		fs.mkdirSync(dir, { recursive: true });
+		const settings = { [LUAU_LSP_AUTOGENERATE_KEY]: false };
+		fs.writeFileSync(file, `${JSON.stringify(settings, null, 2)}\n`, "utf8");
+		output.appendLine("[yeet:create] wrote .vscode/settings.json");
+		return;
+	}
+
+	const raw = fs.readFileSync(file, "utf8");
+	let parsed: unknown;
+	try {
+		parsed = JSON.parse(raw);
+	} catch {
+		output.appendLine(
+			`[yeet:create] .vscode/settings.json is not plain JSON (comments or trailing `
+				+ `commas?) — leaving it untouched. Add "${LUAU_LSP_AUTOGENERATE_KEY}": false `
+				+ "yourself, or luau-lsp will fight the daemon over sourcemap.json.",
+		);
+		return;
+	}
+	if (typeof parsed !== "object" || parsed === null || Array.isArray(parsed)) {
+		output.appendLine(
+			"[yeet:create] .vscode/settings.json is not a JSON object — leaving it untouched.",
+		);
+		return;
+	}
+
+	const settings = parsed as Record<string, unknown>;
+	if (LUAU_LSP_AUTOGENERATE_KEY in settings) {
+		output.appendLine(
+			`[yeet:create] .vscode/settings.json already sets ${LUAU_LSP_AUTOGENERATE_KEY} `
+				+ `(${JSON.stringify(settings[LUAU_LSP_AUTOGENERATE_KEY])}) — keeping it`,
+		);
+		return;
+	}
+
+	settings[LUAU_LSP_AUTOGENERATE_KEY] = false;
+	backupExistingFile(file, output);
+	fs.writeFileSync(file, `${JSON.stringify(settings, null, 2)}\n`, "utf8");
+	output.appendLine(
+		`[yeet:create] added ${LUAU_LSP_AUTOGENERATE_KEY} to .vscode/settings.json`,
+	);
 }
 
 function writeGitignore(folder: string, output: vscode.OutputChannel): void {
