@@ -17,6 +17,7 @@ pub mod auth;
 pub mod merge;
 pub mod project;
 pub mod protocol;
+pub mod registry;
 pub mod sourcemap;
 pub mod state;
 pub mod syncback;

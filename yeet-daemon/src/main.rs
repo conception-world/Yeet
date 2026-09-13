@@ -32,6 +32,7 @@ use yeet_daemon::protocol::{
     SerializedInstance, ServerMsg, StudioFileSnapshot, SyncErrorKind, SyncbackMode,
     SyncbackTemplate, classify, is_init_filename,
 };
+use yeet_daemon::registry;
 use yeet_daemon::sourcemap;
 use yeet_daemon::state::{
     FileMeta, FsRemovedPending, PendingApply, ProjectState, SharedState, encode_for_disk,
@@ -365,6 +366,9 @@ async fn main() -> Result<()> {
         info!("auth-token written to .yeet/auth-token");
     }
     println!("yeet-auth-token: {}", state_inner.auth_token);
+    // Captured before the state moves into the Arc; used for the registry entry
+    // once the listener has a real port.
+    let project_name = state_inner.project.name.clone();
     let state: SharedState = Arc::new(RwLock::new(state_inner));
     info!(
         files = state.read().await.tree_fs.len(),
@@ -445,14 +449,57 @@ async fn main() -> Result<()> {
         println!("yeet-port: {}", addr.port());
     }
 
-    tokio::select! {
+    // Announce this daemon in `~/.yeet/daemons.json` so the extension can ask
+    // "is one already serving MY project root?" instead of the old "is port
+    // 34872 taken?", which with per-project ports no longer answers anything.
+    //
+    // Strictly best-effort. The registry is advisory (see `registry`'s module
+    // docs): the plugin finds daemons by scanning ports and never reads this
+    // file, so a home directory we cannot locate or write must not stop the
+    // daemon from serving.
+    let registry_entry = local_addr.map(|addr| {
+        registry::entry_for(
+            &args.project_root,
+            &project_name,
+            addr.port(),
+            env!("CARGO_PKG_VERSION"),
+        )
+    });
+    if let Some(entry) = &registry_entry {
+        match registry::register(entry) {
+            Ok(()) => info!(
+                daemon_id = %entry.daemon_id,
+                port = entry.port,
+                "registered in ~/.yeet/daemons.json"
+            ),
+            Err(e) => warn!(
+                error = ?e,
+                "could not write the daemon registry; the extension's duplicate-spawn \
+                 guard will fall back to spawning its own daemon (harmless, just an \
+                 extra process)"
+            ),
+        }
+    }
+
+    let result = tokio::select! {
         res = accept_loop(listener, state, sessions, bcast_tx, enforce_loopback_host) => res,
         res = tokio::signal::ctrl_c() => {
             res.context("install ctrl+c handler")?;
             info!("shutdown: ctrl+c received");
             Ok(())
         }
+    };
+
+    // Clean exit: drop our row. A SIGKILL, a panic, or a force-quit skips this
+    // entirely, which is exactly why readers prune by probing the port rather
+    // than trusting the file to be accurate.
+    if let Some(entry) = &registry_entry {
+        if let Err(e) = registry::unregister(&entry.daemon_id) {
+            warn!(error = ?e, "could not remove this daemon from the registry");
+        }
     }
+
+    result
 }
 
 fn init_tracing() {
