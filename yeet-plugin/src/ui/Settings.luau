@@ -215,6 +215,50 @@ function Settings.save(p: Plugin, s: Settings): SaveResult
 	return { ok = #errors == 0, errors = errors }
 end
 
+-- Reads a value written by `Settings.writeWrapped`, or by any older plugin
+-- version that stored it raw. Returns nil when the key is absent or unusable.
+--
+-- Exported so everything that persists a plugin setting goes through the same
+-- JSON wrapper. The auth token used to bypass this entirely — it wrote a bare
+-- string under a DOTTED key (`yeet.authToken`), which is the exact combination
+-- this module documents as not persisting on the affected Studio builds. It
+-- almost certainly never survived a reload, and nothing surfaced that because
+-- the tokenless pairing path silently covered for it.
+function Settings.readWrapped(p: Plugin, key: string): any
+	return decodeStored(p, key)
+end
+
+-- Writes `value` under `key` with the same JSON wrapper and same-tick readback
+-- verification that `Settings.save` uses. Returns nil on success, or a
+-- human-readable reason on failure.
+--
+-- Callers should surface that reason rather than discard it: a key that fails
+-- to persist degrades silently otherwise, which is precisely how the auth-token
+-- bug went unnoticed.
+function Settings.writeWrapped(p: Plugin, key: string, value: any): string?
+	local jsonOk, encoded = pcall(function()
+		return HttpService:JSONEncode({ v = value })
+	end)
+	if not jsonOk then
+		return string.format("JSON-encode failed (%s)", tostring(encoded))
+	end
+	local setOk, err = pcall(function() p:SetSetting(key, encoded) end)
+	if not setOk then
+		return string.format("SetSetting threw (%s)", tostring(err))
+	end
+	local readOk, readBack = pcall(function() return p:GetSetting(key) end)
+	if not readOk or readBack == nil then
+		return "did not persist (readback returned nil)"
+	end
+	return nil
+end
+
+-- Clears a key. Studio has no delete, so this writes an empty value through the
+-- same wrapper — `readWrapped` then yields `""`, which callers treat as absent.
+function Settings.clearWrapped(p: Plugin, key: string): string?
+	return Settings.writeWrapped(p, key, "")
+end
+
 -- Defaults factory used by the dock's "Reset to defaults" button.
 function Settings.defaults(): Settings
 	return {

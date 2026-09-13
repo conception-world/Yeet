@@ -241,6 +241,13 @@ type self = {
 	-- cached one; the Widget tears the connection down. Optional: absent in
 	-- minimal/test wirings, where the loud log line is the only signal.
 	onProjectRootMismatch: ((expected: string, got: string) -> ())?,
+	-- Fired with `ProjectOpened.daemon_id` — the daemon's stable per-project
+	-- identifier. The Widget keys this project's stored auth token on it, so a
+	-- plugin that connected through a manual Daemon URL (never having run a
+	-- discovery scan) still learns its key. Optional; absent against a daemon
+	-- too old to send the field, in which case the tokenless pairing path
+	-- continues to work exactly as before.
+	onDaemonId: ((daemonId: string) -> ())?,
 	-- Injected by the Widget: queries the SourceWatcher for a pending,
 	-- not-yet-sent Studio edit at `path`, returning (content, hash) or nil.
 	-- applyFileChanged consults it so a daemon FileChanged doesn't silently
@@ -298,6 +305,7 @@ function Applier.new(log: Log): Applier
 		onBootstrapSnapshot = nil :: BootstrapSnapshotHook?,
 		projectRoot = nil :: string?,
 		onProjectRootMismatch = nil :: ((expected: string, got: string) -> ())?,
+		onDaemonId = nil :: ((daemonId: string) -> ())?,
 		pendingEditProbe = nil :: ((path: string) -> (string?, string?))?,
 		liveConnections = {} :: { RBXScriptConnection },
 		applyingDaemonCreate = false,
@@ -319,6 +327,10 @@ function Applier.setProjectRootMismatchHook(
 	hook: ((expected: string, got: string) -> ())?
 )
 	self.onProjectRootMismatch = hook
+end
+
+function Applier.setDaemonIdHook(self: Applier, hook: ((daemonId: string) -> ())?)
+	self.onDaemonId = hook
 end
 
 function Applier.setPendingEditProbe(
@@ -723,6 +735,17 @@ local function applyProjectOpened(self: Applier, msg: any)
 	-- that differs, refuse to materialize and signal the Widget to disconnect.
 	-- The cache lives on the Applier (one per Reconnect session), so it spans
 	-- resume/re-bootstrap but resets on a fresh user-initiated connect.
+	-- The daemon's stable per-project id. Surfaced before the root guard below
+	-- so the Widget can key this project's auth token even on a connection that
+	-- is about to be refused for a root mismatch — the token belongs to the
+	-- project, not to this particular attempt.
+	local incomingDaemonId = msg.daemon_id
+	if typeof(incomingDaemonId) == "string" and incomingDaemonId ~= "" then
+		local idHook = self.onDaemonId
+		if idHook ~= nil then
+			idHook(incomingDaemonId)
+		end
+	end
 	local incomingRoot = msg.project_root
 	if typeof(incomingRoot) == "string" and incomingRoot ~= "" then
 		local cachedRoot = self.projectRoot

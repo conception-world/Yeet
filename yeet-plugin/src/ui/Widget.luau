@@ -19,6 +19,10 @@ local ConflictResolver = require(script.Parent.ConflictResolver)
 local BulkSyncPreview = require(script.Parent.BulkSyncPreview)
 local MergePicker = require(script.Parent.MergePicker)
 local theme = require(script.Parent.theme)
+-- Used for its wrapped read/write helpers: every plugin setting goes through
+-- the same JSON wrapper and same-tick readback check, so a key that fails to
+-- persist is reported instead of silently degrading.
+local Settings = require(script.Parent.Settings)
 local Card = require(script.Parent.components.Card)
 local Button = require(script.Parent.components.Button)
 local Heading = require(script.Parent.components.Heading)
@@ -193,13 +197,41 @@ type ViewProps = {
 local DAEMON_URL = "ws://127.0.0.1:34872"
 local WIDGET_ID = "YeetMain"
 local LOG_LIMIT = 200
--- Plugin setting key under which we persist the auth token from a
--- successful pairing. `plugin:SetSetting` / `GetSetting` survives
--- plugin reloads and Studio restarts (it's stored in the user's
--- Studio profile, not the place file), so the user only pairs once
--- per machine per plugin install. Wiped by `Yeet: Forget Pairing` if
--- we ever ship that command.
-local AUTH_TOKEN_SETTING = "yeet.authToken"
+
+-- The pre-multi-place auth-token key. Kept only to delete it once: see
+-- `forgetLegacyAuthToken`.
+--
+-- It was global (one token for every project) AND dotted. Both are bugs. The
+-- global part made two daemons clear each other's token in a
+-- reject -> re-pair -> reject loop, since each daemon generates its own. The
+-- dot is worse: ui/Settings.luau documents that Studio does not reliably
+-- persist setting keys containing `.`, which is why every settings key was
+-- migrated to underscores — this one was missed, so the token most likely
+-- never survived a reload at all.
+local LEGACY_AUTH_TOKEN_SETTING = "yeet.authToken"
+
+-- Per-project auth-token key. `daemonId` is the daemon's
+-- `sha256(project_root)[..16]`, reported in both `daemon_info` (discovery) and
+-- `project_opened` (so a plugin that connected via a manual Daemon URL, never
+-- having scanned, still learns its key).
+--
+-- Underscore-separated and hex-only by construction: no dots, for the Studio
+-- persistence bug above.
+local function authTokenKey(daemonId: string): string
+	return "yeet_auth_" .. daemonId
+end
+
+-- Drops the pre-multi-place global token once, on plugin load.
+--
+-- Not migrated to a per-project key, because there is no way to know which
+-- project it belonged to — and, given the dotted-key persistence bug, it very
+-- likely holds nothing anyway. The cost of dropping it is a single tokenless
+-- re-pair through the extension's breadcrumb, which the user never sees.
+local function forgetLegacyAuthToken(p: Plugin)
+	pcall(function()
+		p:SetSetting(LEGACY_AUTH_TOKEN_SETTING, nil)
+	end)
+end
 
 -- ─── Pure view ─────────────────────────────────────────────────────────────
 
@@ -585,6 +617,9 @@ type WidgetSettings = {
 -- guaranteed initialized; nothing in the host's call site can
 -- reorder around it.
 function Widget.new(plugin: Plugin, initialSettings: WidgetSettings?): Widget
+  -- One-shot cleanup of the pre-multi-place global auth token.
+  forgetLegacyAuthToken(plugin)
+
   local info = DockWidgetPluginGuiInfo.new(Enum.InitialDockState.Right, false, false, 320, 480, 280, 360)
   local gui = plugin:CreateDockWidgetPluginGui(WIDGET_ID, info)
   gui.Title = "Yeet v0.5.0"
@@ -597,6 +632,10 @@ function Widget.new(plugin: Plugin, initialSettings: WidgetSettings?): Widget
     plugin = plugin,
     gui = gui,
     connection = nil :: ConnectionHandle?,
+    -- Stable id of the daemon/project we are talking to, from `daemon_info`
+    -- (discovery) or `project_opened`. Namespaces this project's stored auth
+    -- token. Nil before the first connect through a manual Daemon URL.
+    activeDaemonId = nil :: string?,
     applier = nil :: ApplierHandle?,
     sourceWatcher = nil :: SourceWatcherHandle?,
     resolver = resolver :: ConflictResolverHandle,
@@ -1131,6 +1170,25 @@ function Widget._onConnectPressed(self: Widget)
   -- project_root than the one we first bootstrapped against (cross-project
   -- corruption guard). The Applier caches the root and fires this on a
   -- mismatch; we surface it and tear the connection down.
+  -- Identity of the daemon THIS connection is talking to.
+  --
+  -- Deliberately a local captured by the auth closures below, not a field read
+  -- from `self` when they fire. The two are not equivalent: a teardown does not
+  -- silence an Applier's already-queued callbacks, so if the user disconnects
+  -- and immediately connects to a different project, a late `auth_granted` or
+  -- `auth_rejected` from the OLD daemon would read the NEW `self.activeDaemonId`
+  -- and write — or clear — the wrong project's token. Binding the id to the
+  -- connection makes each handler act on the daemon it actually belongs to.
+  local connectionDaemonId: string? = self.activeDaemonId
+
+  applier:setDaemonIdHook(function(daemonId: string)
+    -- Learned here for a plugin that connected via a manual Daemon URL and so
+    -- never ran a discovery scan; the picker path sets it earlier.
+    connectionDaemonId = daemonId
+    if self.activeDaemonId ~= daemonId then
+      self.activeDaemonId = daemonId
+    end
+  end)
   applier:setProjectRootMismatchHook(function(expected: string, got: string)
     self:_appendLog(
       `!! daemon switched project_root ({expected} -> {got}); disconnecting to avoid cross-project corruption`
@@ -1156,13 +1214,22 @@ function Widget._onConnectPressed(self: Widget)
     if token == "" then
       return
     end
-    local ok, err = pcall(function()
-      self.plugin:SetSetting(AUTH_TOKEN_SETTING, token)
-    end)
-    if not ok then
-      self:_appendLog(`!! failed to persist auth token: {tostring(err)}`)
+    local daemonId = connectionDaemonId
+    if daemonId == nil or daemonId == "" then
+      -- No id yet means `project_opened` has not arrived on THIS connection, so
+      -- we do not know which project this token belongs to. Storing it under a
+      -- guessed key would be worse than not storing it: the next connect
+      -- re-pairs via the breadcrumb, which is invisible to the user.
+      self:_appendLog("auth token received before project id; will re-pair next time")
+      return
+    end
+    local failure = Settings.writeWrapped(self.plugin, authTokenKey(daemonId), token)
+    if failure ~= nil then
+      -- Surfaced rather than swallowed: a key that silently fails to persist is
+      -- exactly how the legacy dotted-key bug hid for so long.
+      self:_appendLog(`!! failed to persist auth token: {failure}`)
     else
-      self:_appendLog(`auth token saved`)
+      self:_appendLog("auth token saved for this project")
     end
   end)
   applier:setAuthRejectedHandler(function(payload: any)
@@ -1170,12 +1237,20 @@ function Widget._onConnectPressed(self: Widget)
     -- it regenerates the token every boot). Clear the cached token so the
     -- automatic reconnect sends none and re-pairs via a fresh breadcrumb;
     -- otherwise we would replay the same rejected token on every retry.
+    -- Clears ONLY this project's token. Clearing a shared key — as the legacy
+    -- global setting forced — meant a rejection from one daemon wiped every
+    -- other project's credential too, which is what produced the
+    -- reject -> re-pair -> reject thrash when two daemons were running.
     local reason = tostring((payload and payload.reason) or "unknown")
-    local ok, err = pcall(function()
-      self.plugin:SetSetting(AUTH_TOKEN_SETTING, "")
-    end)
-    if not ok then
-      self:_appendLog(`!! auth rejected ({reason}); failed to clear token: {tostring(err)}`)
+    -- This connection's daemon, not whatever the Widget is pointed at now — a
+    -- late rejection must never clear a different project's credential.
+    local daemonId = connectionDaemonId
+    local failure: string? = nil
+    if daemonId ~= nil and daemonId ~= "" then
+      failure = Settings.clearWrapped(self.plugin, authTokenKey(daemonId))
+    end
+    if failure ~= nil then
+      self:_appendLog(`!! auth rejected ({reason}); failed to clear token: {failure}`)
     else
       self:_appendLog(`auth rejected ({reason}); cleared stored token, will re-pair`)
     end
@@ -1328,11 +1403,19 @@ function Widget._onConnectPressed(self: Widget)
       -- was ever sent, and the daemon closed the socket on its
       -- read-Hello timeout. Symptom: Connect button does nothing,
       -- Activity log empty.
-      local pcallOk, stored = pcall(function()
-        return self.plugin:GetSetting(AUTH_TOKEN_SETTING)
-      end)
-      if pcallOk and typeof(stored) == "string" and stored ~= "" then
-        payload.auth_token = stored
+      --
+      -- The token is stored per project (keyed by the daemon's `daemon_id`),
+      -- so connecting to a second project no longer invalidates the first's
+      -- token. It is nil on a first connect through a manual Daemon URL — we
+      -- then send no token, the daemon pairs us via the extension's
+      -- breadcrumb, and `project_opened` tells us the id to store it under
+      -- next time.
+      local daemonId = connectionDaemonId
+      if daemonId ~= nil and daemonId ~= "" then
+        local stored = Settings.readWrapped(self.plugin, authTokenKey(daemonId))
+        if typeof(stored) == "string" and stored ~= "" then
+          payload.auth_token = stored
+        end
       end
       return payload
     end,
