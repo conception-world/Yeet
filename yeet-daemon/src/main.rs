@@ -42,6 +42,27 @@ use yeet_daemon::tree::{self, TreeEntry};
 use yeet_daemon::watcher::{self, FileEvent};
 
 const BIND_ADDR: &str = "127.0.0.1:34872";
+/// Base of the port window Yeet daemons prefer, and the port a single-project
+/// user still lands on — so nothing changes for them.
+///
+/// Multi-place needs one daemon per project, which means the port cannot be a
+/// constant. A pure ephemeral bind (`:0`) would work for the extension, which
+/// learns the port from the daemon's stdout, but not for the Studio plugin: it
+/// has no filesystem and no HTTP client, so it can only find daemons by opening
+/// WebSockets to candidate ports. Scanning the OS ephemeral range (~16k ports)
+/// is not viable; scanning a narrow, fixed window is. Hence a window rather
+/// than either extreme.
+///
+/// MUST stay in lockstep with `PORT_WINDOW_BASE` in the plugin's discovery
+/// scan — a daemon outside the window is invisible to the picker (it is still
+/// reachable via an explicit `daemonUrl`, and still listed in the registry for
+/// the extension).
+const PORT_WINDOW_BASE: u16 = 34872;
+/// How many consecutive ports to try before falling back to an OS-assigned
+/// ephemeral port. Ten concurrent projects is well beyond a realistic Studio
+/// session count, and bounds the plugin's scan at ten short-lived loopback
+/// connects.
+const PORT_WINDOW_SIZE: u16 = 10;
 const PROJECT_FILE: &str = "default.project.json";
 const EVENT_CHANNEL_CAPACITY: usize = 256;
 // Sized for bursty IDE operations: format-on-save across a folder, git
@@ -398,16 +419,31 @@ async fn main() -> Result<()> {
     // (only reachable via `--allow-remote`) legitimately sees remote Hosts,
     // so the check is disabled there.
     let enforce_loopback_host = is_loopback_bind_addr(bind_addr);
-    let listener = TcpListener::bind(bind_addr)
-        .await
-        .with_context(|| format!("bind {bind_addr}"))?;
+    // An explicit `--bind` keeps its exact, literal meaning: one address, one
+    // port, hard failure if it is taken. It is the documented test/debug escape
+    // hatch and things depend on `--bind 127.0.0.1:0` behaving verbatim. Only
+    // the default path walks the discovery window, and it hardcodes loopback so
+    // it can never wander onto a routable interface.
+    let listener = match args.bind.as_deref() {
+        Some(explicit) => TcpListener::bind(explicit)
+            .await
+            .with_context(|| format!("bind {explicit}"))?,
+        None => bind_in_window("127.0.0.1").await?.0,
+    };
     // Re-read the actual bound address — `127.0.0.1:0` lets the OS pick
     // an ephemeral port and tests parse it back from this log line.
-    let actual_addr = listener
-        .local_addr()
+    let local_addr = listener.local_addr().ok();
+    let actual_addr = local_addr
         .map(|a| a.to_string())
-        .unwrap_or_else(|_| bind_addr.to_owned());
+        .unwrap_or_else(|| bind_addr.to_owned());
     info!(addr = %actual_addr, "yeet-daemon listening");
+    // Machine-readable port marker, mirroring the `yeet-auth-token:` line the
+    // extension already scrapes from stdout. With the port no longer a
+    // constant, this is how the extension learns where its own daemon landed —
+    // no probing, no new channel. Printed after the bind so the number is real.
+    if let Some(addr) = local_addr {
+        println!("yeet-port: {}", addr.port());
+    }
 
     tokio::select! {
         res = accept_loop(listener, state, sessions, bcast_tx, enforce_loopback_host) => res,
@@ -423,6 +459,44 @@ fn init_tracing() {
     let filter = EnvFilter::try_from_default_env()
         .unwrap_or_else(|_| EnvFilter::new("yeet_daemon=info"));
     tracing_subscriber::fmt().with_env_filter(filter).init();
+}
+
+/// Binds the first free port in `[PORT_WINDOW_BASE, PORT_WINDOW_BASE +
+/// PORT_WINDOW_SIZE)` on `host`, so N projects can each run their own daemon.
+/// Returns the listener and whether it landed inside the window.
+///
+/// Only `AddrInUse` advances to the next candidate. Any other error (permission
+/// denied, an interface that does not exist) is fatal and propagates: retrying
+/// ten times on a genuine misconfiguration would just delay a clear message and
+/// end with a confusing "fell back to ephemeral" instead of the real cause.
+///
+/// Exhausting the window falls back to an OS-assigned ephemeral port. The daemon
+/// still starts, still serves, and still registers — it is only invisible to the
+/// plugin's window scan, which the warning says out loud.
+///
+/// The caller is responsible for keeping `host` loopback on the default path;
+/// `--bind` is handled separately so its semantics stay exactly as documented.
+async fn bind_in_window(host: &str) -> Result<(TcpListener, bool)> {
+    for offset in 0..PORT_WINDOW_SIZE {
+        let port = PORT_WINDOW_BASE + offset;
+        let addr = format!("{host}:{port}");
+        match TcpListener::bind(&addr).await {
+            Ok(listener) => return Ok((listener, true)),
+            Err(e) if e.kind() == std::io::ErrorKind::AddrInUse => continue,
+            Err(e) => return Err(e).with_context(|| format!("bind {addr}")),
+        }
+    }
+    warn!(
+        base = PORT_WINDOW_BASE,
+        size = PORT_WINDOW_SIZE,
+        "every port in the discovery window is in use; falling back to an ephemeral port. \
+         This daemon will NOT be found by the Studio plugin's scan — connect it by setting \
+         the plugin's Daemon URL to the address logged below."
+    );
+    let listener = TcpListener::bind(format!("{host}:0"))
+        .await
+        .with_context(|| format!("bind {host}:0"))?;
+    Ok((listener, false))
 }
 
 /// Refuses a non-loopback `--bind` unless `--allow-remote` was passed, and
@@ -9376,5 +9450,76 @@ mod security_tests {
     fn bind_non_loopback_allowed_with_flag() {
         assert!(validate_bind_addr(Some("0.0.0.0:34872"), true).is_ok());
         assert!(validate_bind_addr(Some("192.168.1.5:34872"), true).is_ok());
+    }
+
+    // ─── Multi-place: the daemon walks a port window ──────────────────────
+    use super::{PORT_WINDOW_BASE, PORT_WINDOW_SIZE, bind_in_window};
+    use tokio::net::TcpListener;
+
+    /// These tests bind the real, fixed window on loopback, so they contend
+    /// with each other and with any daemon running on this machine. Run them
+    /// serially — the suite is already invoked with `--test-threads=1` because
+    /// of `concurrency.rs`.
+    #[tokio::test]
+    async fn bind_in_window_takes_the_base_port_when_it_is_free() {
+        let Ok((listener, in_window)) = bind_in_window("127.0.0.1").await else {
+            // A developer machine may legitimately have the whole window busy
+            // (a real daemon per open project). Skip rather than fail — the
+            // fallback path has its own assertion below.
+            return;
+        };
+        assert!(in_window, "a free window must report an in-window bind");
+        let port = listener.local_addr().expect("local_addr").port();
+        assert!(
+            (PORT_WINDOW_BASE..PORT_WINDOW_BASE + PORT_WINDOW_SIZE).contains(&port),
+            "bound {port}, outside the window starting at {PORT_WINDOW_BASE}"
+        );
+    }
+
+    /// The whole point of the window: a second project must not fail to start
+    /// just because the first one took the canonical port.
+    #[tokio::test]
+    async fn bind_in_window_steps_past_an_occupied_port() {
+        let Ok((first, _)) = bind_in_window("127.0.0.1").await else {
+            return;
+        };
+        let first_port = first.local_addr().expect("local_addr").port();
+        let Ok((second, _)) = bind_in_window("127.0.0.1").await else {
+            return;
+        };
+        let second_port = second.local_addr().expect("local_addr").port();
+        assert_ne!(
+            first_port, second_port,
+            "a second daemon must not collide with the first"
+        );
+    }
+
+    /// With every port in the window held, the daemon still starts — it just
+    /// lands outside the window and says so. Losing the plugin's scan is a
+    /// much milder failure than refusing to run.
+    #[tokio::test]
+    async fn bind_in_window_falls_back_to_an_ephemeral_port_when_full() {
+        let mut held = Vec::new();
+        for offset in 0..PORT_WINDOW_SIZE {
+            let addr = format!("127.0.0.1:{}", PORT_WINDOW_BASE + offset);
+            if let Ok(l) = TcpListener::bind(&addr).await {
+                held.push(l);
+            }
+        }
+        if held.len() != usize::from(PORT_WINDOW_SIZE) {
+            // Something outside this test owns part of the window; the
+            // precondition ("window is entirely ours and full") does not hold.
+            return;
+        }
+        let (listener, in_window) = bind_in_window("127.0.0.1")
+            .await
+            .expect("a full window must fall back, not fail");
+        assert!(!in_window, "the fallback must report itself as out-of-window");
+        let port = listener.local_addr().expect("local_addr").port();
+        assert!(
+            !(PORT_WINDOW_BASE..PORT_WINDOW_BASE + PORT_WINDOW_SIZE).contains(&port),
+            "fallback port {port} must not be inside the (full) window"
+        );
+        assert_ne!(port, 0, "the OS must have assigned a real port");
     }
 }
