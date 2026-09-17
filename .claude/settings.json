@@ -1,0 +1,21 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(grep -rln 'project.json\\\\|Project::load\\\\|$path' yeet-daemon/tests/)",
+      "Bash(timeout 6 c:/Users/ihyhe/OneDrive/Documentos/TestingRobloxGames/Yeet/yeet-daemon/target/debug/yeet-daemon.exe C:/Users/ihyhe/AppData/Local/Temp/claude/c--Users-ihyhe-OneDrive-Documentos-TestingRobloxGames-Yeet/7a2c464a-c04f-43d1-91cb-ca11f072558c/scratchpad/rv --bind 127.0.0.1:39871)",
+      "Bash(echo \"exit=$?\")",
+      "Bash(./yeet-extension/bin/win-x64/yeet-daemon.exe --no-sourcemap --version)",
+      "PowerShell(Get-Process yeet-daemon -ErrorAction SilentlyContinue | Stop-Process -Force -ErrorAction SilentlyContinue; Start-Sleep -Milliseconds 500; \\(Get-Process yeet-daemon -ErrorAction SilentlyContinue | Measure-Object\\).Count)",
+      "Bash(node -e ' *)",
+      "Bash(../yeet-extension/bin/win-x64/yeet-daemon.exe --no-sourcemap)",
+      "Bash(timeout 12 c:/Users/ihyhe/OneDrive/Documentos/TestingRobloxGames/Yeet/yeet-daemon/target/release/yeet-daemon.exe)",
+      "Bash(node /tmp/w.js __TRACKED_VAR__/sourcemap.json)",
+      "Bash(rm -rf C:/Users/ihyhe/AppData/Local/Temp/claude/c--Users-ihyhe-OneDrive-Documentos-TestingRobloxGames-Yeet/7a2c464a-c04f-43d1-91cb-ca11f072558c/scratchpad/wally3)",
+      "Bash(mkdir -p C:/Users/ihyhe/AppData/Local/Temp/claude/c--Users-ihyhe-OneDrive-Documentos-TestingRobloxGames-Yeet/7a2c464a-c04f-43d1-91cb-ca11f072558c/scratchpad/wally3/Packages/_Index/roblox_roact@1.4.4/roact/src C:/Users/ihyhe/AppData/Local/Temp/claude/c--Users-ihyhe-OneDrive-Documentos-TestingRobloxGames-Yeet/7a2c464a-c04f-43d1-91cb-ca11f072558c/scratchpad/wally3/src)",
+      "Bash(printf %s '{\"name\":\"roact\",\"tree\":{\"$path\":\"src\"}}')",
+      "Bash(echo 'return {}')",
+      "Bash(echo 'return 1')",
+      "Bash(rm -rf .yeet sourcemap.json)"
+    ]
+  }
+}

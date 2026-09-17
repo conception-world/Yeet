@@ -1,0 +1,81 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(rtk grep *)",
+      "Bash(rtk git *)",
+      "Bash(python -c ' *)",
+      "Bash(echo \"exit=$?\")",
+      "Bash(xxd sourcemap.json)",
+      "Bash(\"c:/Users/ihyhe/OneDrive/Documentos/TestingRobloxGames/Yeet/yeet-daemon-windows-x64.exe\" --help)",
+      "Bash(python - C:/Users/ihyhe/AppData/Local/Temp/claude/c--Users-ihyhe-OneDrive-Documentos-TestingRobloxGames-Yeet/7a2c464a-c04f-43d1-91cb-ca11f072558c/scratchpad/pjtest/src/main.rs)",
+      "Bash(cargo run *)",
+      "Bash(grep -rn \"feff\\\\|FEFF\\\\|BOM\\\\|trim_start_matches\\('\\\\\\\\\\\\\\\\u\" yeet-daemon/src/)",
+      "Bash(grep -rn '\"\\\\$path\": \"\\\\./\\\\|\"\\\\$path\": \"\\\\.\\\\\"\\\\|\\\\$path\": \"[a-z]*/\"' --include=*.rs src tests)",
+      "Bash(timeout 8 ./yeet-extension/bin/win-x64/yeet-daemon.exe --nope)",
+      "Bash(awk -F: '$1<1200 && $1>850')",
+      "Bash(awk -F: '$1>900 && $1<1400')",
+      "Bash(rustc main.rs -o ptest.exe)",
+      "Bash(./ptest.exe)",
+      "Bash(grep -rn '\"\\\\$path\"' docs/ yeet-extension/src/ scripts/)",
+      "Bash(rustc -O main.rs -o pcheck.exe)",
+      "Bash(./pcheck.exe)",
+      "Bash(grep -rn '\"\\\\$path\"[[:space:]]*:[[:space:]]*\"\\\\\\(\\\\./\\\\|\\\\.\\\\\"\\\\\\)' --include=*.json --include=*.rs --include=*.ts --include=*.luau .)",
+      "Bash(echo \"EXIT: $?\")",
+      "Bash(awk 'NR<=245 && /^pub \\(async \\)?fn |^fn /{l=NR\": \"$0} END{}' yeet-daemon/src/syncback.rs)",
+      "Bash(awk -F: '$1<245')",
+      "Bash(git check-ignore *)",
+      "Bash(echo \"exit:$?\")",
+      "Bash(printf '{\\\\n \"name\": \"BomTest\",\\\\n \"tree\": {\\\\n \"$className\": \"DataModel\",\\\\n \"ServerScriptService\": { \"$path\": \"src/server\" }\\\\n }\\\\n}\\\\n')",
+      "Bash(xxd)",
+      "Bash(c:/Users/ihyhe/OneDrive/Documentos/TestingRobloxGames/Yeet/yeet-daemon-windows-x64.exe --bind 127.0.0.1:0 C:/Users/ihyhe/AppData/Local/Temp/claude/c--Users-ihyhe-OneDrive-Documentos-TestingRobloxGames-Yeet/7a2c464a-c04f-43d1-91cb-ca11f072558c/scratchpad/bomtest)",
+      "Bash(awk 'NR>=63 && NR<=73 {print NR\": \"$0}' yeet-daemon/src/sourcemap.rs)",
+      "Bash(awk 'NR>=278 && NR<=290 {print NR\": \"$0}' yeet-daemon/src/sourcemap.rs)",
+      "Bash(awk 'NR>=353 && NR<=360 {print NR\": \"$0}' yeet-daemon/src/sourcemap.rs)",
+      "Bash(awk 'NR>=488 && NR<=500 {print NR\": \"$0}' yeet-daemon/src/sourcemap.rs)",
+      "Read(//c/Users/ihyhe/AppData/Local/Temp/claude/c--Users-ihyhe-OneDrive-Documentos-TestingRobloxGames-Yeet/7a2c464a-c04f-43d1-91cb-ca11f072558c/scratchpad/flat/**)",
+      "Bash(grep -rn \"trim_start_matches\\\\|strip_prefix\\(\\\\\"./\\\\\"\\)\\\\|starts_with\\(\\\\\"./\\\\\"\\)\\\\|starts_with\\(\\\\\"\\\\\\\\./\\\\\"\\)\" yeet-daemon/src/)",
+      "Bash(grep -rn \"starts_with\\('\\\\$'\\)\\\\|starts_with\\(\\\\\"\\\\\\\\\\\\$\\\\\"\\)\" src/)",
+      "Bash(grep -rn '\\\\$attributes\\\\|\\\\$tags\\\\|\\\\$properties' docs/ yeet-plugin/ yeet-extension/src/)",
+      "Bash(grep -rn \"starts_with\\('\\\\\\\\\\\\$'\\)\\\\|starts_with\\(\\\\\"\\\\\\\\\\\\$\\\\\"\\)\" .)",
+      "Bash(echo \"--- exit:$? \\(1=no match\\) ---\")",
+      "Bash(ls ~/.cargo/registry/cache/*/ 2>/dev/null | grep -E \"^serde\\(_json|_derive\\)?-|^serde-\" | head -20)",
+      "Read(//c/Users/ihyhe/.cargo/registry/cache/**)",
+      "Bash(grep -rn '\\\\$path' docs/ README.md)",
+      "Bash(grep -i 'attribut\\\\|\\\\$tags')",
+      "Bash(git log *)",
+      "Bash(grep -rn 'attributes\\\\|\\\\$tags\\\\|optional' yeet-daemon/src/project.rs yeet-daemon/tests)",
+      "Bash(ls ~/.cargo/registry/src/*/ 2>/dev/null | grep -i \"^notify\" | head -20; grep -n \"notify\" yeet-daemon/Cargo.toml)",
+      "Read(//c/Users/ihyhe/.cargo/registry/src/**)",
+      "Bash(timeout 8 C:/Users/ihyhe/OneDrive/Documentos/TestingRobloxGames/Yeet/yeet-daemon-windows-x64.exe C:/Users/ihyhe/AppData/Local/Temp/claude/c--Users-ihyhe-OneDrive-Documentos-TestingRobloxGames-Yeet/7a2c464a-c04f-43d1-91cb-ca11f072558c/scratchpad/p_empty --bind 127.0.0.1:0)",
+      "Bash(grep -n \"ERROR_NOTIFY_ENUM_DIR\\\\|bytes_returned\\\\|Error::io\\\\|overflow\" ~/.cargo/registry/src/*/notify-6.1.1/src/windows.rs | head -40)",
+      "Bash(grep -n \"event_handler\\\\|EventHandler\\\\|fn handle_event\\\\|Err\\(\\\\|unwrap_or\\\\|bytes\\\\|0 =>\" ~/.cargo/registry/src/*/notify-6.1.1/src/windows.rs | head -60)",
+      "Bash(grep -n '\\\\$className\\\\|\\\\$path\\\\|\\\\$properties\\\\|\\\\$attributes' yeet-extension/src/create.ts)",
+      "Bash(echo \"\\(exit $?\\)\")",
+      "Bash(git check-attr *)",
+      "Bash(git config *)",
+      "Bash(sed -n '305,345p' ~/.cargo/registry/src/*/notify-6.1.1/src/windows.rs)",
+      "Bash(git ls-tree *)",
+      "Bash(grep -n \"Err\\(Error\\\\|event_handler\\(Err\\\\|MustScanSubDirs\\\\|send_event\\\\|Result<Event>\" ~/.cargo/registry/src/*/notify-6.1.1/src/fsevent.rs | head -20)",
+      "Bash(cd \"C:/Users/ihyhe/.claude/projects/c--Users-ihyhe-OneDrive-Documentos-TestingRobloxGames-Yeet/7a2c464a-c04f-43d1-91cb-ca11f072558c/subagents/workflows/wf_954be834-32b\" 2>/dev/null && ls && wc -l journal.jsonl 2>/dev/null)",
+      "Read(//c/Users/ihyhe/.claude/projects/c--Users-ihyhe-OneDrive-Documentos-TestingRobloxGames-Yeet/7a2c464a-c04f-43d1-91cb-ca11f072558c/subagents/workflows/wf_954be834-32b/**)",
+      "Bash(grep -n \"MUST_SCAN_SUBDIRS\" -A 6 ~/.cargo/registry/src/*/notify-6.1.1/src/fsevent.rs | head -30; echo \"=== inotify ===\"; grep -n \"Error::generic\\\\|event_handler\\(Err\\\\|Q_OVERFLOW\\\\|EventKind::Other\" ~/.cargo/registry/src/*/notify-6.1.1/src/inotify.rs | head -20)",
+      "Bash(awk '/^async fn push_to_studio/,/^}/' main.rs)",
+      "Bash(node -e ' *)"
+    ],
+    "additionalDirectories": [
+      "C:\\Users\\ihyhe\\.cargo\\registry\\src\\*\\notify-6.1.1\\src"
+    ]
+  },
+  "hooks": {
+    "UserPromptSubmit": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "node \"C:/Users/ihyhe/OneDrive/Documentos/TestingRobloxGames/Yeet/.claude/hooks/apply-skills.mjs\""
+          }
+        ]
+      }
+    ]
+  }
+}
