@@ -74,10 +74,16 @@ Settings persist across Studio restarts via `plugin:SetSetting`.
 
 - **Default**: off
 
-When on, the plugin clicks **Connect** for you once it finishes
-loading. Useful for users who always want sync on; removes one click
-from the daily flow. Off by default so a fresh install never opens a
-network connection without consent.
+When on, the plugin connects for you once it finishes loading. Useful
+if you always want sync on; removes one click from the daily flow. Off
+by default so a fresh install never opens a network connection without
+consent.
+
+It waits for a discovery scan first, then reconnects to the project
+this place used last. If daemons are running but none is the
+remembered one, it stops and asks you to pick — connecting to whichever
+daemon happened to answer first is exactly the cross-project mistake
+the picker exists to prevent.
 
 ### Skip HTTP-enabled check
 
@@ -97,6 +103,10 @@ When on, the plugin's Activity log accepts trace-level breadcrumbs
 (echo decisions, frame sizes, watcher debounce ticks). Off keeps the
 log focused on user-meaningful events.
 
+It also makes a Refresh report the outcome of every port it probed,
+which is the fastest way to find out why a project is missing from the
+picker — there is no console to inspect from inside Studio otherwise.
+
 ### Auto-confirm bulk sync
 
 - **Default**: off
@@ -110,9 +120,15 @@ they review every bulk apply.**
 
 - **Default**: `ws://127.0.0.1:34872`
 
-Override for the daemon's WebSocket URL. Devs running a second
-daemon on a custom port can point the plugin at it without
-recompiling. Don't change this unless you know exactly why.
+Where the plugin connects when you have *not* picked a project from
+the list. Since v0.6.0 the picker is the normal way to choose, and a
+row you click wins over this setting — otherwise clicking a project
+and connecting somewhere else would be the same action.
+
+It still matters in one case: a daemon that landed outside the scanned
+`34872..34881` window is invisible to the picker, and this is how you
+reach it. Set it and the picker shows a pinned **Manual (from
+Settings)** row at the top; select that row to use it.
 
 ## Resetting
 

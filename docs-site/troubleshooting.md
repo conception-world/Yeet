@@ -14,29 +14,55 @@ the
    every connection attempt with the actual error from the
    WebSocket layer.
 
+## The project doesn't appear in the picker
+
+The plugin finds daemons by scanning ports `34872..34881`. A project
+missing from the list means no daemon is answering for it.
+
+1. **Is its daemon running?** Each project has its own. Open that
+   project's window and check the status bar — it should read
+   `Yeet: running (:34873)` or similar. If not, run **`Yeet: Start`**
+   there.
+2. **Is HTTP enabled in this place?** File → Game Settings → Security
+   → Allow HTTP Requests = on. Without it every probe fails, and the
+   picker says so rather than showing an empty list.
+3. **Did the daemon land outside the window?** If all ten ports were
+   taken, it falls back to an OS-assigned port and logs a warning. The
+   picker cannot see it; set the plugin's **Daemon URL** to the address
+   the daemon logged.
+4. **Turn on verbose logging** (Settings → Verbose logging) and hit
+   Refresh. The Activity log then reports the outcome of every port.
+
 ## Daemon says "Address already in use"
 
-Port `34872` is held by another process. Most common causes:
-
-- A second VS Code window also running Yeet
-- A leftover `yeet-daemon.exe` from a crashed session
-- An antivirus / network-monitoring tool that briefly squats on
-  loopback ports
-
-The extension's early-exit modal (added in v0.3.0) already names
-this case. To fix:
+Since v0.6.0 a busy port is normally *not* a problem: the daemon walks
+`34872..34881` and takes the first free one, so a second project simply
+lands on the next port. Seeing this error means all ten are occupied.
 
 ```bash
-# Windows
-netstat -ano | findstr :34872
+# Windows — see what holds the window
+netstat -ano | findstr "3487"
 taskkill /PID <pid> /F
 
 # macOS / Linux
-lsof -i :34872
+lsof -i :34872-34881
 kill <pid>
 ```
 
-Or close all VS Code windows, then start fresh.
+Usual cause is leftover `yeet-daemon` processes from crashed sessions.
+The registry at `~/.yeet/daemons.json` lists what Yeet believes is
+running, including each daemon's `pid` — handy for spotting orphans.
+
+## Two places are syncing the same project
+
+Each Studio place should connect to its own project's daemon. If two
+places pick the same row, both apply that project's tree.
+
+The picker marks a daemon another place already holds with an **in
+use** badge. If you connected the wrong one: Disconnect, pick the
+right row, Connect. The plugin also refuses to materialize a tree
+whose project root disagrees with what it first bootstrapped against,
+so a mismatch disconnects rather than corrupting the place.
 
 ## Windows SmartScreen blocks first launch
 

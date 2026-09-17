@@ -101,13 +101,39 @@ The confirmation modal is mandatory — opening an arbitrary folder
 in VS Code can run code (`.vscode/tasks.json` with `"runOn":
 "folderOpen"`), so Yeet never opens a folder silently.
 
+## Working on two projects at once
+
+Each project gets its own daemon, so two projects sync side by side.
+
+1. Open project A in one editor window and run **`Yeet: Start`**. Do
+   the same for project B in a second window. The first takes port
+   `34872`, the second `34873` — the status bar shows which.
+2. Open place A in Studio. In the Yeet panel, the **Project** list
+   shows both daemons: project name, root path and port. Click the row
+   for A, then **Connect**.
+3. Open place B in another Studio window and pick B's row there.
+
+Studio remembers each place's choice, so from then on both reconnect
+to the right project on their own.
+
+The picker marks a daemon another place already holds with an **in
+use** badge, so you do not take a connection away by accident. Read
+the root path before connecting when two projects share a name — that
+path is what tells them apart.
+
+If a project is missing from the list, hit **Refresh**. Still missing
+usually means its daemon is not running; see
+[Troubleshooting](/troubleshooting).
+
 ## Disconnecting
 
 You can leave the daemon running indefinitely; it idles cheap. To
 stop sync:
 
-- **`Yeet: Stop`** in your IDE — the daemon exits cleanly, Studio's
-  Connect button reverts to "Disconnected"
+- **`Yeet: Stop`** in your IDE — stops the daemon this window started
+  and reverts Studio's Connect button to "Disconnected". If this window
+  attached to a daemon another window spawned, it only detaches; that
+  daemon keeps serving whoever else is using it.
 - Click **Pause** in the plugin dock — Studio stops applying remote
   edits but the disk side keeps watching (useful when you want to
   test a quick change without writing it back)
