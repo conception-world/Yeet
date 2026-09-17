@@ -4,6 +4,61 @@ All notable changes to the Yeet VS Code extension are documented here.
 The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/);
 versions follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.6.0] — Multi-place sync
+
+One daemon per project instead of one daemon per machine. Two projects can
+now sync at the same time, in two editor windows, against two open Studio
+places. Previously the extension refused to start a second daemon at all.
+
+Update the plugin and the extension together: the plugin gained a project
+picker that depends on a handshake this daemon version introduces. An older
+plugin still works against a newer daemon (the protocol additions are
+backward compatible), but it will not show the picker.
+
+### Added
+- **One daemon per project.** The daemon takes the first free port in
+  `127.0.0.1:34872..34881`, so the first project still lands on `34872` and
+  single-project setups are unchanged. If the whole window is busy it falls
+  back to an OS-assigned port and says so.
+- **Project picker in the Studio plugin.** The Yeet panel lists every
+  running daemon it finds — project name, root path, port — and you click
+  the one this place belongs to. The choice is remembered per place, so you
+  only pick once. An "in use" badge marks a daemon another place is already
+  connected to.
+- **Daemon registry** at `~/.yeet/daemons.json`, so the extension can reuse
+  a daemon already serving the same project root instead of spawning a
+  duplicate. Stale entries are pruned by probing the port. Advisory only: if
+  it is missing or unreadable, everything still works.
+- **Multi-root workspaces ask which project to sync** instead of silently
+  taking the first folder that contains a `default.project.json`. The answer
+  is remembered per workspace, and cancelling starts nothing.
+
+### Fixed
+- **`sourcemap.json` regenerates again.** Four independent faults kept it
+  from ever being written: a foreign map at startup disabled generation for
+  the whole session (deleting the map no longer requires a daemon restart);
+  a refused write still marked the structure as done, so it was never
+  retried; and luau-lsp's `sourcemap.autogenerate` was left on by default,
+  racing the daemon for the same file. `Yeet: Create` now writes
+  `.vscode/settings.json` accordingly, merging rather than overwriting.
+- **The plugin's auth token is stored per project.** A single global key
+  meant two daemons cleared each other's token in a reject/re-pair loop. The
+  old key also contained a dot, which Studio does not persist reliably.
+- **The scan cannot strand sockets.** A batch that stopped early left probes
+  open, which made Studio refuse further WebSocket clients — so the more
+  daemons were actually running, the more went missing from the picker.
+- **Connection cap raised** from 4 to 8 so discovery probes are not dropped
+  when several places scan at once.
+
+### Security
+- The discovery endpoint answers **before** the auth gate, by design: the
+  plugin has to know which project a daemon serves before it can choose the
+  right token, and going through the auth gate would consume the one-shot
+  pairing breadcrumb of every project scanned. It exposes identity only —
+  project name, root path, port, version — and never the auth token, file
+  contents, or a session id. Everything past the probe is still gated by the
+  Origin allowlist and the token, and every listener remains loopback-only.
+
 ## [0.5.0] — Security & stability audit
 
 A 13-area audit across the daemon, plugin, and extension. ~50 findings
