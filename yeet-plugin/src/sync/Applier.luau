@@ -60,6 +60,8 @@ type Project = {
 
 type Mappings = { [string]: Instance }
 type FixedClass = { [string]: boolean }
+type DeferredMount = { anchor: Instance, chain: { string } }
+type DeferredMounts = { [string]: DeferredMount }
 
 type Log = (string) -> ()
 type TrackHook = (path: string, instance: Instance) -> ()
@@ -160,6 +162,13 @@ Applier.__index = Applier
 type self = {
 	fileToInstance: { [string]: Instance },
 	mappings: Mappings,
+	-- Mounts the preview traversal could not resolve because their container
+	-- does not exist in Studio yet (a fresh place has no
+	-- `ReplicatedStorage.Packages`). `materializeFile` creates the chain on the
+	-- first file that lands there, so a preview the user cancels leaves no
+	-- empty folders behind. Empty after a full bootstrap, which creates
+	-- everything up front.
+	deferredMounts: DeferredMounts,
 	-- Which `$path` mounts have a project-fixed `$className` (so a script-shaped
 	-- mount must not be reclassed). Threaded into `TreeBuilder.materializeFile`.
 	fixedClass: FixedClass,
@@ -279,6 +288,7 @@ function Applier.new(log: Log): Applier
 	return setmetatable({
 		fileToInstance = {},
 		mappings = {},
+		deferredMounts = {},
 		fixedClass = {},
 		bootstrapped = false,
 		log = log,
@@ -607,6 +617,7 @@ local function resetPerSessionState(self: Applier)
 	self.instanceToPath = {}
 	self.pendingCollisions = {}
 	self.mappings = {}
+	self.deferredMounts = {}
 	self.fixedClass = {}
 	self.appliedAttributes = {}
 end
@@ -621,6 +632,7 @@ local function applyProjectOpenedForPreview(self: Applier, project: Project)
 
 	local result = TreeBuilder.discover(project)
 	self.mappings = result.mappings
+	self.deferredMounts = result.deferred
 	self.fixedClass = result.fixedClass
 	-- Mark as bootstrapped so that `applyFileCreated` / `applyFileChanged` /
 	-- `applyFileDeleted` triggered by the daemon's per-resolution broadcasts
@@ -904,7 +916,7 @@ local function applyFileCreated(self: Applier, msg: any)
 	local prevApplying = self.applyingDaemonCreate
 	self.applyingDaemonCreate = true
 	local ok, err = withRecording("YeetFileCreated", function()
-		created = TreeBuilder.materializeFile(snap, self.mappings, self.fixedClass)
+		created = TreeBuilder.materializeFile(snap, self.mappings, self.fixedClass, self.deferredMounts)
 		if created ~= nil then
 			self.fileToInstance[snap.path] = created
 			self.instanceToPath[created] = snap.path

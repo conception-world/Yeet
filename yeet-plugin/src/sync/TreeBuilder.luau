@@ -50,6 +50,16 @@ export type Mappings = { [string]: Instance }
 -- Rojo and the daemon's sourcemap (`sourcemap::mount_has_explicit_class`).
 export type FixedClass = { [string]: boolean }
 
+-- A `$path` mount whose container does not exist in Studio yet, recorded by the
+-- preview traversal so the first file that needs it can create the chain on
+-- demand. `anchor` is the deepest instance that DOES exist; `chain` are the
+-- names to create beneath it.
+--
+-- Deferring rather than creating up front is what keeps a preview the user
+-- cancels from leaving empty folders behind in their place.
+export type DeferredMount = { anchor: Instance, chain: { string } }
+export type DeferredMounts = { [string]: DeferredMount }
+
 -- When a Script already existed in the `DataModel` with a `Source` that
 -- disagrees with the daemon's snapshot, `build` records it here instead of
 -- clobbering. Caller is expected to echo the Studio `Source` back to the
@@ -401,9 +411,36 @@ end
 local function materializeFile(
 	snap: FileSnapshot,
 	mappings: Mappings,
-	fixedClass: FixedClass
+	fixedClass: FixedClass,
+	-- Mounts the preview traversal could not resolve because their container
+	-- did not exist yet. Consulted only when `mappings` has no match, and the
+	-- chain is created at that point — so a mount nothing ever lands in stays
+	-- uncreated.
+	deferred: DeferredMounts?
 ): (Instance?, string?)
 	local mapPath, parent = bestMapping(snap, mappings)
+	if (mapPath == nil or parent == nil) and deferred ~= nil then
+		-- Longest matching deferred mount, same rule `bestMapping` uses.
+		local bestPath: string? = nil
+		for candidate in pairs(deferred) do
+			local exact = snap.path == candidate
+			local under = snap.path:sub(1, #candidate + 1) == (candidate .. "/")
+			if (exact or under) and (bestPath == nil or #candidate > #bestPath) then
+				bestPath = candidate
+			end
+		end
+		if bestPath ~= nil then
+			local entry = deferred[bestPath]
+			local cursor: Instance = entry.anchor
+			for _, name in entry.chain do
+				cursor = ensureContainer(cursor, name)
+			end
+			mappings[bestPath] = cursor
+			deferred[bestPath] = nil
+			mapPath = bestPath
+			parent = cursor
+		end
+	end
 	if mapPath == nil or parent == nil then
 		return nil, nil
 	end
@@ -689,15 +726,55 @@ end
 -- Dry-run counterpart to `traverseTree`: resolves the project tree against the
 -- live DataModel *without* creating any missing Folder/service, so a Preview
 -- connect doesn't leave orphan containers behind in a place the user then
--- decides to skip. Paths whose chain can't be walked (e.g. a service not yet
--- present) are dropped from `mappings` — they surface as pure IDE-only.
+-- decides to skip.
+--
+-- A node whose chain cannot be walked (its container does not exist in Studio
+-- yet) is recorded in `deferred` instead of being dropped. Dropping it was a
+-- real bug: a project mounting `ReplicatedStorage.Packages` has no `Packages`
+-- folder in a fresh place, so the mount never reached `mappings`, and every
+-- later apply failed with "no $path mapping resolves this path" — including
+-- files under sibling mounts, because the same is true of any not-yet-created
+-- container. `materializeFile` creates these lazily, on the first file that
+-- actually lands there, which keeps the "no orphan containers on a preview the
+-- user abandons" property intact.
 local function traverseTreeDryRun(
     node: ProjectTreeNode,
     parent: Instance?,
     mappings: Mappings,
-    fixedClass: FixedClass
+    fixedClass: FixedClass,
+    -- `$path` -> the chain of instance names to create under `anchor` the
+    -- moment a file needs this mount.
+    deferred: DeferredMounts?,
+    anchor: Instance?,
+    chain: { string }?
 )
     if parent == nil then
+        -- Container missing in Studio. Keep walking the PROJECT tree so the
+        -- mounts below it are still discovered; they resolve against the
+        -- nearest ancestor that does exist, plus the names needed to get there.
+        if deferred ~= nil and anchor ~= nil and chain ~= nil then
+            local path = node["$path"]
+            if path ~= nil then
+                deferred[path] = { anchor = anchor, chain = table.clone(chain) }
+                fixedClass[path] = node["$className"] ~= nil
+            end
+            for key, child in pairs(node :: any) do
+                if typeof(key) ~= "string" or (key :: string):sub(1, 1) == "$" then
+                    continue
+                end
+                local nextChain = table.clone(chain)
+                table.insert(nextChain, key :: string)
+                traverseTreeDryRun(
+                    child :: ProjectTreeNode,
+                    nil,
+                    mappings,
+                    fixedClass,
+                    deferred,
+                    anchor,
+                    nextChain
+                )
+            end
+        end
         return
     end
     local path = node["$path"]
@@ -736,7 +813,17 @@ local function traverseTreeDryRun(
         else
             childInst = parent:FindFirstChild(key :: string)
         end
-        traverseTreeDryRun(childNode, childInst, mappings, fixedClass)
+        -- When the child is missing, `parent` is the deepest container that
+        -- DOES exist, so it becomes the anchor the deferred chain hangs off.
+        traverseTreeDryRun(
+            childNode,
+            childInst,
+            mappings,
+            fixedClass,
+            deferred,
+            if childInst ~= nil then nil else parent,
+            if childInst ~= nil then nil else { key :: string }
+        )
     end
 end
 
@@ -759,10 +846,11 @@ export type DiscoveredScript = {
 
 function TreeBuilder.discover(
     project: Project
-): { mappings: Mappings, fixedClass: FixedClass, scripts: { DiscoveredScript } }
+): { mappings: Mappings, fixedClass: FixedClass, deferred: DeferredMounts, scripts: { DiscoveredScript } }
     local mappings: Mappings = {}
     local fixedClass: FixedClass = {}
-    traverseTreeDryRun(project.tree, game, mappings, fixedClass)
+    local deferred: DeferredMounts = {}
+    traverseTreeDryRun(project.tree, game, mappings, fixedClass, deferred, nil, nil)
     local scripts: { DiscoveredScript } = {}
     -- Yield every YIELD_EVERY descendants so a place with thousands of
     -- instances doesn't block the main thread for several seconds.
@@ -797,7 +885,7 @@ function TreeBuilder.discover(
             })
         end
     end
-    return { mappings = mappings, fixedClass = fixedClass, scripts = scripts }
+    return { mappings = mappings, fixedClass = fixedClass, deferred = deferred, scripts = scripts }
 end
 
 -- Returns the `Instance.Name` a script should have after being renamed to
