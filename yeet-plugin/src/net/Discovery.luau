@@ -205,13 +205,27 @@ function Discovery.scan(
 		onComplete(found)
 	end
 
+	-- Returned by a probe that settled before it could arm anything abortable.
+	local function noop() end
+
 	-- Probes one port and resolves via `done` exactly once, whatever happens.
 	--
 	-- `done(constructFailed)` reports whether the failure was Studio refusing to
 	-- create the WebSocket client at all, as opposed to the port simply having
 	-- nothing on it. The caller uses that to detect a concurrency cap and retry
 	-- the port in a smaller batch.
-	local function probe(port: number, done: (constructFailed: boolean) -> ())
+	--
+	-- Returns an `abort` the batch loop MUST call on every probe still in flight
+	-- when it stops waiting on a batch. Without it, leaving a batch early (the
+	-- fast-settle `break` below) strands those sockets open for the rest of
+	-- PROBE_TIMEOUT_SEC while the next batch opens more on top of them. Studio
+	-- then refuses to create further clients, which this scanner reads as a
+	-- concurrency cap — and since `retried` grants each port only one more
+	-- attempt, ports refused twice are dropped silently. The daemons that answer
+	-- are precisely what create that pressure, so the more projects are actually
+	-- running, the more of them go missing: exactly backwards from what the
+	-- picker is for.
+	local function probe(port: number, done: (constructFailed: boolean) -> ()): () -> ()
 		local url = string.format("ws://127.0.0.1:%d", port)
 		local handle: ConnectionHandle? = nil
 		local finished = false
@@ -302,7 +316,7 @@ function Discovery.scan(
 			-- fails the same way and the scan still ends empty, which is the
 			-- correct outcome.
 			settleOne("client could not be created", true)
-			return
+			return noop
 		end
 
 		-- A callback settled this probe before `connect` returned, so the close
@@ -312,19 +326,27 @@ function Discovery.scan(
 			pcall(function()
 				current:close()
 			end)
-			return
+			return noop
 		end
 
 		-- Already settled (a synchronous callback we did handle) — do not arm a
 		-- deadline for a probe that is finished.
 		if finished then
-			return
+			return noop
 		end
 
 		-- Per-probe deadline, so one wedged port cannot hold up its batch.
 		task.delay(PROBE_TIMEOUT_SEC, function()
 			settleOne("")
 		end)
+
+		-- Settling is idempotent, so aborting a probe that already finished is a
+		-- no-op. `done` still runs, which matters: the batch's `outstanding`
+		-- counter is decremented by it, and a batch that never reaches zero
+		-- would leave `refused` unread.
+		return function()
+			settleOne("")
+		end
 	end
 
 	task.spawn(function()
@@ -358,8 +380,12 @@ function Discovery.scan(
 			-- proves the round trip is quick and the stragglers are dead ports.
 			local firstSettleAt: number? = nil
 
+			-- One abort per probe, so the batch can close whatever is still open
+			-- before the next batch asks Studio for more clients.
+			local aborts: { () -> () } = {}
+
 			for _, port in batch do
-				probe(port, function(constructFailed: boolean)
+				local abort = probe(port, function(constructFailed: boolean)
 					if constructFailed and not retried[port] then
 						retried[port] = true
 						table.insert(refused, port)
@@ -372,6 +398,7 @@ function Discovery.scan(
 						batchDone = true
 					end
 				end)
+				table.insert(aborts, abort)
 			end
 
 			-- Wait for the batch. Two bounds, whichever comes first: the full
@@ -386,6 +413,19 @@ function Discovery.scan(
 					break
 				end
 				task.wait()
+			end
+
+			-- Close every probe this batch left in flight before the next batch
+			-- opens any client. Reaching here without `batchDone` is the normal
+			-- path, not the exception: the fast-settle `break` above is what the
+			-- common case takes, and the stranded sockets it used to leave are
+			-- what made Studio refuse the next batch's clients.
+			--
+			-- Ordered before `refused` is read because aborting runs each
+			-- probe's `done`, and `done` is what appends to `refused`. Reading
+			-- first would miss exactly the ports that need a retry.
+			for _, abort in aborts do
+				abort()
 			end
 
 			if #refused > 0 then
