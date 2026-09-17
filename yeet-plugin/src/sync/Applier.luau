@@ -784,6 +784,7 @@ local function applyProjectOpened(self: Applier, msg: any)
 	end
 	local divergent: { { path: string, kind: ScriptKind, studio_content: string } } = {}
 	local untracked: { { path: string, kind: ScriptKind, studio_content: string } } = {}
+	local relocations: { string } = {}
 	local ok, err = withRecording("YeetBootstrap", function()
 		local result = TreeBuilder.build(project, initialFiles)
 		self.fileToInstance = result.fileToInstance
@@ -791,7 +792,20 @@ local function applyProjectOpened(self: Applier, msg: any)
 		self.fixedClass = result.fixedClass
 		self.bootstrapped = true
 		divergent = result.divergent
+		relocations = result.relocations
 	end)
+	-- A root mount that is not a Roblox service cannot exist under the
+	-- DataModel, so it was hosted under ReplicatedStorage instead. Say so: the
+	-- Studio path now differs from what the project file and the sourcemap
+	-- declare, and a `require` written against the declared path would fail.
+	for _, name in relocations do
+		self.log(
+			`note: '{name}' is not a Roblox service, so it was created under `
+				.. `ReplicatedStorage.{name} instead of at the DataModel root. `
+				.. `Declare it under a service in default.project.json to make `
+				.. `Studio and your editor agree.`
+		)
+	end
 	if not ok then
 		self.log(`bootstrap failed: {err}`)
 		return

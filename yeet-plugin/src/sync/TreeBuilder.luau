@@ -80,6 +80,12 @@ export type BuildResult = {
 	mappings: Mappings,
 	fixedClass: FixedClass,
 	divergent: { Divergent },
+	-- Root mounts that are not Roblox services and so could not be created as
+	-- direct DataModel children; they were hosted under ReplicatedStorage
+	-- instead. Non-empty means the Studio instance path differs from what
+	-- `default.project.json` (and the sourcemap) declare, which the caller
+	-- should tell the user about.
+	relocations: { string },
 }
 
 local function classFor(kind: ScriptKind): string
@@ -225,27 +231,61 @@ end
 
 -- Resolves a named child of the *tree root* (DataModel). Services must be
 -- accessed via `GetService`, not `Instance.new`, so they get their own path.
-local function ensureNode(parent: Instance, name: string, node: ProjectTreeNode): Instance
+--
+-- A root child that is NOT a service cannot exist there at all: the DataModel
+-- rejects it, so `Instance.new(...).Parent = game` throws. Rojo can express
+-- such a node because it writes a model file offline, where the engine's
+-- parent validation never runs; a plugin building the tree live cannot.
+--
+-- The conventional Wally layout hits this immediately by mounting `Packages`
+-- at the root. Left unhandled, the throw propagated out of the whole tree
+-- build and every mount — not just this one — silently failed to materialize,
+-- which is what made Packages "not appear in Studio".
+--
+-- ReplicatedStorage is where such a folder has to live to be reachable from
+-- both client and server, and is where Rojo users put `Packages` when they
+-- declare it properly. Hosting it there keeps the declared instance name, so
+-- `require(...Packages.Trove)` still resolves; `hostedElsewhere` is returned
+-- so the caller can tell the user their project path differs from the
+-- sourcemap's.
+local function ensureNode(
+	parent: Instance,
+	name: string,
+	node: ProjectTreeNode
+): (Instance, boolean)
 	local className = node["$className"] or "Folder"
 	if parent == game then
 		local ok, service = pcall(function()
 			return game:GetService(name :: any)
 		end)
-		if ok then
-			return service
+		if ok and service ~= nil then
+			return service, false
 		end
+		local hostOk, host = pcall(function()
+			return game:GetService("ReplicatedStorage")
+		end)
+		if hostOk and host ~= nil then
+			local child, _ = ensureChild(host, name, className)
+			return child, true
+		end
+		-- No ReplicatedStorage either (should be unreachable in Studio).
+		-- Let the original error surface rather than inventing a location.
 		local child, _ = ensureChild(parent, name, className)
-		return child
+		return child, false
 	end
 	local child, _ = ensureChild(parent, name, className)
-	return child
+	return child, false
 end
 
 local function traverseTree(
 	node: ProjectTreeNode,
 	parent: Instance,
 	mappings: Mappings,
-	fixedClass: FixedClass
+	fixedClass: FixedClass,
+	-- Names of root mounts that had to be hosted under ReplicatedStorage
+	-- because they are not services. Collected so the caller can tell the user
+	-- their Studio path differs from what the project declares.
+	relocations: { string }
 )
 	local path = node["$path"]
 	if path ~= nil then
@@ -262,8 +302,11 @@ local function traverseTree(
 			continue
 		end
 		local childNode = child :: ProjectTreeNode
-		local childInstance = ensureNode(parent, key :: string, childNode)
-		traverseTree(childNode, childInstance, mappings, fixedClass)
+		local childInstance, relocated = ensureNode(parent, key :: string, childNode)
+		if relocated then
+			table.insert(relocations, key :: string)
+		end
+		traverseTree(childNode, childInstance, mappings, fixedClass, relocations)
 	end
 end
 
@@ -549,7 +592,8 @@ end
 function TreeBuilder.build(project: Project, snapshots: { FileSnapshot }): BuildResult
 	local mappings: Mappings = {}
 	local fixedClass: FixedClass = {}
-	traverseTree(project.tree, game, mappings, fixedClass)
+	local relocations: { string } = {}
+	traverseTree(project.tree, game, mappings, fixedClass, relocations)
 	local fileToInstance: { [string]: Instance } = {}
 	local divergent: { Divergent } = {}
 	-- Sort init files before non-init siblings within each parent dir, and
@@ -591,6 +635,7 @@ function TreeBuilder.build(project: Project, snapshots: { FileSnapshot }): Build
 		mappings = mappings,
 		fixedClass = fixedClass,
 		divergent = divergent,
+		relocations = relocations,
 	}
 end
 
@@ -673,8 +718,20 @@ local function traverseTreeDryRun(
             local ok, svc = pcall(function()
                 return game:GetService(key :: any)
             end)
-            if ok then
+            if ok and svc ~= nil then
                 childInst = svc
+            else
+                -- Mirror `ensureNode`: a non-service root mount cannot live
+                -- under the DataModel, so the live build hosts it under
+                -- ReplicatedStorage. Looking for it at the root here would
+                -- report it as absent and make the dry run disagree with what
+                -- the real build produces.
+                local hostOk, host = pcall(function()
+                    return game:GetService("ReplicatedStorage")
+                end)
+                if hostOk and host ~= nil then
+                    childInst = host:FindFirstChild(key :: string)
+                end
             end
         else
             childInst = parent:FindFirstChild(key :: string)

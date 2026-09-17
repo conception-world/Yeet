@@ -368,6 +368,63 @@ fn mount_has_explicit_class(project: &Project, segments: &[String]) -> bool {
 /// `TreeBuilder.ensureNode` does: an explicit `$className` from the project tree
 /// wins; otherwise a top-level `DataModel` child keeps its own name (services'
 /// ClassName equals their name), and a deeper node defaults to `Folder`.
+/// Roblox service names that may appear as instances in a project tree.
+///
+/// Rojo's rule, which this mirrors: a node whose name is a service keeps that
+/// name as its `className`; anything else is a `Folder`. Getting this wrong is
+/// not cosmetic — a `"className": "Packages"` names no real Roblox class, so
+/// luau-lsp cannot resolve anything beneath it and every `require(Packages.X)`
+/// goes untyped.
+///
+/// The list covers the services a Rojo-style project realistically mounts. A
+/// service missing from it degrades to `Folder`, which is exactly how an
+/// unknown name should behave — the failure mode is conservative.
+const ROBLOX_SERVICES: &[&str] = &[
+    "Workspace",
+    "Players",
+    "Lighting",
+    "ReplicatedFirst",
+    "ReplicatedStorage",
+    "ServerScriptService",
+    "ServerStorage",
+    "StarterGui",
+    "StarterPack",
+    "StarterPlayer",
+    "StarterPlayerScripts",
+    "StarterCharacterScripts",
+    "SoundService",
+    "Chat",
+    "TextChatService",
+    "LocalizationService",
+    "TestService",
+    "MaterialService",
+    "Teams",
+    "VoiceChatService",
+    "ProximityPromptService",
+    "UserInputService",
+    "RunService",
+    "HttpService",
+    "CollectionService",
+    "PhysicsService",
+    "TweenService",
+    "Debris",
+    "InsertService",
+    "MarketplaceService",
+    "DataStoreService",
+    "BadgeService",
+    "GamePassService",
+    "PathfindingService",
+    "TeleportService",
+    "AnalyticsService",
+    "AvatarEditorService",
+];
+
+/// True when `name` is a Roblox service, and so keeps its own name as its
+/// class rather than becoming a `Folder`.
+fn is_service_name(name: &str) -> bool {
+    ROBLOX_SERVICES.contains(&name)
+}
+
 fn ensure_segment_chain<'a>(
     root: &'a mut SourceNode,
     project: &Project,
@@ -375,12 +432,23 @@ fn ensure_segment_chain<'a>(
 ) -> &'a mut SourceNode {
     let mut node = root;
     let mut proj_node = &project.tree;
-    for (depth, seg) in segments.iter().enumerate() {
+    for seg in segments {
         let child_proj = proj_node.children.get(seg);
+        // An explicit `$className` always wins. Otherwise the name decides:
+        // a service keeps its own name as its class, anything else is a
+        // `Folder`. This is Rojo's rule, verified against `rojo sourcemap`.
+        //
+        // It used to key off depth instead — every direct DataModel child took
+        // its own name as the class. That is right for `Lighting` and wrong for
+        // the conventional Wally `Packages` mount, which came out as
+        // `"className": "Packages"`: not a Roblox class at all, so luau-lsp
+        // resolved nothing under it. Depth was also the wrong axis in the other
+        // direction, since `StarterPlayerScripts` is a service nested one level
+        // down and must keep its class.
         let class_name = child_proj
             .and_then(|n| n.class_name.clone())
             .unwrap_or_else(|| {
-                if depth == 0 {
+                if is_service_name(seg) {
                     seg.clone()
                 } else {
                     "Folder".to_owned()
@@ -1028,6 +1096,56 @@ mod tests {
     /// `"Shared": {"$className": "Folder"}` and `"Lighting": {"$properties": …}`
     /// shapes `rojo init` emits — so `game.ReplicatedStorage.Shared` existed at
     /// runtime but would not resolve in the editor.
+
+    /// A DataModel child whose name is not a Roblox service must be a `Folder`,
+    /// not a class named after itself.
+    ///
+    /// `rojo sourcemap` was the reference here: for a project mounting
+    /// `Packages` at the root (the conventional Wally layout) it emits
+    /// `"className": "Folder"`, while it keeps `Lighting` as `Lighting`. Naming
+    /// the class after the node produced `"className": "Packages"` — not a real
+    /// class — which luau-lsp cannot resolve, so every `require(Packages.X)`
+    /// went untyped in the editor.
+    #[test]
+    fn build_sourcemap_classes_non_services_as_folders() {
+        let project: Project = serde_json::from_str(
+            r#"{
+                "name": "Wally",
+                "tree": {
+                    "$className": "DataModel",
+                    "Lighting": { "$path": "light" },
+                    "Packages": { "$path": "Packages" },
+                    "StarterPlayer": {
+                        "StarterPlayerScripts": { "$path": "sps" }
+                    }
+                }
+            }"#,
+        )
+        .expect("parse project");
+        let mut tree = Tree::new();
+        tree.insert("Packages/Trove.lua".to_owned(), entry(ScriptKind::ModuleScript));
+        tree.insert("light/A.luau".to_owned(), entry(ScriptKind::ModuleScript));
+        tree.insert("sps/B.luau".to_owned(), entry(ScriptKind::ModuleScript));
+        let map = build_sourcemap(&project, &tree, &[]);
+
+        assert_eq!(
+            class_name(child(&map, "Packages").expect("Packages node")),
+            Some("Folder"),
+            "a non-service root child must be a Folder, as `rojo sourcemap` emits"
+        );
+        // Real services keep their own name as the class, at any depth.
+        assert_eq!(
+            class_name(child(&map, "Lighting").expect("Lighting node")),
+            Some("Lighting")
+        );
+        let sp = child(&map, "StarterPlayer").expect("StarterPlayer node");
+        assert_eq!(class_name(sp), Some("StarterPlayer"));
+        assert_eq!(
+            class_name(child(sp, "StarterPlayerScripts").expect("SPS node")),
+            Some("StarterPlayerScripts"),
+            "a nested service must keep its class too"
+        );
+    }
     #[test]
     fn build_sourcemap_seeds_declared_nodes_without_path() {
         let project: Project = serde_json::from_str(
