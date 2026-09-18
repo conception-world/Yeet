@@ -233,7 +233,7 @@ type ViewProps = {
 -- MIN_COMPATIBLE_PLUGIN_VERSION) and shown in the dock title, so the two must
 -- never drift — a plugin that advertises one version and displays another makes
 -- "which build am I running?" unanswerable from a bug report.
-local PLUGIN_VERSION = "0.6.0"
+local PLUGIN_VERSION = "0.6.1"
 
 -- First port a daemon tries, and so the fallback when nothing has been picked.
 -- Not a promise of where any given daemon is: with one daemon per project they

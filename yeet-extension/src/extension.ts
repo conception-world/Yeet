@@ -24,7 +24,7 @@ const KILL_GRACE_MS = 2000;
 // warning naming both versions; sync continues to operate (semver
 // minor compat usually holds), but the user knows what to fix when
 // behavior gets weird.
-const EXPECTED_DAEMON_VERSION = "0.6.0";
+const EXPECTED_DAEMON_VERSION = "0.6.1";
 // How long to wait for the daemon's `yeet-port:` line before giving up and
 // assuming it landed on the window's base port. The daemon prints it the
 // instant it binds, so reaching this timeout means something is wrong (the

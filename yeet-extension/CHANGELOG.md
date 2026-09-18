@@ -4,6 +4,49 @@ All notable changes to the Yeet VS Code extension are documented here.
 The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/);
 versions follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.6.1] — Fixes for a first sync into a fresh place
+
+Follow-up to 0.6.0. Everything here was found by syncing a real Wally
+project into a place that had never been bootstrapped — the path 0.6.0's
+testing did not cover.
+
+### Fixed
+- **Every apply failed with "no $path mapping resolves this path"** on a
+  first sync after a preview connect. The preview traversal walks the
+  project tree against the live DataModel without creating anything, so a
+  preview you cancel leaves no orphan folders behind — but it gave up the
+  moment a container was missing, silently dropping that mount and
+  everything below it. A fresh place has nothing under its services, so a
+  project declaring `ReplicatedStorage.Packages` and
+  `ReplicatedStorage.Shared` resolved neither, and every file was rejected.
+  Missing containers are now recorded and created on the first file that
+  actually lands in them, so nothing is dropped and the no-orphans property
+  still holds.
+- **`className` for a non-service node.** A direct child of the DataModel
+  took its own name as its class, so the conventional Wally `Packages`
+  mount emitted `"className": "Packages"` — not a Roblox class, so luau-lsp
+  could resolve nothing beneath it. Matching `rojo sourcemap`, a name is
+  kept only when it is a real service; anything else is a `Folder`.
+  Verified by diffing the whole tree against Rojo's own output.
+- **A non-service mounted at the DataModel root no longer kills the sync.**
+  The engine rejects such a child at runtime, and the throw took the entire
+  tree build down with it — not just that mount. It is now hosted under
+  ReplicatedStorage, with a note in the Activity log, since the resulting
+  Studio path differs from what the project file and sourcemap declare.
+- **Discovery no longer strands sockets.** A scan batch that settled early
+  left its remaining probes open, which made Studio refuse further
+  WebSocket clients — so the more daemons were actually running, the more
+  went missing from the picker.
+- **Connection cap raised** from 4 to 8, so a discovery probe is not
+  dropped when several places scan at once.
+
+### Note
+If `sourcemap.json` is not being regenerated, check that
+`luau-lsp.sourcemap.autogenerate` is `false` in your workspace settings.
+With it on, luau-lsp runs `rojo sourcemap --watch`, and Yeet deliberately
+refuses to overwrite a map it did not write — the daemon log says so when
+it happens.
+
 ## [0.6.0] — Multi-place sync
 
 One daemon per project instead of one daemon per machine. Two projects can

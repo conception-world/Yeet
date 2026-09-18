@@ -81,7 +81,7 @@ local Discovery = {}
 -- because this module sits below the UI layer and must not depend upward on
 -- it; the value only labels the handshake, since discovery is answered before
 -- the daemon's version gate.
-local PLUGIN_VERSION = "0.6.0"
+local PLUGIN_VERSION = "0.6.1"
 
 -- Keep in lockstep with PORT_WINDOW_BASE / PORT_WINDOW_SIZE in
 -- yeet-daemon/src/main.rs. A daemon outside this window is unreachable by the
